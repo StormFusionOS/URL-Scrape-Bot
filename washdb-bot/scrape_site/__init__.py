@@ -18,6 +18,12 @@ from scrape_site.site_parse import (
     extract_reviews,
     extract_json_ld,
 )
+from scrape_site.site_scraper import (
+    scrape_website,
+    fetch_page,
+    discover_internal_links,
+    merge_results,
+)
 
 __version__ = "0.1.0"
 
@@ -31,4 +37,8 @@ __all__ = [
     "extract_address",
     "extract_reviews",
     "extract_json_ld",
+    "scrape_website",
+    "fetch_page",
+    "discover_internal_links",
+    "merge_results",
 ]
