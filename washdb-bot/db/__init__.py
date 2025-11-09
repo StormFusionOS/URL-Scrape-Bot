@@ -8,6 +8,12 @@ This module handles:
 """
 
 from db.models import Base, Company, canonicalize_url, domain_from_url
+from db.save_discoveries import (
+    upsert_discovered,
+    normalize_phone,
+    normalize_email,
+    create_session,
+)
 
 __version__ = "0.1.0"
 
@@ -16,4 +22,8 @@ __all__ = [
     "Company",
     "canonicalize_url",
     "domain_from_url",
+    "upsert_discovered",
+    "normalize_phone",
+    "normalize_email",
+    "create_session",
 ]
