@@ -14,6 +14,10 @@ from db.save_discoveries import (
     normalize_email,
     create_session,
 )
+from db.update_details import (
+    update_company_details,
+    update_batch,
+)
 
 __version__ = "0.1.0"
 
@@ -26,4 +30,6 @@ __all__ = [
     "normalize_phone",
     "normalize_email",
     "create_session",
+    "update_company_details",
+    "update_batch",
 ]
