@@ -7,4 +7,16 @@ This module handles:
 - Extracting business information
 """
 
+from scrape_yp.yp_client import (
+    fetch_yp_search_page,
+    parse_yp_results,
+    clean_text,
+)
+
 __version__ = "0.1.0"
+
+__all__ = [
+    "fetch_yp_search_page",
+    "parse_yp_results",
+    "clean_text",
+]
