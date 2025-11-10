@@ -262,6 +262,14 @@ def clear_log():
         ui.notify('Log cleared', type='info')
 
 
+def clear_discovery_log():
+    """Clear the discovery log viewer."""
+    from .discover import discovery_state
+    if discovery_state.log_element:
+        discovery_state.log_element.clear()
+        ui.notify('Discovery log cleared', type='info')
+
+
 def copy_log():
     """Copy log to clipboard."""
     if not job_state.logs:
@@ -346,73 +354,25 @@ def status_page():
     ui.label('Live Activity').classes('text-2xl font-bold mb-2')
 
     with ui.card().classes('w-full mb-4'):
-        ui.label('System Status').classes('text-xl font-bold mb-3')
-
-        # Status cards
-        with ui.row().classes('w-full gap-4 mb-4'):
-            # Active job card
-            with ui.card().classes('flex-1'):
-                ui.label('Active Job').classes('text-sm text-gray-400 mb-1')
-                status_state.job_name_label = ui.label('No active job').classes('text-lg font-semibold')
-
-            # Status badge card
-            with ui.card().classes('flex-1'):
-                ui.label('Status').classes('text-sm text-gray-400 mb-1')
-                status_state.status_badge = ui.badge('IDLE', color='grey').classes('text-lg')
-
-            # Start time card
-            with ui.card().classes('flex-1'):
-                ui.label('Start Time').classes('text-sm text-gray-400 mb-1')
-                status_state.start_time_label = ui.label('-').classes('text-lg')
-
-            # Elapsed card
-            with ui.card().classes('flex-1'):
-                ui.label('Elapsed').classes('text-sm text-gray-400 mb-1')
-                status_state.elapsed_label = ui.label('0s').classes('text-lg')
-
-        # Metrics row
-        with ui.row().classes('w-full gap-4 mb-4'):
-            with ui.card().classes('flex-1'):
-                ui.label('Items').classes('text-sm text-gray-400 mb-1')
-                status_state.items_label = ui.label('0').classes('text-lg font-semibold')
-
-            with ui.card().classes('flex-1'):
-                ui.label('Errors').classes('text-sm text-gray-400 mb-1')
-                status_state.errors_label = ui.label('0').classes('text-lg font-semibold text-red-400')
-
-            with ui.card().classes('flex-1'):
-                ui.label('Throughput').classes('text-sm text-gray-400 mb-1')
-                status_state.throughput_label = ui.label('0.0 items/min').classes('text-lg')
-
-        # Progress bar
-        ui.label('Progress').classes('text-sm text-gray-400 mb-1')
-        status_state.progress_bar = ui.linear_progress(value=0, show_value=True).classes('w-full mb-4')
-
-        # Control buttons
-        with ui.row().classes('gap-2 mb-4'):
-            ui.button('Start Test Job', icon='play_arrow', color='positive',
-                      on_click=lambda: start_test_job()).props('outline')
-            ui.button('Cancel Job', icon='stop', color='negative',
-                      on_click=lambda: cancel_job()).props('outline')
-
-        # Log viewer
-        ui.label('Live Output').classes('text-lg font-bold mb-2')
+        # Log viewer - displays discovery logs
+        ui.label('Live Output (Discovery Runs)').classes('text-lg font-bold mb-2')
 
         with ui.row().classes('w-full gap-2 mb-2'):
-            ui.button('Clear Log', icon='delete', on_click=clear_log).props('flat dense')
-            ui.button('Copy Log', icon='content_copy', on_click=copy_log).props('flat dense')
+            ui.button('Clear Log', icon='delete', on_click=lambda: clear_discovery_log()).props('flat dense')
 
-            ui.space()
+        # Display discovery logs
+        log_container = ui.scroll_area().classes('w-full h-96 bg-gray-900 rounded p-2')
 
-            ui.label('Auto-scroll:').classes('text-sm')
-            ui.checkbox(value=True, on_change=lambda e: setattr(status_state, 'auto_scroll', e.value))
-
-        # Log container with scrolling
-        with ui.element('div').props('id=log-container').style(
-            'background: #1a1a1a; border-radius: 8px; padding: 12px; '
-            'height: 400px; overflow-y: auto; font-family: monospace;'
-        ) as log_container:
-            status_state.log_element = log_container
+        with log_container:
+            # Import discovery state to show discovery logs
+            from .discover import discovery_state
+            if discovery_state.log_element:
+                # Reference the same log element from discovery
+                status_state.log_element = discovery_state.log_element
+            else:
+                # Create a placeholder
+                status_state.log_element = ui.column().classes('w-full gap-0 font-mono text-xs')
+                ui.label('No discovery runs yet. Start a discovery run from the Discover page.').classes('text-gray-400 italic text-sm')
 
     # ======================
     # HISTORY SECTION

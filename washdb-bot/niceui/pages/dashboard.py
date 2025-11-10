@@ -242,6 +242,51 @@ def dashboard_page():
     with ui.tab_panels(tabs, value=overview_tab).classes('w-full'):
         # OVERVIEW TAB
         with ui.tab_panel(overview_tab):
+            # System Status Section - Eye-Catching
+            with ui.card().classes('w-full mb-6').style('background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border: none;'):
+                ui.label('🖥️ System Status').classes('text-2xl font-bold mb-4 text-white')
+
+                # Import discovery state to show real-time info
+                from .discover import discovery_state
+
+                with ui.row().classes('w-full gap-4'):
+                    # Active Discovery Status
+                    with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
+                        ui.label('Discovery Status').classes('text-sm text-gray-200 mb-2')
+                        if discovery_state.running:
+                            with ui.row().classes('items-center gap-2'):
+                                ui.spinner(size='sm', color='positive')
+                                ui.label('RUNNING').classes('text-2xl font-bold text-green-300')
+                        else:
+                            ui.badge('IDLE', color='grey').classes('text-xl p-3')
+
+                    # Last Run Time
+                    with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
+                        ui.label('Last Run').classes('text-sm text-gray-200 mb-2')
+                        if discovery_state.last_run_summary:
+                            timestamp = discovery_state.last_run_summary['timestamp'][:19]
+                            ui.label(timestamp).classes('text-lg font-semibold text-white')
+                        else:
+                            ui.label('No runs yet').classes('text-lg text-gray-300 italic')
+
+                    # Database Status
+                    with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
+                        ui.label('Database').classes('text-sm text-gray-200 mb-2')
+                        db_status = backend.check_database_connection()
+                        if db_status['connected']:
+                            with ui.row().classes('items-center gap-2'):
+                                ui.icon('check_circle', size='md', color='positive')
+                                ui.label('Connected').classes('text-lg font-semibold text-green-300')
+                        else:
+                            with ui.row().classes('items-center gap-2'):
+                                ui.icon('error', size='md', color='negative')
+                                ui.label('Error').classes('text-lg font-semibold text-red-300')
+
+                    # Total Processed
+                    with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
+                        ui.label('Total Companies').classes('text-sm text-gray-200 mb-2')
+                        ui.label(str(kpis['total_companies'])).classes('text-2xl font-bold text-white')
+
             # KPI Cards
             with ui.row().classes('w-full gap-4 mb-6'):
                 create_kpi_card('Total Companies', kpis['total_companies'], 'business', 'info')

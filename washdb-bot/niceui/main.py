@@ -22,8 +22,6 @@ def register_pages():
     """Register all pages with the router."""
     router.register('dashboard', pages.dashboard_page)
     router.register('discover', pages.discover_page)
-    router.register('scrape', pages.scrape_page)
-    router.register('single_url', pages.single_url_page)
     router.register('database', pages.database_page)
     router.register('logs', pages.logs_page)
     router.register('status', pages.status_page)

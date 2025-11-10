@@ -391,8 +391,8 @@ def database_page():
                 ui.label('• Select all rows with Ctrl+A / Cmd+A in the grid').classes('text-sm text-gray-400')
                 ui.label('• Export creates a timestamped CSV file').classes('text-sm text-gray-400')
 
-    # Load initial data
-    load_companies()
+    # Load initial data on page creation
+    ui.timer(0.1, lambda: load_companies(), once=True)
 
     # Listen for scrape complete events to auto-refresh
     def check_refresh():

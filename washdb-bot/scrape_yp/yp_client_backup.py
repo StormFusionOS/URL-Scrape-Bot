@@ -6,7 +6,6 @@ This module handles:
 - Fetching search results from Yellow Pages
 - Parsing business listings from HTML
 - Polite crawling with rate limiting and retries
-- Playwright support for bypassing anti-bot protection
 """
 
 import os
@@ -26,7 +25,6 @@ load_dotenv()
 # Configuration
 YP_BASE = os.getenv("YP_BASE", "https://www.yellowpages.com/search")
 CRAWL_DELAY_SECONDS = float(os.getenv("CRAWL_DELAY_SECONDS", "2"))
-USE_PLAYWRIGHT = os.getenv("USE_PLAYWRIGHT", "true").lower() == "true"
 
 # Common desktop browser User-Agent
 USER_AGENT = (
@@ -59,9 +57,6 @@ def fetch_yp_search_page(
     """
     Fetch a Yellow Pages search results page.
 
-    Uses Playwright (headless browser) if USE_PLAYWRIGHT=true,
-    otherwise falls back to requests library.
-
     Args:
         category: Search category/terms (e.g., "pressure washing")
         location: Geographic location (e.g., "Texas")
@@ -72,26 +67,14 @@ def fetch_yp_search_page(
         HTML content as string
 
     Raises:
-        Exception: If request fails after retries
+        requests.RequestException: If request fails after retries
     """
-    # Use Playwright if enabled
-    if USE_PLAYWRIGHT:
-        try:
-            return fetch_yp_search_page_playwright(category, location, page, delay)
-        except Exception as e:
-            print(f"Playwright failed: {e}")
-            print("Falling back to requests library...")
-            # Fall through to requests method
-
-    # Apply rate limiting with randomization to avoid detection
+    # Apply rate limiting
     if delay is None:
         delay = CRAWL_DELAY_SECONDS
 
     if delay > 0:
-        # Add ±20% random jitter to make timing less predictable
-        import random
-        jittered_delay = delay * random.uniform(0.8, 1.2)
-        time.sleep(jittered_delay)
+        time.sleep(delay)
 
     # Build query URL
     url = (
@@ -340,211 +323,6 @@ def clean_text(text: str) -> str:
     cleaned = cleaned.strip()
 
     return cleaned
-
-
-def fetch_yp_search_page_playwright(
-    category: str,
-    location: str,
-    page: int = 1,
-    delay: Optional[float] = None,
-) -> str:
-    """
-    Fetch Yellow Pages search page using Playwright (headless browser).
-
-    Args:
-        category: Search category/terms
-        location: Geographic location
-        page: Page number
-        delay: Optional delay before request
-
-    Returns:
-        HTML content as string
-    """
-    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-
-    # Apply rate limiting with randomization to avoid detection
-    if delay is None:
-        delay = CRAWL_DELAY_SECONDS
-
-    if delay > 0:
-        # Add ±20% random jitter to make timing less predictable
-        import random
-        jittered_delay = delay * random.uniform(0.8, 1.2)
-        time.sleep(jittered_delay)
-
-    # Build query URL
-    url = (
-        f"{YP_BASE}?"
-        f"search_terms={quote_plus(category)}&"
-        f"geo_location_terms={quote_plus(location)}&"
-        f"page={page}"
-    )
-
-    print(f"Fetching with Playwright: {url}")
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            with sync_playwright() as p:
-                import random
-
-                # Randomize browser fingerprint
-                viewports = [
-                    {'width': 1920, 'height': 1080},
-                    {'width': 1366, 'height': 768},
-                    {'width': 1536, 'height': 864},
-                    {'width': 1440, 'height': 900},
-                ]
-
-                user_agents = [
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
-                ]
-
-                timezones = [
-                    'America/New_York',
-                    'America/Chicago',
-                    'America/Denver',
-                    'America/Los_Angeles',
-                ]
-
-                locales = [
-                    'en-US',
-                    'en-GB',
-                    'en-CA',
-                ]
-
-                # Launch browser in headless mode
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=[
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-dev-shm-usage',
-                        '--no-sandbox',
-                        '--disable-web-security',
-                        '--disable-features=IsolateOrigins,site-per-process',
-                    ]
-                )
-
-                # Create context with randomized settings
-                context = browser.new_context(
-                    viewport=random.choice(viewports),
-                    user_agent=random.choice(user_agents),
-                    locale=random.choice(locales),
-                    timezone_id=random.choice(timezones),
-                    # Add some browser features
-                    has_touch=random.choice([True, False]),
-                    is_mobile=False,
-                    device_scale_factor=random.choice([1, 1.5, 2]),
-                )
-
-                # Create page
-                page_obj = context.new_page()
-
-                # Inject script to remove webdriver property
-                page_obj.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    });
-
-                    // Randomize some properties
-                    Object.defineProperty(navigator, 'platform', {
-                        get: () => 'Win32'
-                    });
-
-                    // Override plugins to look more real
-                    Object.defineProperty(navigator, 'plugins', {
-                        get: () => [1, 2, 3, 4, 5]
-                    });
-                """)
-
-                # Set extra HTTP headers with randomization
-                accept_langs = ['en-US,en;q=0.9', 'en-GB,en;q=0.9', 'en-US,en;q=0.9,es;q=0.8']
-                page_obj.set_extra_http_headers({
-                    'Accept-Language': random.choice(accept_langs),
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'DNT': '1',
-                    'Connection': 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1',
-                })
-
-                # Navigate to page
-                response = page_obj.goto(url, wait_until='domcontentloaded', timeout=30000)
-
-                # Simulate human behavior
-                # Random wait after page load (1-3 seconds)
-                page_obj.wait_for_timeout(random.randint(1000, 3000))
-
-                # Simulate scrolling (makes it look like a real user)
-                try:
-                    # Scroll down a bit
-                    page_obj.evaluate(f"window.scrollTo(0, {random.randint(100, 500)})")
-                    page_obj.wait_for_timeout(random.randint(500, 1500))
-
-                    # Scroll to middle
-                    page_obj.evaluate(f"window.scrollTo(0, {random.randint(600, 1200)})")
-                    page_obj.wait_for_timeout(random.randint(300, 800))
-
-                    # Scroll back to top
-                    page_obj.evaluate("window.scrollTo(0, 0)")
-                    page_obj.wait_for_timeout(random.randint(200, 500))
-                except:
-                    pass  # Ignore scroll errors
-
-                # Random mouse movements
-                try:
-                    for _ in range(random.randint(2, 4)):
-                        x = random.randint(100, 800)
-                        y = random.randint(100, 600)
-                        page_obj.mouse.move(x, y)
-                        page_obj.wait_for_timeout(random.randint(50, 200))
-                except:
-                    pass  # Ignore mouse movement errors
-
-                if response.status == 403:
-                    print(f"403 Forbidden (attempt {attempt + 1}/{MAX_RETRIES})")
-                    browser.close()
-                    if attempt < MAX_RETRIES - 1:
-                        backoff = RETRY_BACKOFF_BASE ** (attempt + 1)
-                        print(f"Retrying in {backoff}s...")
-                        time.sleep(backoff)
-                        continue
-                    raise Exception("403 Forbidden after all retries")
-
-                # Wait a bit for dynamic content
-                page_obj.wait_for_timeout(2000)
-
-                # Get HTML content
-                html = page_obj.content()
-
-                # Close browser
-                browser.close()
-
-                print(f"✓ Successfully fetched page {page} ({len(html)} bytes)")
-                return html
-
-        except PlaywrightTimeoutError:
-            print(f"Timeout (attempt {attempt + 1}/{MAX_RETRIES})")
-            if attempt < MAX_RETRIES - 1:
-                backoff = RETRY_BACKOFF_BASE ** (attempt + 1)
-                print(f"Retrying in {backoff}s...")
-                time.sleep(backoff)
-                continue
-            raise
-
-        except Exception as e:
-            print(f"Error: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
-            if attempt < MAX_RETRIES - 1:
-                backoff = RETRY_BACKOFF_BASE ** (attempt + 1)
-                print(f"Retrying in {backoff}s...")
-                time.sleep(backoff)
-                continue
-            raise
-
-    raise Exception(f"Failed to fetch page after {MAX_RETRIES} attempts")
 
 
 def main():

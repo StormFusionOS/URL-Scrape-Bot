@@ -87,8 +87,13 @@ class AppLayout:
 
     def create_drawer(self):
         """Create left navigation drawer."""
-        with ui.left_drawer(value=True, elevated=True).style(
-            f'background-color: {COLORS["dark"]};'
+        with ui.left_drawer(
+            value=False,  # Start closed to avoid overlay
+            elevated=True,
+            fixed=False,  # Not fixed position
+            bordered=True
+        ).style(
+            f'background-color: {COLORS["dark"]}; width: 250px;'
         ).classes('q-pa-md') as self.drawer:
 
             ui.label('Navigation').classes('text-lg font-bold mb-4')
@@ -97,8 +102,6 @@ class AppLayout:
             nav_items = [
                 {'name': 'Dashboard', 'icon': 'dashboard', 'page': 'dashboard'},
                 {'name': 'Discover', 'icon': 'search', 'page': 'discover'},
-                {'name': 'Scrape', 'icon': 'data_usage', 'page': 'scrape'},
-                {'name': 'Single URL', 'icon': 'link', 'page': 'single_url'},
                 {'name': 'Database', 'icon': 'storage', 'page': 'database'},
                 {'name': 'Logs', 'icon': 'article', 'page': 'logs'},
                 {'name': 'Status', 'icon': 'timeline', 'page': 'status'},
@@ -138,8 +141,6 @@ class AppLayout:
         nav_items = [
             {'name': 'Dashboard', 'icon': 'dashboard', 'page': 'dashboard'},
             {'name': 'Discover', 'icon': 'search', 'page': 'discover'},
-            {'name': 'Scrape', 'icon': 'data_usage', 'page': 'scrape'},
-            {'name': 'Single URL', 'icon': 'link', 'page': 'single_url'},
             {'name': 'Database', 'icon': 'storage', 'page': 'database'},
             {'name': 'Logs', 'icon': 'article', 'page': 'logs'},
             {'name': 'Status', 'icon': 'timeline', 'page': 'status'},
@@ -151,7 +152,8 @@ class AppLayout:
 
     def create_content_area(self):
         """Create main content area."""
-        self.content_area = ui.column().classes('w-full p-4')
+        # Add proper spacing to avoid overlap with drawer
+        self.content_area = ui.column().classes('w-full p-4').style('max-width: 100%;')
         return self.content_area
 
     def create_footer(self):
@@ -161,7 +163,7 @@ class AppLayout:
         ) as self.footer_element:
 
             # Version info
-            ui.label(f'Washdb-Bot v{self.version} | Powered by NiceGUI').classes('text-sm text-gray-400')
+            ui.label(f'Washdb-Bot v{self.version}').classes('text-sm text-gray-400')
 
             ui.space()
 

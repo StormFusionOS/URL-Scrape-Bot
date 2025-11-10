@@ -15,6 +15,7 @@ class DiscoveryState:
         self.cancel_requested = False
         self.last_run_summary = None
         self.start_time = None
+        self.log_element = None
 
     def cancel(self):
         self.cancel_requested = True
@@ -25,22 +26,42 @@ class DiscoveryState:
     def reset(self):
         self.cancel_requested = False
 
+    def add_log(self, message, level='info'):
+        """Add a log message to the output window."""
+        if not self.log_element:
+            return
+
+        # Color coding based on level
+        color_map = {
+            'info': 'text-blue-400',
+            'success': 'text-green-400',
+            'warning': 'text-yellow-400',
+            'error': 'text-red-400',
+            'debug': 'text-gray-400'
+        }
+
+        color = color_map.get(level, 'text-white')
+        timestamp = datetime.now().strftime('%H:%M:%S')
+
+        with self.log_element:
+            ui.label(f'[{timestamp}] {message}').classes(f'{color} leading-tight')
+
 
 discovery_state = DiscoveryState()
 
 
-# Service categories from our scraper
+# Service categories - using broader terms that return consistent results
 DEFAULT_CATEGORIES = [
     "pressure washing",
     "power washing",
     "soft washing",
     "window cleaning",
-    "window washing",
-    "deck restoration",
-    "deck staining",
-    "wood restoration",
-    "fence staining",
-    "log home restoration",
+    "gutter cleaning",
+    "roof cleaning",
+    "deck cleaning",
+    "concrete cleaning",
+    "house cleaning exterior",
+    "driveway cleaning",
 ]
 
 # US States
@@ -71,6 +92,20 @@ async def run_discovery(
     run_button.disable()
     stop_button.enable()
 
+    # Clear log
+    if discovery_state.log_element:
+        discovery_state.log_element.clear()
+
+    # Add initial log messages
+    discovery_state.add_log('=' * 60, 'info')
+    discovery_state.add_log('Starting Discovery Job', 'info')
+    discovery_state.add_log('=' * 60, 'info')
+    discovery_state.add_log(f'Categories: {", ".join(categories)}', 'info')
+    discovery_state.add_log(f'States: {", ".join(states)}', 'info')
+    discovery_state.add_log(f'Pages per pair: {pages_per_pair}', 'info')
+    discovery_state.add_log(f'Total pairs: {len(categories)} × {len(states)} = {len(categories) * len(states)}', 'info')
+    discovery_state.add_log('-' * 60, 'info')
+
     # Clear stats
     stats_card.clear()
     with stats_card:
@@ -84,17 +119,102 @@ async def run_discovery(
         }
 
     try:
-        # Run discovery in I/O bound thread
+        discovery_state.add_log('Starting Yellow Pages crawler...', 'info')
+
+        # Progress callback to update UI in real-time
+        def progress_callback(progress):
+            """Handle progress updates from backend."""
+            progress_type = progress.get('type')
+
+            if progress_type == 'batch_start':
+                category = progress.get('category', '')
+                state = progress.get('state', '')
+                pairs_done = progress.get('pairs_done', 0)
+                pairs_total = progress.get('pairs_total', 0)
+                discovery_state.add_log(
+                    f"Processing pair {pairs_done}/{pairs_total}: {category} × {state}",
+                    'info'
+                )
+
+            elif progress_type == 'batch_complete':
+                category = progress.get('category', '')
+                state = progress.get('state', '')
+                found = progress.get('found', 0)
+                new = progress.get('new', 0)
+                updated = progress.get('updated', 0)
+                discovery_state.add_log(
+                    f"✓ {category} × {state}: Found {found}, New {new}, Updated {updated}",
+                    'success'
+                )
+
+                # Update stats card with current totals
+                stats_card.clear()
+                with stats_card:
+                    ui.label('Running discovery...').classes('text-lg font-bold')
+                    ui.label(f'Found: {progress.get("total_found", 0)}')
+                    ui.label(f'New: {progress.get("total_new", 0)}')
+                    ui.label(f'Updated: {progress.get("total_updated", 0)}')
+                    ui.label(f'Errors: {progress.get("total_errors", 0)}')
+                    ui.label(f'Progress: {progress.get("pairs_done", 0)}/{progress.get("pairs_total", 0)} pairs')
+
+                # Update progress bar
+                if progress.get('pairs_total', 0) > 0:
+                    progress_bar.value = progress.get('pairs_done', 0) / progress.get('pairs_total', 1)
+
+            elif progress_type == 'batch_empty':
+                category = progress.get('category', '')
+                state = progress.get('state', '')
+                discovery_state.add_log(
+                    f"○ {category} × {state}: No results",
+                    'debug'
+                )
+
+            elif progress_type == 'batch_error':
+                category = progress.get('category', '')
+                state = progress.get('state', '')
+                error = progress.get('error', 'Unknown error')
+                discovery_state.add_log(
+                    f"✗ {category} × {state}: Error - {error}",
+                    'error'
+                )
+
+            elif progress_type == 'save_error':
+                category = progress.get('category', '')
+                state = progress.get('state', '')
+                error = progress.get('error', 'Unknown error')
+                discovery_state.add_log(
+                    f"✗ {category} × {state}: Save error - {error}",
+                    'error'
+                )
+
+            elif progress_type == 'cancelled':
+                discovery_state.add_log('Discovery cancelled by user', 'warning')
+
+        # Run discovery in I/O bound thread with progress callback
         result = await run.io_bound(
             backend.discover,
             categories,
             states,
             pages_per_pair,
-            lambda: discovery_state.is_cancelled()
+            lambda: discovery_state.is_cancelled(),
+            progress_callback
         )
+
+        discovery_state.add_log('Crawler completed!', 'success')
 
         # Update final stats
         elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
+
+        # Log final results
+        discovery_state.add_log('-' * 60, 'info')
+        discovery_state.add_log('Discovery Complete!', 'success')
+        discovery_state.add_log(f'Elapsed time: {elapsed:.1f}s', 'info')
+        discovery_state.add_log(f'Found: {result["found"]} businesses', 'success')
+        discovery_state.add_log(f'New: {result["new"]} businesses added', 'success')
+        discovery_state.add_log(f'Updated: {result["updated"]} businesses updated', 'info')
+        discovery_state.add_log(f'Errors: {result["errors"]}', 'error' if result["errors"] > 0 else 'info')
+        discovery_state.add_log(f'Pairs processed: {result["pairs_done"]}/{result["pairs_total"]}', 'info')
+        discovery_state.add_log('=' * 60, 'info')
 
         stats_card.clear()
         with stats_card:
@@ -128,6 +248,11 @@ async def run_discovery(
             )
 
     except Exception as e:
+        discovery_state.add_log('-' * 60, 'error')
+        discovery_state.add_log('Discovery Failed!', 'error')
+        discovery_state.add_log(f'Error: {str(e)}', 'error')
+        discovery_state.add_log('=' * 60, 'error')
+
         stats_card.clear()
         with stats_card:
             ui.label('Discovery Failed').classes('text-lg font-bold text-red-500')
@@ -148,6 +273,40 @@ def stop_discovery():
     if discovery_state.running:
         discovery_state.cancel()
         ui.notify('Cancelling discovery...', type='warning')
+
+
+async def export_last_run():
+    """Export the results from the last discovery run."""
+    if not discovery_state.last_run_summary:
+        ui.notify('No discovery run to export', type='warning')
+        return
+
+    summary = discovery_state.last_run_summary
+    timestamp = summary['timestamp'][:19].replace(':', '-').replace(' ', '_')
+    filename = f'discovery_run_{timestamp}.json'
+
+    try:
+        # Export summary as JSON
+        import json
+        import tempfile
+        import os
+
+        temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json')
+        json.dump(summary, temp_file, indent=2)
+        temp_file.close()
+
+        ui.download(temp_file.name, filename)
+        ui.notify(f'Exported discovery results to {filename}', type='positive')
+
+        # Clean up temp file after a delay
+        await asyncio.sleep(5)
+        try:
+            os.unlink(temp_file.name)
+        except:
+            pass
+
+    except Exception as e:
+        ui.notify(f'Export failed: {str(e)}', type='negative')
 
 
 async def export_new_urls():
@@ -191,15 +350,39 @@ def discover_page():
         # Use a dictionary to track category chips and their selection state
         category_chips = {}
 
+        def create_category_chip(category_name, selected=True):
+            """Create a category chip with visual indicators."""
+            chip_state = {'selected': selected}
+
+            def toggle_chip():
+                chip_state['selected'] = not chip_state['selected']
+                # Update visual appearance
+                if chip_state['selected']:
+                    chip.props(f'color=positive icon=check_circle')
+                    chip.classes(remove='bg-red-600 text-white')
+                    chip.classes(add='bg-green-600 text-white')
+                else:
+                    chip.props(f'color=negative icon=cancel')
+                    chip.classes(remove='bg-green-600')
+                    chip.classes(add='bg-red-600 text-white')
+
+            chip = ui.chip(
+                category_name,
+                icon='check_circle' if selected else 'cancel',
+                on_click=toggle_chip
+            ).props(f'clickable color={"positive" if selected else "negative"}')
+
+            if selected:
+                chip.classes('bg-green-600 text-white')
+            else:
+                chip.classes('bg-red-600 text-white')
+
+            category_chips[category_name] = chip_state
+            return chip
+
         with ui.row().classes('gap-2 flex-wrap mb-4'):
-            for category in DEFAULT_CATEGORIES[:5]:  # Show first 5 for testing
-                chip = ui.chip(
-                    category,
-                    icon='label',
-                    selectable=True,
-                    selected=True
-                ).props('color=primary')
-                category_chips[category] = chip
+            for category in DEFAULT_CATEGORIES:  # Show all categories
+                create_category_chip(category, selected=True)
 
         # State selection
         ui.label('States/Regions').classes('font-semibold mt-4 mb-2')
@@ -246,7 +429,7 @@ def discover_page():
             icon='play_arrow',
             color='positive',
             on_click=lambda: run_discovery(
-                [cat for cat, chip in category_chips.items() if chip.selected],
+                [cat for cat, state in category_chips.items() if state['selected']],
                 state_select.value,
                 int(pages_slider.value),
                 stats_card,
@@ -279,44 +462,32 @@ def discover_page():
     with stats_card:
         ui.label('Ready to run discovery').classes('text-lg text-gray-400 italic')
 
-    # Last run card
-    with ui.card().classes('w-full'):
-        ui.label('Last Run Summary').classes('text-xl font-bold mb-4')
+    # Live output log
+    with ui.card().classes('w-full mb-4'):
+        with ui.row().classes('w-full items-center mb-2'):
+            ui.label('Live Output').classes('text-xl font-bold')
+            ui.space()
+            clear_log_btn = ui.button(
+                'Clear',
+                icon='clear',
+                on_click=lambda: log_element.clear(),
+                color='secondary'
+            ).props('size=sm outline')
 
-        if discovery_state.last_run_summary:
-            summary = discovery_state.last_run_summary
-            result = summary['result']
+        # Create scrollable log container
+        log_container = ui.scroll_area().classes('w-full h-64 bg-gray-900 rounded p-2')
 
-            with ui.row().classes('gap-4'):
-                ui.label(f"Timestamp: {summary['timestamp'][:19]}").classes('text-sm')
-                ui.label(f"Elapsed: {summary['elapsed']:.1f}s").classes('text-sm')
+        with log_container:
+            log_element = ui.column().classes('w-full gap-0 font-mono text-xs')
 
-            ui.separator()
+        # Store reference for access in run_discovery
+        discovery_state.log_element = log_element
 
-            with ui.grid(columns=4).classes('w-full gap-4 mt-2'):
-                with ui.card().classes('p-3'):
-                    ui.label('Found').classes('text-gray-400 text-sm')
-                    ui.label(str(result['found'])).classes('text-2xl font-bold')
-
-                with ui.card().classes('p-3'):
-                    ui.label('New').classes('text-gray-400 text-sm')
-                    ui.label(str(result['new'])).classes('text-2xl font-bold text-green-500')
-
-                with ui.card().classes('p-3'):
-                    ui.label('Updated').classes('text-gray-400 text-sm')
-                    ui.label(str(result['updated'])).classes('text-2xl font-bold text-blue-500')
-
-                with ui.card().classes('p-3'):
-                    ui.label('Errors').classes('text-gray-400 text-sm')
-                    ui.label(str(result['errors'])).classes('text-2xl font-bold text-red-500')
-        else:
-            ui.label('No previous runs').classes('text-gray-400 italic')
-
-    # Instructions
-    with ui.card().classes('w-full mt-4'):
-        ui.label('Instructions').classes('text-lg font-bold mb-2')
-        ui.label('1. Select business categories and states').classes('text-sm')
-        ui.label('2. Adjust pages per pair (more pages = more results but slower)').classes('text-sm')
-        ui.label('3. Click RUN to start discovery').classes('text-sm')
-        ui.label('4. Use STOP to cancel if needed').classes('text-sm')
-        ui.label('5. Export new URLs to download discovered businesses').classes('text-sm')
+    # Instructions - Collapsible
+    with ui.expansion('📖 Instructions', icon='help').classes('w-full mt-4'):
+        with ui.card().classes('p-4'):
+            ui.label('1. Select business categories and states').classes('text-sm mb-2')
+            ui.label('2. Adjust pages per pair (more pages = more results but slower)').classes('text-sm mb-2')
+            ui.label('3. Click RUN to start discovery').classes('text-sm mb-2')
+            ui.label('4. Use STOP to cancel if needed').classes('text-sm mb-2')
+            ui.label('5. Export new URLs to download discovered businesses').classes('text-sm')

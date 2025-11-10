@@ -6,3 +6,6 @@ beautifulsoup4>=4.12.0
 lxml>=4.9.0
 python-dotenv>=1.0.0
 tldextract>=5.0.0
+
+# Headless browser for anti-blocking
+playwright>=1.40.0

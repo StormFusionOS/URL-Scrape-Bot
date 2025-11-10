@@ -19,18 +19,18 @@ from scrape_yp.yp_client import fetch_yp_search_page, parse_yp_results
 # Initialize logger
 logger = get_logger("yp_crawl")
 
-# Default categories to crawl
+# Default categories to crawl - using broader terms that return consistent results
 CATEGORIES = [
     "pressure washing",
     "power washing",
     "soft washing",
     "window cleaning",
-    "window washing",
-    "deck restoration",
-    "deck staining",
-    "wood restoration",
-    "fence staining",
-    "log home restoration",
+    "gutter cleaning",
+    "roof cleaning",
+    "deck cleaning",
+    "concrete cleaning",
+    "house cleaning exterior",
+    "driveway cleaning",
 ]
 
 # US States (2-letter codes)
@@ -220,6 +220,9 @@ def crawl_all_states(
     total_combinations = len(categories) * len(states)
     current = 0
 
+    import time
+    import random
+
     for state in states:
         for category in categories:
             current += 1
@@ -262,6 +265,13 @@ def crawl_all_states(
                     "count": 0,
                     "error": str(e),
                 }
+
+        # Add cooldown period after each state (all categories for one state)
+        # This gives Yellow Pages time to "forget" about us
+        if state != states[-1]:  # Don't sleep after last state
+            cooldown = random.uniform(15, 25)  # 15-25 second cooldown
+            logger.info(f"Cooldown period: sleeping {cooldown:.1f}s before next state...")
+            time.sleep(cooldown)
 
 
 def main():

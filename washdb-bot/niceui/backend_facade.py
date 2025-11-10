@@ -38,7 +38,8 @@ class BackendFacade:
         categories: List[str],
         states: List[str],
         pages_per_pair: int,
-        cancel_flag: Optional[Callable[[], bool]] = None
+        cancel_flag: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable[[dict], None]] = None
     ) -> Dict[str, int]:
         """
         Run YP discovery across category×state with pagination and dedup.
@@ -48,6 +49,7 @@ class BackendFacade:
             states: List of state codes to search
             pages_per_pair: Number of pages to crawl per category-state pair
             cancel_flag: Optional callable that returns True to cancel operation
+            progress_callback: Optional callable to receive progress updates
 
         Returns:
             Dict with keys:
@@ -86,19 +88,56 @@ class BackendFacade:
                 # Check for cancellation
                 if cancel_flag and cancel_flag():
                     logger.warning("Discovery cancelled by user")
+                    if progress_callback:
+                        progress_callback({
+                            'type': 'cancelled',
+                            'pairs_done': pairs_done,
+                            'pairs_total': total_pairs
+                        })
                     break
 
                 pairs_done += 1
+
+                # Get category and state from batch metadata if available
+                category = batch.get("category", "")
+                state = batch.get("state", "")
+
+                # Report progress: starting batch
+                if progress_callback:
+                    progress_callback({
+                        'type': 'batch_start',
+                        'pairs_done': pairs_done,
+                        'pairs_total': total_pairs,
+                        'category': category,
+                        'state': state
+                    })
 
                 # Check if batch has results
                 if batch.get("error"):
                     total_errors += 1
                     logger.warning(f"Error in batch {pairs_done}/{total_pairs}: {batch['error']}")
+                    if progress_callback:
+                        progress_callback({
+                            'type': 'batch_error',
+                            'pairs_done': pairs_done,
+                            'pairs_total': total_pairs,
+                            'category': category,
+                            'state': state,
+                            'error': batch['error']
+                        })
                     continue
 
                 results = batch.get("results", [])
                 if not results:
                     logger.info(f"No results in batch {pairs_done}/{total_pairs}")
+                    if progress_callback:
+                        progress_callback({
+                            'type': 'batch_empty',
+                            'pairs_done': pairs_done,
+                            'pairs_total': total_pairs,
+                            'category': category,
+                            'state': state
+                        })
                     continue
 
                 total_found += len(results)
@@ -114,9 +153,35 @@ class BackendFacade:
                         f"{len(results)} found, {inserted} new, {updated} updated"
                     )
 
+                    # Report progress: batch complete
+                    if progress_callback:
+                        progress_callback({
+                            'type': 'batch_complete',
+                            'pairs_done': pairs_done,
+                            'pairs_total': total_pairs,
+                            'category': category,
+                            'state': state,
+                            'found': len(results),
+                            'new': inserted,
+                            'updated': updated,
+                            'total_found': total_found,
+                            'total_new': total_new,
+                            'total_updated': total_updated,
+                            'total_errors': total_errors
+                        })
+
                 except Exception as e:
                     total_errors += 1
                     logger.error(f"Error saving batch {pairs_done}: {e}", exc_info=True)
+                    if progress_callback:
+                        progress_callback({
+                            'type': 'save_error',
+                            'pairs_done': pairs_done,
+                            'pairs_total': total_pairs,
+                            'category': category,
+                            'state': state,
+                            'error': str(e)
+                        })
                     continue
 
         except Exception as e:
