@@ -9,7 +9,7 @@ This module provides:
 """
 
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Callable
 
 from sqlalchemy import select, or_, and_
 
@@ -133,6 +133,8 @@ def update_batch(
     limit: int = 100,
     stale_days: int = 30,
     only_missing_email: bool = False,
+    cancel_flag: Optional[Callable[[], bool]] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ) -> dict:
     """
     Batch update companies by scraping their websites.
@@ -146,6 +148,8 @@ def update_batch(
         limit: Maximum number of companies to update (default: 100)
         stale_days: Consider companies stale after this many days (default: 30)
         only_missing_email: Only update companies missing email (default: False)
+        cancel_flag: Optional callable that returns True to cancel operation
+        progress_callback: Optional callable to receive progress updates
 
     Returns:
         Dict with summary:
@@ -204,6 +208,11 @@ def update_batch(
 
         # Process each company
         for i, company in enumerate(companies, 1):
+            # Check for cancellation
+            if cancel_flag and cancel_flag():
+                logger.warning(f"Batch update cancelled by user at {i}/{len(companies)}")
+                break
+
             logger.info(f"[{i}/{len(companies)}] Processing: {company.name} ({company.website})")
 
             try:
@@ -233,6 +242,23 @@ def update_batch(
                 summary["errors"] += 1
                 logger.error(f"  ✗ Unexpected error: {e}", exc_info=True)
                 continue
+
+            # Send progress update
+            if progress_callback:
+                try:
+                    progress_callback({
+                        "current": i,
+                        "total": len(companies),
+                        "processed": summary["total_processed"],
+                        "updated": summary["updated"],
+                        "skipped": summary["skipped"],
+                        "errors": summary["errors"],
+                        "company_name": company.name,
+                        "company_website": company.website,
+                        "last_result": result,
+                    })
+                except Exception as e:
+                    logger.warning(f"Progress callback error: {e}")
 
         # Print summary
         logger.info("")
