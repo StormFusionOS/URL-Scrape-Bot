@@ -18,6 +18,11 @@ from db.update_details import update_batch
 from db.models import Company, canonicalize_url, domain_from_url
 from runner.logging_setup import get_logger
 
+# Import Google scraper modules
+from scrape_google.google_crawl import GoogleCrawler
+from scrape_google.google_config import GoogleConfig
+import asyncio
+
 # SQLAlchemy imports for queries
 from sqlalchemy import select, func, or_, and_
 
@@ -199,6 +204,90 @@ class BackendFacade:
 
         logger.info(f"Discovery complete: {result}")
         return result
+
+    def discover_google(
+        self,
+        query: str,
+        location: str = None,
+        max_results: int = 20,
+        scrape_details: bool = True,
+        cancel_flag: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable[[dict], None]] = None
+    ) -> Dict[str, Any]:
+        """
+        Run Google Maps discovery and scraping.
+
+        Args:
+            query: Search query (e.g., "car wash")
+            location: Location (e.g., "Seattle, WA")
+            max_results: Maximum results to scrape
+            scrape_details: Whether to scrape detailed info for each business
+            cancel_flag: Optional callable that returns True to cancel operation
+            progress_callback: Optional callable to receive progress updates
+
+        Returns:
+            Dict with keys:
+            - success: Boolean indicating if operation completed successfully
+            - found: Total businesses found
+            - saved: Businesses saved to database
+            - duplicates: Duplicates skipped
+            - errors: Number of errors encountered
+            - results: List of scraped business data
+        """
+        logger.info(
+            f"Starting Google discovery: query='{query}', location='{location}', "
+            f"max_results={max_results}, scrape_details={scrape_details}"
+        )
+
+        # Create Google config (can be customized via environment variables)
+        config = GoogleConfig.from_env()
+
+        # Create crawler with progress tracking
+        crawler = GoogleCrawler(config=config, logger=None)
+
+        # Set up progress callback wrapper
+        def google_progress_callback(status: str, message: str, stats: Dict):
+            """Wrapper to adapt GoogleCrawler progress to GUI format."""
+            if cancel_flag and cancel_flag():
+                # Cancellation is handled by the async task
+                logger.warning("Google discovery cancelled by user")
+                return
+
+            if progress_callback:
+                progress_callback({
+                    'type': status,
+                    'message': message,
+                    'found': stats.get('businesses_found', 0),
+                    'saved': stats.get('businesses_saved', 0),
+                    'duplicates': stats.get('duplicates_skipped', 0),
+                    'errors': stats.get('errors', 0)
+                })
+
+        crawler.set_progress_callback(google_progress_callback)
+
+        # Run the async scraping operation
+        try:
+            # Create async task
+            result = asyncio.run(crawler.search_and_save(
+                query=query,
+                location=location,
+                max_results=max_results,
+                scrape_details=scrape_details
+            ))
+
+            logger.info(f"Google discovery complete: {result}")
+            return result
+
+        except Exception as e:
+            logger.error(f"Google discovery error: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+                "found": 0,
+                "saved": 0,
+                "duplicates": 0,
+                "errors": 1
+            }
 
     def scrape_batch(
         self,
