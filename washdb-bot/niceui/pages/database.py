@@ -392,15 +392,17 @@ def database_page():
                 ui.label('• Export creates a timestamped CSV file').classes('text-sm text-gray-400')
 
     # Load initial data on page creation
-    ui.timer(0.1, lambda: load_companies(), once=True)
+    async def initial_load():
+        await load_companies()
+    ui.timer(0.1, initial_load, once=True)
 
     # Listen for scrape complete events to auto-refresh
-    def check_refresh():
+    async def check_refresh():
         """Check if scrape completed and refresh if needed."""
         if app.storage.general.get('scrape_complete'):
             # Clear the flag
             del app.storage.general['scrape_complete']
             # Reload data
-            load_companies(database_state.search_text)
+            await load_companies(database_state.search_text)
 
     ui.timer(2.0, check_refresh)  # Check every 2 seconds
