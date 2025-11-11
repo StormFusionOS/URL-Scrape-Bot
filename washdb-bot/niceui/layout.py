@@ -65,8 +65,11 @@ class AppLayout:
             # Menu button for drawer
             ui.button(icon='menu', on_click=lambda: self.drawer.toggle()).props('flat color=white')
 
+            # Logo
+            ui.image('/static/logo.svg').classes('h-10 ml-2')
+
             # App title
-            ui.label('Washdb-Bot Dashboard').classes('text-xl font-bold ml-2')
+            ui.label('StormFusion OS URL').classes('text-xl font-bold ml-2')
 
             # Environment badge
             ui.badge('DEV', color='accent').classes('ml-2')

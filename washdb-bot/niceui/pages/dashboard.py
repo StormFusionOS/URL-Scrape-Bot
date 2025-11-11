@@ -295,18 +295,6 @@ def dashboard_page():
                 create_kpi_card('Updated (30d)', kpis['updated_30d'], 'update', 'warning')
                 create_kpi_card('New (7d)', kpis['new_7d'], 'fiber_new', 'accent')
 
-            # Sparklines
-            with ui.card().classes('w-full mb-6'):
-                ui.label('Recent Trends').classes('text-xl font-bold mb-4')
-                with ui.row().classes('w-full gap-6'):
-                    # TODO: Replace with real data from database
-                    # Generate sample data for sparklines (7 days)
-                    new_urls_7d = [random.randint(5, 25) for _ in range(7)]
-                    updated_7d = [random.randint(10, 40) for _ in range(7)]
-
-                    create_sparkline_chart('New URLs (7d)', new_urls_7d, COLORS['accent'])
-                    create_sparkline_chart('Updated (7d)', updated_7d, COLORS['positive'])
-
         # DISCOVERY TAB
         with ui.tab_panel(discovery_tab):
             ui.label('Discovery Metrics').classes('text-2xl font-bold mb-4')
