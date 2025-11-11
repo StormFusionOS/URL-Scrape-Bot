@@ -1,0 +1,17 @@
+# Logrotate configuration for washdb-bot
+# Install: sudo cp washdb-bot-logrotate /etc/logrotate.d/washdb-bot
+
+/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 rivercityscrape rivercityscrape
+    sharedscripts
+    postrotate
+        # Signal the application to reopen log files if needed
+        systemctl reload washdb-bot.service 2>/dev/null || true
+    endscript
+}

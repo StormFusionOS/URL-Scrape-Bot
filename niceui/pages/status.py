@@ -1,0 +1,476 @@
+"""
+Status & History page - comprehensive dashboard for live activity and past runs.
+"""
+
+import asyncio
+from datetime import datetime, timedelta
+from nicegui import ui, run
+from ..router import event_bus
+from ..utils import job_state, history_manager
+from ..layout import layout
+import tempfile
+
+
+# Page state
+class StatusPageState:
+    """State for the status page."""
+    def __init__(self):
+        self.log_element = None
+        self.auto_scroll = True
+        self.status_badge = None
+        self.job_name_label = None
+        self.start_time_label = None
+        self.elapsed_label = None
+        self.items_label = None
+        self.errors_label = None
+        self.throughput_label = None
+        self.progress_bar = None
+        self.history_table = None
+        self.stats_cards = {}
+        self.update_timer = None
+
+
+status_state = StatusPageState()
+
+
+def get_status_color(exit_code, is_running, is_stalled):
+    """Get badge color based on status."""
+    if is_stalled:
+        return 'red'
+    if is_running:
+        return 'blue'
+    if exit_code is None:
+        return 'grey'
+    return 'positive' if exit_code == 0 else 'negative'
+
+
+def get_status_text(exit_code, is_running, is_stalled):
+    """Get status text."""
+    if is_stalled:
+        return 'STALLED'
+    if is_running:
+        return 'RUNNING'
+    if exit_code is None:
+        return 'IDLE'
+    return 'FINISHED' if exit_code == 0 else 'FAILED'
+
+
+def format_duration(seconds):
+    """Format duration in seconds to human readable."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        return f"{int(seconds // 60)}m {int(seconds % 60)}s"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        return f"{hours}h {minutes}m"
+
+
+async def update_live_stats():
+    """Update live statistics (called by timer)."""
+    if not job_state.active_job or not job_state.streamer:
+        return
+
+    try:
+        # Update status badge
+        is_stalled = job_state.streamer.is_stalled(30)
+        is_running = job_state.streamer.running
+        exit_code = job_state.streamer.exit_code
+
+        # Update elapsed time ONLY if job is still running
+        if is_running:
+            elapsed = job_state.streamer.get_elapsed()
+            if status_state.elapsed_label:
+                status_state.elapsed_label.set_text(format_duration(elapsed))
+
+        if status_state.status_badge:
+            color = get_status_color(exit_code, is_running, is_stalled)
+            text = get_status_text(exit_code, is_running, is_stalled)
+            status_state.status_badge.props(f'color={color}')
+            status_state.status_badge.set_text(text)
+
+        # Update metrics
+        metrics = job_state.metrics
+        if status_state.items_label:
+            if metrics['items_total'] > 0:
+                status_state.items_label.set_text(
+                    f"{metrics['items_done']} / {metrics['items_total']}"
+                )
+            else:
+                status_state.items_label.set_text(f"{metrics['items_done']}")
+
+        if status_state.errors_label:
+            status_state.errors_label.set_text(str(metrics['errors']))
+
+        if status_state.throughput_label:
+            status_state.throughput_label.set_text(f"{metrics['throughput']:.1f} items/min")
+
+        # Update progress bar
+        if status_state.progress_bar and metrics['items_total'] > 0:
+            progress = metrics['items_done'] / metrics['items_total']
+            status_state.progress_bar.value = progress
+
+    except Exception as e:
+        print(f"Error updating live stats: {e}")
+
+
+def add_log_line(line_type: str, line: str):
+    """Add a line to the log viewer."""
+    if not status_state.log_element:
+        return
+
+    # Determine color based on content
+    line_lower = line.lower()
+    if 'error' in line_lower or line_type == 'stderr':
+        color = 'red'
+    elif 'warning' in line_lower or 'warn' in line_lower:
+        color = 'yellow'
+    elif 'info' in line_lower:
+        color = 'lightblue'
+    else:
+        color = 'white'
+
+    # Add timestamp
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    formatted = f"[{timestamp}] {line}"
+
+    # Store in job state first
+    job_state.logs.append((datetime.now(), line_type, line))
+
+    # Parse for metrics
+    job_state.parse_metrics(line)
+
+    # Add to log element
+    try:
+        # Escape HTML entities in the line
+        import html
+        escaped_line = html.escape(formatted)
+
+        with status_state.log_element:
+            ui.html(f'<div style="color: {color}; font-family: monospace; font-size: 12px; white-space: pre-wrap;">{escaped_line}</div>')
+
+        # Auto-scroll if enabled
+        if status_state.auto_scroll:
+            ui.run_javascript('''
+                const logContainer = document.querySelector('#log-container');
+                if (logContainer) {
+                    logContainer.scrollTop = logContainer.scrollHeight;
+                }
+            ''')
+
+    except Exception as e:
+        print(f"Error adding log line: {e}")
+
+
+async def start_test_job():
+    """Start a test job (simulated)."""
+    if job_state.active_job:
+        ui.notify('A job is already running', type='warning')
+        return
+
+    layout.show_busy()
+
+    # Capture the current client context for UI updates
+    from nicegui import context
+    client = context.get_client()
+
+    try:
+        # Reset state
+        job_state.reset()
+        job_state.active_job = {
+            'name': 'Test Job',
+            'type': 'Test',
+            'args': {'mode': 'test'},
+            'start_time': datetime.now()
+        }
+
+        # Update UI
+        if status_state.job_name_label:
+            status_state.job_name_label.set_text('Test Job')
+        if status_state.start_time_label:
+            status_state.start_time_label.set_text(
+                job_state.active_job['start_time'].strftime('%Y-%m-%d %H:%M:%S')
+            )
+
+        # Create streamer
+        from ..utils.cli_stream import CLIStreamer
+        job_state.streamer = CLIStreamer()
+
+        # Simulate job with echo commands
+        def on_line(line_type, line):
+            # Push UI update to the correct client
+            with client:
+                add_log_line(line_type, line)
+
+        def on_complete(exit_code, duration):
+            # Push UI updates to the correct client
+            with client:
+                # Add to history
+                history_manager.add_run(
+                    job_type='Test',
+                    args={'mode': 'test'},
+                    duration_sec=duration,
+                    exit_code=exit_code,
+                    counts={
+                        'found': job_state.metrics['items_done'],
+                        'errors': job_state.metrics['errors']
+                    },
+                    notes='Test run'
+                )
+
+                # Refresh history table
+                load_history_table()
+
+                ui.notify(f'Job completed in {format_duration(duration)}',
+                          type='positive' if exit_code == 0 else 'negative')
+
+                layout.hide_busy()
+
+        # Run test command
+        await job_state.streamer.run_command(
+            ['bash', '-c', 'for i in {1..10}; do echo "Processing item $i"; sleep 0.5; done; echo "Done"'],
+            on_line=on_line,
+            on_complete=on_complete
+        )
+
+    except Exception as e:
+        ui.notify(f'Error starting job: {e}', type='negative')
+        job_state.reset()
+        layout.hide_busy()
+
+
+async def cancel_job():
+    """Cancel the running job."""
+    if not job_state.active_job or not job_state.streamer:
+        ui.notify('No job to cancel', type='warning')
+        return
+
+    try:
+        await job_state.streamer.terminate()
+        ui.notify('Job cancelled', type='warning')
+        layout.hide_busy()
+    except Exception as e:
+        ui.notify(f'Error cancelling job: {e}', type='negative')
+
+
+def clear_log():
+    """Clear the log viewer."""
+    if status_state.log_element:
+        status_state.log_element.clear()
+        job_state.logs = []
+        ui.notify('Log cleared', type='info')
+
+
+def clear_discovery_log():
+    """Clear the discovery log viewer."""
+    from .discover import discovery_state
+    if discovery_state.log_element:
+        discovery_state.log_element.clear()
+        ui.notify('Discovery log cleared', type='info')
+
+
+def copy_log():
+    """Copy log to clipboard."""
+    if not job_state.logs:
+        ui.notify('No logs to copy', type='warning')
+        return
+
+    log_text = '\n'.join(f"[{ts.strftime('%H:%M:%S')}] {line}" for ts, _, line in job_state.logs)
+
+    ui.run_javascript(f'''
+        navigator.clipboard.writeText(`{log_text}`);
+    ''')
+    ui.notify('Log copied to clipboard', type='positive')
+
+
+def load_history_table(job_filter=None, search_text=None):
+    """Load history into table."""
+    if not status_state.history_table:
+        return
+
+    runs = history_manager.filter_runs(job_type=job_filter, search=search_text, limit=100)
+
+    # Convert to table rows
+    rows = []
+    for run in runs:
+        counts = run.get('counts', {})
+        timestamp = run.get('timestamp', '')
+        if timestamp:
+            try:
+                dt = datetime.fromisoformat(timestamp)
+                timestamp = dt.strftime('%Y-%m-%d %H:%M:%S')
+            except:
+                pass
+
+        rows.append({
+            'timestamp': timestamp,
+            'job_type': run.get('job_type', ''),
+            'duration': format_duration(run.get('duration_sec', 0)),
+            'exit_code': run.get('exit_code', -1),
+            'found': counts.get('found', 0),
+            'updated': counts.get('updated', 0),
+            'errors': counts.get('errors', 0),
+            'args': str(run.get('args', {}))[:50],
+            'log_path': run.get('log_path', ''),
+        })
+
+    status_state.history_table.options['rowData'] = rows
+    status_state.history_table.update()
+
+
+def export_history_csv():
+    """Export history to CSV."""
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
+            temp_path = f.name
+
+        history_manager.export_csv(temp_path)
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f'history_{timestamp}.csv'
+
+        ui.download(temp_path, filename)
+        ui.notify('History exported', type='positive')
+
+    except Exception as e:
+        ui.notify(f'Error exporting: {e}', type='negative')
+
+
+def clear_history():
+    """Clear all history."""
+    history_manager.clear_history()
+    load_history_table()
+    ui.notify('History cleared', type='warning')
+
+
+def status_page():
+    """Render status & history page."""
+    ui.label('History').classes('text-3xl font-bold mb-4')
+
+    # ======================
+    # DISCOVERY SOURCES
+    # ======================
+
+    ui.label('Discovery Sources').classes('text-2xl font-bold mb-2')
+
+    # Create cards for each discovery source
+    discovery_sources = [
+        ('Discovery - Yellow Pages', 'Yellow Pages', 'yellow'),
+        ('Discovery - HomeAdvisor', 'HomeAdvisor', 'orange'),
+        ('Discovery - Google Maps', 'Google Maps', 'blue')
+    ]
+
+    with ui.row().classes('w-full gap-4 mb-4'):
+        for job_type, display_name, color in discovery_sources:
+            # Get stats for this source
+            source_runs = history_manager.filter_runs(job_type=job_type, limit=None)
+            total_runs = len(source_runs)
+            success_runs = sum(1 for r in source_runs if r.get('exit_code') == 0)
+            success_rate = (success_runs / total_runs * 100) if total_runs > 0 else 0
+
+            # Calculate total items found
+            total_found = sum(r.get('counts', {}).get('found', 0) for r in source_runs)
+            total_new = sum(r.get('counts', {}).get('new', 0) for r in source_runs)
+            total_saved = sum(r.get('counts', {}).get('saved', 0) for r in source_runs)
+            total_items = total_new or total_saved or total_found
+
+            # Get last run time
+            last_run = source_runs[0] if source_runs else None
+            last_run_time = 'Never'
+            if last_run:
+                try:
+                    dt = datetime.fromisoformat(last_run['timestamp'])
+                    last_run_time = dt.strftime('%m/%d %H:%M')
+                except:
+                    last_run_time = 'Unknown'
+
+            with ui.card().classes(f'flex-1 bg-{color}-900'):
+                ui.label(display_name).classes('text-lg font-bold mb-3')
+
+                # Success rate progress bar
+                ui.label('Success Rate').classes('text-xs text-gray-300 mb-1')
+                ui.linear_progress(
+                    value=success_rate / 100,
+                    show_value=False
+                ).classes('mb-2').props(f'color={color}')
+                ui.label(f'{success_rate:.0f}% ({success_runs}/{total_runs})').classes('text-sm mb-3')
+
+                # Stats
+                with ui.column().classes('gap-1'):
+                    ui.label(f'Total Runs: {total_runs}').classes('text-sm')
+                    ui.label(f'Items Found: {total_items}').classes('text-sm')
+                    ui.label(f'Last Run: {last_run_time}').classes('text-xs text-gray-400')
+
+    # ======================
+    # RUN HISTORY
+    # ======================
+
+    ui.label('All Run History').classes('text-2xl font-bold mb-2 mt-6')
+
+    with ui.card().classes('w-full mb-4'):
+        # Summary stats
+        stats = history_manager.get_stats()
+
+        with ui.row().classes('w-full gap-4 mb-4'):
+            with ui.card().classes('flex-1 bg-blue-900'):
+                ui.label('Total Runs').classes('text-sm text-gray-300')
+                ui.label(str(stats['total_runs'])).classes('text-2xl font-bold')
+
+            with ui.card().classes('flex-1 bg-green-900'):
+                ui.label('Successful').classes('text-sm text-gray-300')
+                ui.label(str(stats['success_count'])).classes('text-2xl font-bold')
+
+            with ui.card().classes('flex-1 bg-red-900'):
+                ui.label('Failed').classes('text-sm text-gray-300')
+                ui.label(str(stats['error_count'])).classes('text-2xl font-bold')
+
+            with ui.card().classes('flex-1 bg-purple-900'):
+                ui.label('Avg Duration').classes('text-sm text-gray-300')
+                ui.label(format_duration(stats['avg_duration'])).classes('text-2xl font-bold')
+
+        # Filters
+        with ui.row().classes('w-full gap-4 mb-4'):
+            job_filter = ui.select(
+                ['All', 'Discover', 'Scrape', 'Single URL'],
+                value='All',
+                label='Job Type'
+            ).classes('w-48')
+
+            search_input = ui.input('Search', placeholder='Search args/notes...').classes('flex-1')
+
+            ui.button('Filter', icon='filter_list',
+                      on_click=lambda: load_history_table(
+                          None if job_filter.value == 'All' else job_filter.value,
+                          search_input.value if search_input.value else None
+                      )).props('outline')
+
+            ui.button('Export CSV', icon='download', color='primary',
+                      on_click=export_history_csv).props('outline')
+
+            ui.button('Clear History', icon='delete_forever', color='negative',
+                      on_click=clear_history).props('outline')
+
+        # History table
+        status_state.history_table = ui.aggrid({
+            'columnDefs': [
+                {'field': 'timestamp', 'headerName': 'Timestamp', 'sortable': True, 'width': 180},
+                {'field': 'job_type', 'headerName': 'Job Type', 'sortable': True, 'width': 120},
+                {'field': 'duration', 'headerName': 'Duration', 'sortable': True, 'width': 100},
+                {'field': 'exit_code', 'headerName': 'Exit Code', 'sortable': True, 'width': 100},
+                {'field': 'found', 'headerName': 'Found', 'sortable': True, 'width': 90},
+                {'field': 'updated', 'headerName': 'Updated', 'sortable': True, 'width': 90},
+                {'field': 'errors', 'headerName': 'Errors', 'sortable': True, 'width': 90},
+                {'field': 'args', 'headerName': 'Args', 'flex': 1},
+            ],
+            'rowData': [],
+            'rowSelection': 'single',
+            'pagination': True,
+            'paginationPageSize': 20,
+        }).classes('w-full').style('height: 400px;')
+
+        # Load initial data
+        load_history_table()
+
+    # Start update timer for live stats
+    status_state.update_timer = ui.timer(1.0, lambda: update_live_stats())
