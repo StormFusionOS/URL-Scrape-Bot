@@ -404,11 +404,11 @@ def settings_page():
                 'Pages per Pair',
                 value=config_manager.get('defaults', 'pages_per_pair', 1),
                 min=1,
-                max=10,
+                max=50,
                 format='%.0f'
             ).classes('w-48')
 
-        ui.label('Number of pages to crawl per category-state combination').classes(
+        ui.label('Search depth: number of result pages to crawl per category/state search').classes(
             'text-xs text-gray-500 ml-48 mb-4'
         )
 

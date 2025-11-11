@@ -56,6 +56,11 @@ class AppLayout:
             pass
         return "1.0.0"
 
+    def _toggle_drawer(self):
+        """Toggle the navigation drawer."""
+        if self.drawer:
+            self.drawer.toggle()
+
     def create_header(self):
         """Create application header."""
         with ui.header().classes('items-center').style(
@@ -63,10 +68,7 @@ class AppLayout:
         ) as self.header_element:
 
             # Menu button for drawer
-            ui.button(icon='menu', on_click=lambda: self.drawer.toggle()).props('flat color=white')
-
-            # Logo
-            ui.image('/static/logo.svg').classes('h-10 ml-2')
+            ui.button(icon='menu', on_click=self._toggle_drawer).props('flat color=white')
 
             # App title
             ui.label('StormFusion OS URL').classes('text-xl font-bold ml-2')
@@ -106,6 +108,7 @@ class AppLayout:
                 {'name': 'Dashboard', 'icon': 'dashboard', 'page': 'dashboard'},
                 {'name': 'Discover', 'icon': 'search', 'page': 'discover'},
                 {'name': 'Database', 'icon': 'storage', 'page': 'database'},
+                {'name': 'Scheduler', 'icon': 'schedule', 'page': 'scheduler'},
                 {'name': 'Logs', 'icon': 'article', 'page': 'logs'},
                 {'name': 'Status', 'icon': 'timeline', 'page': 'status'},
                 {'name': 'Settings', 'icon': 'settings', 'page': 'settings'},
@@ -145,6 +148,7 @@ class AppLayout:
             {'name': 'Dashboard', 'icon': 'dashboard', 'page': 'dashboard'},
             {'name': 'Discover', 'icon': 'search', 'page': 'discover'},
             {'name': 'Database', 'icon': 'storage', 'page': 'database'},
+            {'name': 'Scheduler', 'icon': 'schedule', 'page': 'scheduler'},
             {'name': 'Logs', 'icon': 'article', 'page': 'logs'},
             {'name': 'Status', 'icon': 'timeline', 'page': 'status'},
             {'name': 'Settings', 'icon': 'settings', 'page': 'settings'},

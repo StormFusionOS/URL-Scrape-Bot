@@ -1,5 +1,5 @@
 """
-Logs page - real-time application logs with tailing and filtering.
+Logs page - comprehensive log viewing with multi-file support, filtering, and search.
 """
 
 from nicegui import ui
@@ -8,6 +8,7 @@ import asyncio
 from pathlib import Path
 from collections import deque
 from datetime import datetime
+import os
 
 
 # Global state for log tailing
@@ -15,10 +16,13 @@ class LogState:
     def __init__(self):
         self.tailing = False
         self.log_position = 0
-        self.error_entries = deque(maxlen=50)  # Last 50 errors
+        self.error_entries = deque(maxlen=100)  # Last 100 errors
         self.timer = None
         self.log_element = None
         self.error_table = None
+        self.current_log_file = 'backend_facade.log'  # Default to biggest log
+        self.search_text = ''
+        self.level_filter = 'ALL'
 
 
 log_state = LogState()
@@ -111,33 +115,202 @@ def clear_logs():
 
 def download_logs():
     """Download current logs."""
-    log_file = Path('logs/scraper.log')
+    log_file = Path(f'logs/{log_state.current_log_file}')
 
     if log_file.exists():
         ui.download(str(log_file))
-        ui.notify('Downloading log file...', type='positive')
+        ui.notify(f'Downloading {log_state.current_log_file}...', type='positive')
     else:
         ui.notify('Log file not found', type='warning')
 
 
+def get_log_files():
+    """Get list of all available log files with sizes."""
+    log_dir = Path('logs')
+
+    if not log_dir.exists():
+        return []
+
+    log_files = []
+    for log_file in sorted(log_dir.glob('*.log')):
+        try:
+            size = log_file.stat().st_size
+            # Convert size to human readable
+            if size < 1024:
+                size_str = f'{size}B'
+            elif size < 1024 * 1024:
+                size_str = f'{size/1024:.1f}KB'
+            else:
+                size_str = f'{size/(1024*1024):.1f}MB'
+
+            log_files.append({
+                'name': log_file.name,
+                'size': size,
+                'size_str': size_str,
+                'modified': datetime.fromtimestamp(log_file.stat().st_mtime)
+            })
+        except Exception as e:
+            logging.error(f'Error reading log file {log_file}: {e}')
+
+    # Sort by size descending
+    log_files.sort(key=lambda x: x['size'], reverse=True)
+    return log_files
+
+
+def load_log_content(log_file: str, max_lines: int = 1000, filter_level: str = 'ALL', search: str = ''):
+    """Load log file content with filtering."""
+    log_path = Path(f'logs/{log_file}')
+
+    if not log_path.exists():
+        return []
+
+    try:
+        with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+            # Read last N lines for large files
+            lines = f.readlines()
+
+            # Take last max_lines
+            if len(lines) > max_lines:
+                lines = lines[-max_lines:]
+
+            # Apply filters
+            filtered_lines = []
+            for line in lines:
+                line = line.rstrip()
+                if not line:
+                    continue
+
+                # Level filter
+                if filter_level != 'ALL':
+                    if filter_level not in line:
+                        continue
+
+                # Search filter
+                if search and search.lower() not in line.lower():
+                    continue
+
+                filtered_lines.append(line)
+
+            return filtered_lines
+
+    except Exception as e:
+        logging.error(f'Error loading log file {log_file}: {e}')
+        return [f'Error loading log: {str(e)}']
+
+
+def switch_log_file(file_name: str):
+    """Switch to a different log file."""
+    log_state.current_log_file = file_name
+    log_state.log_position = 0  # Reset position for tailing
+
+    # Reload log content
+    if log_state.log_element:
+        log_state.log_element.clear()
+        lines = load_log_content(
+            file_name,
+            max_lines=500,
+            filter_level=log_state.level_filter,
+            search=log_state.search_text
+        )
+        for line in lines:
+            log_state.log_element.push(line)
+
+    ui.notify(f'Switched to {file_name}', type='info')
+
+
+def refresh_logs():
+    """Manually refresh the current log view."""
+    if log_state.log_element:
+        log_state.log_element.clear()
+        lines = load_log_content(
+            log_state.current_log_file,
+            max_lines=500,
+            filter_level=log_state.level_filter,
+            search=log_state.search_text
+        )
+        for line in lines:
+            log_state.log_element.push(line)
+
+    ui.notify('Logs refreshed', type='positive')
+
+
+def apply_filters():
+    """Apply search and level filters to current log."""
+    refresh_logs()
+
+
 def logs_page():
-    """Render logs page with real-time tailing."""
+    """Render comprehensive logs page with multi-file support."""
     ui.label('Application Logs').classes('text-3xl font-bold mb-4')
 
-    # Top control bar
+    # Get available log files
+    log_files = get_log_files()
+    log_file_names = [f['name'] for f in log_files]
+
+    # File browser card
     with ui.card().classes('w-full mb-4'):
-        with ui.row().classes('w-full items-center gap-4'):
-            # Log level filter
-            ui.label('Level:').classes('font-semibold')
+        with ui.row().classes('w-full items-center mb-2'):
+            ui.label('Log Files').classes('text-xl font-bold')
+            ui.space()
+            ui.label(f'{len(log_files)} files found').classes('text-sm text-gray-400')
+
+        # Log file grid
+        with ui.grid(columns=4).classes('w-full gap-2'):
+            for log_file in log_files[:12]:  # Show top 12
+                with ui.card().classes('p-3 cursor-pointer hover:bg-gray-700').on('click', lambda f=log_file['name']: switch_log_file(f)):
+                    ui.label(log_file['name']).classes('text-sm font-semibold truncate')
+                    ui.label(log_file['size_str']).classes('text-xs text-gray-400')
+                    if log_file['name'] == log_state.current_log_file:
+                        ui.badge('ACTIVE', color='positive').classes('absolute top-2 right-2')
+
+    # Control bar
+    with ui.card().classes('w-full mb-4'):
+        ui.label('Log Viewer Controls').classes('text-lg font-bold mb-3')
+
+        # Row 1: File selector and filters
+        with ui.row().classes('w-full items-center gap-4 mb-3'):
+            # Current file selector
+            ui.label('File:').classes('font-semibold')
+            file_select = ui.select(
+                log_file_names,
+                value=log_state.current_log_file,
+                label='Select Log File',
+                on_change=lambda e: switch_log_file(e.value)
+            ).classes('w-64')
+
+            # Level filter
+            ui.label('Level:').classes('font-semibold ml-4')
             level_select = ui.select(
                 ['ALL', 'DEBUG', 'INFO', 'WARNING', 'ERROR'],
-                value='ALL',
-                label='Filter Level'
+                value=log_state.level_filter,
+                label='Filter Level',
+                on_change=lambda e: setattr(log_state, 'level_filter', e.value) or apply_filters()
             ).classes('w-32')
 
-            ui.space()
+            # Search box
+            ui.label('Search:').classes('font-semibold ml-4')
+            search_input = ui.input(
+                'Search text...',
+                value=log_state.search_text,
+                on_change=lambda e: setattr(log_state, 'search_text', e.value)
+            ).classes('w-64')
 
-            # Control buttons
+            ui.button(
+                'Apply',
+                icon='search',
+                on_click=apply_filters,
+                color='primary'
+            ).props('flat')
+
+        # Row 2: Action buttons
+        with ui.row().classes('w-full gap-2'):
+            ui.button(
+                'Refresh',
+                icon='refresh',
+                color='primary',
+                on_click=refresh_logs
+            ).props('outline')
+
             tail_button = ui.button(
                 'Tail File',
                 icon='visibility',
@@ -146,7 +319,7 @@ def logs_page():
             ).props('outline')
 
             ui.button(
-                'Clear',
+                'Clear View',
                 icon='clear_all',
                 color='warning',
                 on_click=lambda: clear_logs()
@@ -159,27 +332,38 @@ def logs_page():
                 on_click=lambda: download_logs()
             ).props('outline')
 
+            ui.space()
+
+            # Stats
+            ui.label(f'Viewing: {log_state.current_log_file}').classes('text-sm text-gray-400')
+
     # Main log viewer
     with ui.card().classes('w-full mb-4'):
-        ui.label('Live Logs').classes('text-xl font-bold mb-2')
+        with ui.row().classes('w-full items-center mb-2'):
+            ui.label('Live Logs').classes('text-xl font-bold')
+            ui.space()
+            ui.label('Last 500 lines').classes('text-sm text-gray-400')
 
-        # Log display - bind to Python logger
+        # Log display
         log_element = ui.log(max_lines=500).classes('w-full h-96')
-
-        # Bind to root logger
-        try:
-            root_logger = logging.getLogger()
-            log_element.bind_logger(root_logger, level=logging.INFO)
-        except Exception as e:
-            print(f"Error binding logger: {e}")
 
         # Store reference
         log_state.log_element = log_element
 
+        # Load initial content
+        initial_lines = load_log_content(
+            log_state.current_log_file,
+            max_lines=500,
+            filter_level=log_state.level_filter,
+            search=log_state.search_text
+        )
+        for line in initial_lines:
+            log_element.push(line)
+
         # Create timer for tailing (inactive by default)
         log_state.timer = ui.timer(
             1.0,  # Run every 1 second
-            lambda: tail_log_file('logs/scraper.log', log_element),
+            lambda: tail_log_file(f'logs/{log_state.current_log_file}', log_element),
             active=False
         )
 

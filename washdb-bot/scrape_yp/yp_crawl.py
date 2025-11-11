@@ -47,6 +47,7 @@ def crawl_category_location(
     category: str,
     location: str,
     max_pages: int = 50,
+    page_callback: callable = None,
 ) -> list[dict]:
     """
     Crawl Yellow Pages for a specific category and location across multiple pages.
@@ -55,6 +56,7 @@ def crawl_category_location(
         category: Search category (e.g., "pressure washing")
         location: Geographic location (e.g., "Texas" or "TX")
         max_pages: Maximum number of pages to crawl (default: 50)
+        page_callback: Optional callback function called after each page with (page, total_pages, new_results, total_results)
 
     Returns:
         List of de-duplicated business dicts with normalized URLs and domains
@@ -127,6 +129,15 @@ def crawl_category_location(
 
             logger.info(f"Added {new_results} new unique results from page {page}")
 
+            # Call page callback if provided
+            if page_callback:
+                page_callback(
+                    page=page,
+                    total_pages=max_pages,
+                    new_results=new_results,
+                    total_results=len(all_results)
+                )
+
             # If no new results were added, we might be at the end
             if new_results == 0:
                 logger.info("No new unique results found. Ending crawl.")
@@ -185,6 +196,7 @@ def crawl_all_states(
     categories: list[str] = None,
     states: list[str] = None,
     limit_per_state: int = 3,
+    page_callback: callable = None,
 ) -> Generator[dict, None, None]:
     """
     Crawl all state-category combinations and yield batches.
@@ -196,6 +208,7 @@ def crawl_all_states(
         categories: List of categories to crawl (default: CATEGORIES)
         states: List of state codes to crawl (default: STATES)
         limit_per_state: Maximum pages per state-category combination (default: 3)
+        page_callback: Optional callback function called after each page with (page, total_pages, new_results, total_results)
 
     Yields:
         Dict with keys:
@@ -236,6 +249,7 @@ def crawl_all_states(
                     category=category,
                     location=state,
                     max_pages=limit_per_state,
+                    page_callback=page_callback,
                 )
 
                 # Yield batch

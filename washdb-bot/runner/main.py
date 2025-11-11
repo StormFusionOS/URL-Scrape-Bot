@@ -78,10 +78,10 @@ Examples:
         help=f"Comma-separated state codes (default: all {len(STATES)} states)",
     )
     discovery_group.add_argument(
-        "--pages-per-state",
+        "--pages-per-pair",
         type=int,
         default=3,
-        help="Maximum pages to crawl per state-category combination (default: 3)",
+        help="Search depth: number of result pages per category-state combination (default: 3, max: 50)",
     )
 
     # Scraping options
@@ -137,7 +137,7 @@ def run_discovery(args):
         states = STATES
         logger.info(f"Using all {len(states)} states")
 
-    logger.info(f"Pages per state-category: {args.pages_per_state}")
+    logger.info(f"Search depth (pages per category-state): {args.pages_per_pair}")
     logger.info("")
 
     # Prepare CSV output
@@ -161,7 +161,7 @@ def run_discovery(args):
         for batch in crawl_all_states(
             categories=categories,
             states=states,
-            limit_per_state=args.pages_per_state,
+            limit_per_state=args.pages_per_pair,
         ):
             category = batch["category"]
             state = batch["state"]

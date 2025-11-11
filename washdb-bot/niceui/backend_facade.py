@@ -12,6 +12,7 @@ from pathlib import Path
 
 # Import actual scraper modules
 from scrape_yp.yp_crawl import crawl_all_states, CATEGORIES as DEFAULT_CATEGORIES, STATES as DEFAULT_STATES
+from scrape_ha.ha_crawl import crawl_all_states as ha_crawl_all, CATEGORIES_HA
 from scrape_site.site_scraper import scrape_website
 from db.save_discoveries import upsert_discovered, create_session
 from db.update_details import update_batch
@@ -44,17 +45,19 @@ class BackendFacade:
         states: List[str],
         pages_per_pair: int,
         cancel_flag: Optional[Callable[[], bool]] = None,
-        progress_callback: Optional[Callable[[dict], None]] = None
+        progress_callback: Optional[Callable[[dict], None]] = None,
+        providers: List[str] = None
     ) -> Dict[str, int]:
         """
-        Run YP discovery across category×state with pagination and dedup.
+        Run multi-provider discovery across category×state with pagination and dedup.
 
         Args:
-            categories: List of business categories to search
+            categories: List of business categories to search (optional, uses provider defaults)
             states: List of state codes to search
-            pages_per_pair: Number of pages to crawl per category-state pair
+            pages_per_pair: Search depth (number of result pages per category-state search)
             cancel_flag: Optional callable that returns True to cancel operation
             progress_callback: Optional callable to receive progress updates
+            providers: List of provider codes to use (e.g., ["YP", "HA"]). Default: ["YP"]
 
         Returns:
             Dict with keys:
@@ -65,18 +68,36 @@ class BackendFacade:
             - pairs_done: Number of category-state pairs completed
             - pairs_total: Total number of pairs to process
         """
-        logger.info(
-            f"Starting discovery: {len(categories)} categories × {len(states)} states "
-            f"× {pages_per_pair} pages/each"
-        )
+        # Default to YP only for backward compatibility
+        if providers is None:
+            providers = ["YP"]
 
-        # Use defaults if not provided
+        # Determine which providers to use
+        use_yp = "YP" in providers
+        use_ha = "HA" in providers
+
+        # Build category list from providers if not specified
         if not categories:
-            categories = DEFAULT_CATEGORIES[:3]  # Use first 3 for reasonable scope
+            categories = []
+            if use_yp:
+                categories.extend(DEFAULT_CATEGORIES[:3])  # Use first 3 for reasonable scope
+            if use_ha:
+                categories.extend(CATEGORIES_HA)
+
+        # Use default states if not provided
         if not states:
             states = DEFAULT_STATES
 
-        total_pairs = len(categories) * len(states)
+        logger.info(
+            f"Starting multi-provider discovery: providers={providers}, "
+            f"{len(categories)} categories × {len(states)} states × {pages_per_pair} pages/each"
+        )
+
+        # Calculate total based on provider-specific categories
+        yp_categories = [c for c in categories if c in DEFAULT_CATEGORIES] if use_yp else []
+        ha_categories = [c for c in categories if c in CATEGORIES_HA] if use_ha else []
+        total_pairs = (len(yp_categories) * len(states)) + (len(ha_categories) * len(states))
+
         pairs_done = 0
         total_found = 0
         total_new = 0
@@ -84,12 +105,51 @@ class BackendFacade:
         total_errors = 0
 
         try:
-            # Iterate through all category-state combinations
-            for batch in crawl_all_states(
-                categories=categories,
-                states=states,
-                limit_per_state=pages_per_pair
-            ):
+            # Create page callback for YP crawling
+            # Store current category and state to use in page callback
+            current_context = {'category': '', 'state': ''}
+
+            def page_callback(page, total_pages, new_results, total_results):
+                """Send page-level progress updates to UI."""
+                if progress_callback:
+                    progress_callback({
+                        'type': 'page_complete',
+                        'page': page,
+                        'total_pages': total_pages,
+                        'new_results': new_results,
+                        'total_results': total_results,
+                        'category': current_context['category'],
+                        'state': current_context['state']
+                    })
+                # Return cancellation check
+                if cancel_flag and cancel_flag():
+                    return True
+                return False
+
+            # Create generators for each provider
+            generators = []
+            if use_yp and yp_categories:
+                logger.info(f"Adding YP crawler: {len(yp_categories)} categories")
+                generators.append(crawl_all_states(
+                    categories=yp_categories,
+                    states=states,
+                    limit_per_state=pages_per_pair,
+                    page_callback=page_callback
+                ))
+            if use_ha and ha_categories:
+                logger.info(f"Adding HA crawler: {len(ha_categories)} categories")
+                generators.append(ha_crawl_all(
+                    categories=ha_categories,
+                    states=states,
+                    limit_per_state=pages_per_pair
+                ))
+
+            # Chain generators together to process sequentially
+            import itertools
+            combined_generator = itertools.chain(*generators)
+
+            # Iterate through all category-state combinations from all providers
+            for batch in combined_generator:
                 # Check for cancellation
                 if cancel_flag and cancel_flag():
                     logger.warning("Discovery cancelled by user")
@@ -106,6 +166,10 @@ class BackendFacade:
                 # Get category and state from batch metadata if available
                 category = batch.get("category", "")
                 state = batch.get("state", "")
+
+                # Update context for page callback
+                current_context['category'] = category
+                current_context['state'] = state
 
                 # Report progress: starting batch
                 if progress_callback:
@@ -160,7 +224,7 @@ class BackendFacade:
 
                     # Report progress: batch complete
                     if progress_callback:
-                        progress_callback({
+                        should_stop = progress_callback({
                             'type': 'batch_complete',
                             'pairs_done': pairs_done,
                             'pairs_total': total_pairs,
@@ -174,6 +238,10 @@ class BackendFacade:
                             'total_updated': total_updated,
                             'total_errors': total_errors
                         })
+                        # Stop if progress callback requests it
+                        if should_stop:
+                            logger.warning("Discovery cancelled by progress callback")
+                            break
 
                 except Exception as e:
                     total_errors += 1
@@ -916,6 +984,299 @@ class BackendFacade:
         """Get application logs."""
         # For now, return empty list - logs are handled by ui.log binding
         return []
+
+    # ========================================================================
+    # SCHEDULER METHODS
+    # ========================================================================
+
+    def get_scheduled_jobs(self) -> List[Dict[str, Any]]:
+        """Get all scheduled jobs."""
+        from db.models import ScheduledJob
+
+        try:
+            session = create_session()
+            stmt = select(ScheduledJob).order_by(ScheduledJob.created_at.desc())
+            jobs = session.scalars(stmt).all()
+
+            result = []
+            for job in jobs:
+                result.append({
+                    'id': job.id,
+                    'name': job.name,
+                    'description': job.description,
+                    'job_type': job.job_type,
+                    'schedule_cron': job.schedule_cron,
+                    'config': json.loads(job.config) if job.config else {},
+                    'enabled': job.enabled,
+                    'priority': job.priority,
+                    'timeout_minutes': job.timeout_minutes,
+                    'max_retries': job.max_retries,
+                    'last_run': job.last_run.isoformat() if job.last_run else None,
+                    'last_status': job.last_status,
+                    'next_run': job.next_run.isoformat() if job.next_run else None,
+                    'total_runs': job.total_runs,
+                    'success_runs': job.success_runs,
+                    'failed_runs': job.failed_runs,
+                    'created_at': job.created_at.isoformat() if job.created_at else None,
+                    'created_by': job.created_by,
+                    'updated_at': job.updated_at.isoformat() if job.updated_at else None,
+                })
+
+            session.close()
+            return result
+
+        except Exception as e:
+            logger.error(f"Error fetching scheduled jobs: {e}")
+            return []
+
+    def create_scheduled_job(self, job_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a new scheduled job."""
+        from db.models import ScheduledJob
+
+        try:
+            session = create_session()
+
+            # Create job instance
+            job = ScheduledJob(
+                name=job_data['name'],
+                description=job_data.get('description'),
+                job_type=job_data['job_type'],
+                schedule_cron=job_data['schedule_cron'],
+                config=json.dumps(job_data.get('config', {})),
+                enabled=job_data.get('enabled', True),
+                priority=job_data.get('priority', 2),
+                timeout_minutes=job_data.get('timeout_minutes', 60),
+                max_retries=job_data.get('max_retries', 3),
+                created_by=job_data.get('created_by', 'dashboard')
+            )
+
+            session.add(job)
+            session.commit()
+
+            job_id = job.id
+            session.close()
+
+            logger.info(f"Created scheduled job: {job.name} (ID: {job_id})")
+
+            return {
+                'success': True,
+                'job_id': job_id,
+                'message': f'Job "{job_data["name"]}" created successfully'
+            }
+
+        except Exception as e:
+            logger.error(f"Error creating scheduled job: {e}")
+            return {
+                'success': False,
+                'message': f'Error creating job: {str(e)}'
+            }
+
+    def update_scheduled_job(self, job_id: int, job_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Update an existing scheduled job."""
+        from db.models import ScheduledJob
+
+        try:
+            session = create_session()
+            job = session.get(ScheduledJob, job_id)
+
+            if not job:
+                session.close()
+                return {
+                    'success': False,
+                    'message': f'Job with ID {job_id} not found'
+                }
+
+            # Update fields
+            if 'name' in job_data:
+                job.name = job_data['name']
+            if 'description' in job_data:
+                job.description = job_data['description']
+            if 'job_type' in job_data:
+                job.job_type = job_data['job_type']
+            if 'schedule_cron' in job_data:
+                job.schedule_cron = job_data['schedule_cron']
+            if 'config' in job_data:
+                job.config = json.dumps(job_data['config'])
+            if 'enabled' in job_data:
+                job.enabled = job_data['enabled']
+            if 'priority' in job_data:
+                job.priority = job_data['priority']
+            if 'timeout_minutes' in job_data:
+                job.timeout_minutes = job_data['timeout_minutes']
+            if 'max_retries' in job_data:
+                job.max_retries = job_data['max_retries']
+
+            session.commit()
+            session.close()
+
+            logger.info(f"Updated scheduled job ID: {job_id}")
+
+            return {
+                'success': True,
+                'message': f'Job updated successfully'
+            }
+
+        except Exception as e:
+            logger.error(f"Error updating scheduled job: {e}")
+            return {
+                'success': False,
+                'message': f'Error updating job: {str(e)}'
+            }
+
+    def delete_scheduled_job(self, job_id: int) -> Dict[str, Any]:
+        """Delete a scheduled job."""
+        from db.models import ScheduledJob
+
+        try:
+            session = create_session()
+            job = session.get(ScheduledJob, job_id)
+
+            if not job:
+                session.close()
+                return {
+                    'success': False,
+                    'message': f'Job with ID {job_id} not found'
+                }
+
+            job_name = job.name
+            session.delete(job)
+            session.commit()
+            session.close()
+
+            logger.info(f"Deleted scheduled job: {job_name} (ID: {job_id})")
+
+            return {
+                'success': True,
+                'message': f'Job "{job_name}" deleted successfully'
+            }
+
+        except Exception as e:
+            logger.error(f"Error deleting scheduled job: {e}")
+            return {
+                'success': False,
+                'message': f'Error deleting job: {str(e)}'
+            }
+
+    def toggle_scheduled_job(self, job_id: int, enabled: bool) -> Dict[str, Any]:
+        """Enable or disable a scheduled job."""
+        from db.models import ScheduledJob
+
+        try:
+            session = create_session()
+            job = session.get(ScheduledJob, job_id)
+
+            if not job:
+                session.close()
+                return {
+                    'success': False,
+                    'message': f'Job with ID {job_id} not found'
+                }
+
+            job.enabled = enabled
+            session.commit()
+            session.close()
+
+            status = 'enabled' if enabled else 'disabled'
+            logger.info(f"Job {job_id} {status}")
+
+            return {
+                'success': True,
+                'message': f'Job {status} successfully'
+            }
+
+        except Exception as e:
+            logger.error(f"Error toggling scheduled job: {e}")
+            return {
+                'success': False,
+                'message': f'Error: {str(e)}'
+            }
+
+    def get_job_execution_logs(self, job_id: Optional[int] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get job execution logs."""
+        from db.models import JobExecutionLog
+
+        try:
+            session = create_session()
+
+            if job_id:
+                stmt = select(JobExecutionLog).where(
+                    JobExecutionLog.job_id == job_id
+                ).order_by(JobExecutionLog.started_at.desc()).limit(limit)
+            else:
+                stmt = select(JobExecutionLog).order_by(
+                    JobExecutionLog.started_at.desc()
+                ).limit(limit)
+
+            logs = session.scalars(stmt).all()
+
+            result = []
+            for log in logs:
+                result.append({
+                    'id': log.id,
+                    'job_id': log.job_id,
+                    'started_at': log.started_at.isoformat() if log.started_at else None,
+                    'completed_at': log.completed_at.isoformat() if log.completed_at else None,
+                    'duration_seconds': log.duration_seconds,
+                    'status': log.status,
+                    'items_found': log.items_found,
+                    'items_new': log.items_new,
+                    'items_updated': log.items_updated,
+                    'items_skipped': log.items_skipped,
+                    'errors_count': log.errors_count,
+                    'output_log': log.output_log,
+                    'error_log': log.error_log,
+                    'triggered_by': log.triggered_by,
+                })
+
+            session.close()
+            return result
+
+        except Exception as e:
+            logger.error(f"Error fetching job execution logs: {e}")
+            return []
+
+    def get_scheduler_stats(self) -> Dict[str, Any]:
+        """Get scheduler statistics."""
+        from db.models import ScheduledJob, JobExecutionLog
+        from sqlalchemy import func as sql_func
+
+        try:
+            session = create_session()
+
+            # Total jobs
+            total_jobs = session.query(sql_func.count(ScheduledJob.id)).scalar() or 0
+
+            # Active jobs
+            active_jobs = session.query(sql_func.count(ScheduledJob.id)).where(
+                ScheduledJob.enabled == True
+            ).scalar() or 0
+
+            # Failed jobs in last 24h
+            yesterday = datetime.now() - timedelta(days=1)
+            failed_24h = session.query(sql_func.count(JobExecutionLog.id)).where(
+                and_(
+                    JobExecutionLog.status == 'failed',
+                    JobExecutionLog.started_at >= yesterday
+                )
+            ).scalar() or 0
+
+            session.close()
+
+            return {
+                'total_jobs': total_jobs,
+                'active_jobs': active_jobs,
+                'running_jobs': 0,  # Would need scheduler service integration
+                'failed_24h': failed_24h
+            }
+
+        except Exception as e:
+            logger.error(f"Error fetching scheduler stats: {e}")
+            return {
+                'total_jobs': 0,
+                'active_jobs': 0,
+                'running_jobs': 0,
+                'failed_24h': 0
+            }
 
 
 # Global backend instance

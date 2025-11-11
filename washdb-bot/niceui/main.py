@@ -11,7 +11,7 @@ from pathlib import Path
 # Add parent directory to path to import modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from nicegui import ui
+from nicegui import ui, app
 from niceui.theme import apply_theme
 from niceui.layout import layout
 from niceui.router import router
@@ -23,6 +23,7 @@ def register_pages():
     router.register('dashboard', pages.dashboard_page)
     router.register('discover', pages.discover_page)
     router.register('database', pages.database_page)
+    router.register('scheduler', pages.scheduler_page)
     router.register('logs', pages.logs_page)
     router.register('status', pages.status_page)
     router.register('settings', pages.settings_page)
@@ -30,6 +31,10 @@ def register_pages():
 
 def create_app():
     """Create and configure the NiceGUI application."""
+    # Add static files directory
+    static_dir = Path(__file__).parent / 'static'
+    app.add_static_files('/static', str(static_dir))
+
     # Apply theme
     apply_theme()
 

@@ -140,6 +140,18 @@ async def run_yellow_pages_discovery(
                     'info'
                 )
 
+            elif progress_type == 'page_complete':
+                page = progress.get('page', 0)
+                total_pages = progress.get('total_pages', 0)
+                new_results = progress.get('new_results', 0)
+                total_results = progress.get('total_results', 0)
+                category = progress.get('category', '')
+                state = progress.get('state', '')
+                discovery_state.add_log(
+                    f"Page {page}/{total_pages}: Found {new_results} new results ({total_results} total) - {category} in {state}",
+                    'processing'
+                )
+
             elif progress_type == 'batch_complete':
                 category = progress.get('category', '')
                 state = progress.get('state', '')
@@ -176,12 +188,15 @@ async def run_yellow_pages_discovery(
             return False
 
         # Run discovery through backend
+        # Use YP provider by default (can be extended to support multiple providers)
         result = await run.io_bound(
-            backend.discover_yellow_pages,
+            backend.discover,
             categories,
             states,
             pages_per_pair,
-            progress_callback
+            discovery_state.is_cancelled,  # cancel_flag - callable that returns True when cancelled
+            progress_callback,
+            ["YP"]  # providers - defaults to Yellow Pages
         )
 
         discovery_state.add_log('Crawler completed!', 'success')
@@ -218,6 +233,195 @@ async def run_yellow_pages_discovery(
         # Store summary
         discovery_state.last_run_summary = {
             'source': 'yellow_pages',
+            'elapsed': elapsed,
+            'result': result,
+            'timestamp': discovery_state.start_time.isoformat()
+        }
+
+        # Show notification
+        if discovery_state.cancel_requested:
+            ui.notify('Discovery cancelled', type='warning')
+        else:
+            ui.notify(
+                f'Discovery complete! Found {result["found"]}, New {result["new"]}',
+                type='positive'
+            )
+
+    except Exception as e:
+        discovery_state.add_log('-' * 60, 'error')
+        discovery_state.add_log('Discovery Failed!', 'error')
+        discovery_state.add_log(f'Error: {str(e)}', 'error')
+        discovery_state.add_log('=' * 60, 'error')
+
+        stats_card.clear()
+        with stats_card:
+            ui.label('Discovery Failed').classes('text-lg font-bold text-red-500')
+            ui.label(f'Error: {str(e)}').classes('text-sm text-red-400')
+
+        ui.notify(f'Discovery failed: {str(e)}', type='negative')
+
+    finally:
+        # Re-enable run button, disable stop button
+        discovery_state.running = False
+        run_button.enable()
+        stop_button.disable()
+        progress_bar.value = 0
+
+
+async def run_homeadvisor_discovery(
+    categories,
+    states,
+    pages_per_pair,
+    stats_card,
+    progress_bar,
+    run_button,
+    stop_button
+):
+    """Run HomeAdvisor discovery in background with progress updates."""
+    discovery_state.running = True
+    discovery_state.reset()
+    discovery_state.start_time = datetime.now()
+
+    # Disable run button, enable stop button
+    run_button.disable()
+    stop_button.enable()
+
+    # Clear log
+    if discovery_state.log_element:
+        discovery_state.log_element.clear()
+
+    # Add initial log messages
+    discovery_state.add_log('=' * 60, 'info')
+    discovery_state.add_log('Starting HomeAdvisor Discovery', 'info')
+    discovery_state.add_log('=' * 60, 'info')
+    discovery_state.add_log(f'Categories: {", ".join(categories)}', 'info')
+    discovery_state.add_log(f'States: {", ".join(states)}', 'info')
+    discovery_state.add_log(f'Pages per pair: {pages_per_pair}', 'info')
+    discovery_state.add_log(f'Total pairs: {len(categories)} × {len(states)} = {len(categories) * len(states)}', 'info')
+    discovery_state.add_log('-' * 60, 'info')
+
+    # Clear stats
+    stats_card.clear()
+    with stats_card:
+        ui.label('Running discovery...').classes('text-lg font-bold')
+        stat_labels = {
+            'found': ui.label('Found: 0'),
+            'new': ui.label('New: 0'),
+            'updated': ui.label('Updated: 0'),
+            'errors': ui.label('Errors: 0'),
+            'progress': ui.label('Progress: 0/0 pairs')
+        }
+
+    try:
+        discovery_state.add_log('Starting HomeAdvisor crawler...', 'info')
+
+        # Progress callback to update UI in real-time
+        def progress_callback(progress):
+            """Handle progress updates from backend."""
+            progress_type = progress.get('type')
+
+            if progress_type == 'batch_start':
+                category = progress.get('category', '')
+                state = progress.get('state', '')
+                pairs_done = progress.get('pairs_done', 0)
+                pairs_total = progress.get('pairs_total', 0)
+                discovery_state.add_log(
+                    f"Processing pair {pairs_done}/{pairs_total}: {category} × {state}",
+                    'info'
+                )
+
+            elif progress_type == 'page_complete':
+                page = progress.get('page', 0)
+                total_pages = progress.get('total_pages', 0)
+                new_results = progress.get('new_results', 0)
+                total_results = progress.get('total_results', 0)
+                category = progress.get('category', '')
+                state = progress.get('state', '')
+                discovery_state.add_log(
+                    f"Page {page}/{total_pages}: Found {new_results} new results ({total_results} total) - {category} in {state}",
+                    'processing'
+                )
+
+            elif progress_type == 'batch_complete':
+                category = progress.get('category', '')
+                state = progress.get('state', '')
+                found = progress.get('found', 0)
+                new = progress.get('new', 0)
+                updated = progress.get('updated', 0)
+                discovery_state.add_log(
+                    f"✓ {category} × {state}: Found {found}, New {new}, Updated {updated}",
+                    'success'
+                )
+
+                # Update stats card with current totals
+                totals = progress.get('totals', {})
+                stat_labels['found'].set_text(f"Found: {totals.get('found', 0)}")
+                stat_labels['new'].set_text(f"New: {totals.get('new', 0)}")
+                stat_labels['updated'].set_text(f"Updated: {totals.get('updated', 0)}")
+                stat_labels['errors'].set_text(f"Errors: {totals.get('errors', 0)}")
+
+                # Update progress bar
+                pairs_done = progress.get('pairs_done', 0)
+                pairs_total = progress.get('pairs_total', 1)
+                progress_bar.value = pairs_done / pairs_total
+                stat_labels['progress'].set_text(f"Progress: {pairs_done}/{pairs_total} pairs")
+
+            elif progress_type == 'error':
+                error_msg = progress.get('error', 'Unknown error')
+                discovery_state.add_log(f"✗ Error: {error_msg}", 'error')
+
+            # Check if cancelled
+            if discovery_state.is_cancelled():
+                discovery_state.add_log('Cancellation requested, stopping...', 'warning')
+                return True  # Signal to stop
+
+            return False
+
+        # Run discovery through backend with HomeAdvisor provider
+        result = await run.io_bound(
+            backend.discover,
+            categories,
+            states,
+            pages_per_pair,
+            discovery_state.is_cancelled,  # cancel_flag - callable that returns True when cancelled
+            progress_callback,
+            ["HA"]  # providers - use HomeAdvisor
+        )
+
+        discovery_state.add_log('Crawler completed!', 'success')
+
+        # Update final stats
+        elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
+
+        # Log final results
+        discovery_state.add_log('-' * 60, 'info')
+        discovery_state.add_log('Discovery Complete!', 'success')
+        discovery_state.add_log(f'Elapsed time: {elapsed:.1f}s', 'info')
+        discovery_state.add_log(f'Found: {result["found"]} businesses', 'success')
+        discovery_state.add_log(f'New: {result["new"]} businesses added', 'success')
+        discovery_state.add_log(f'Updated: {result["updated"]} businesses updated', 'info')
+        discovery_state.add_log(f'Errors: {result["errors"]}', 'error' if result["errors"] > 0 else 'info')
+        discovery_state.add_log(f'Pairs processed: {result["pairs_done"]}/{result["pairs_total"]}', 'info')
+        discovery_state.add_log('=' * 60, 'info')
+
+        stats_card.clear()
+        with stats_card:
+            ui.label('Discovery Complete!').classes('text-lg font-bold text-green-500')
+            ui.label(f'Elapsed: {elapsed:.1f}s').classes('text-sm text-gray-400')
+            ui.separator()
+            ui.label(f'Found: {result["found"]}').classes('text-lg')
+            ui.label(f'New: {result["new"]}').classes('text-lg text-green-500')
+            ui.label(f'Updated: {result["updated"]}').classes('text-lg text-blue-500')
+            ui.label(f'Errors: {result["errors"]}').classes('text-lg text-red-500')
+            ui.label(f'Pairs: {result["pairs_done"]}/{result["pairs_total"]}').classes('text-sm')
+
+        # Update progress bar
+        if result["pairs_total"] > 0:
+            progress_bar.value = result["pairs_done"] / result["pairs_total"]
+
+        # Store summary
+        discovery_state.last_run_summary = {
+            'source': 'homeadvisor',
             'elapsed': elapsed,
             'result': result,
             'timestamp': discovery_state.start_time.isoformat()
@@ -332,6 +536,7 @@ async def run_google_maps_discovery(
             location,
             max_results,
             scrape_details,
+            discovery_state.is_cancelled,  # cancel_flag - callable that returns True when cancelled
             update_progress
         )
 
@@ -405,67 +610,6 @@ def stop_discovery():
         ui.notify('Cancelling discovery...', type='warning')
 
 
-async def export_last_run():
-    """Export the results from the last discovery run."""
-    if not discovery_state.last_run_summary:
-        ui.notify('No discovery run to export', type='warning')
-        return
-
-    summary = discovery_state.last_run_summary
-    timestamp = summary['timestamp'][:19].replace(':', '-').replace(' ', '_')
-    source = summary.get('source', 'unknown')
-    filename = f'discovery_{source}_{timestamp}.json'
-
-    try:
-        # Export summary as JSON
-        import json
-        import tempfile
-        import os
-
-        temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json')
-        json.dump(summary, temp_file, indent=2)
-        temp_file.close()
-
-        ui.download(temp_file.name, filename)
-        ui.notify(f'Exported discovery results to {filename}', type='positive')
-
-        # Clean up temp file after a delay
-        await asyncio.sleep(5)
-        try:
-            os.unlink(temp_file.name)
-        except:
-            pass
-
-    except Exception as e:
-        ui.notify(f'Export failed: {str(e)}', type='negative')
-
-
-async def export_new_urls():
-    """Export new URLs from last 7 days."""
-    ui.notify('Exporting new URLs...', type='info')
-
-    try:
-        result = await run.io_bound(
-            backend.export_new_urls,
-            days=7,
-            out_csv='data/new_urls.csv',
-            out_jsonl='data/new_urls.jsonl'
-        )
-
-        if result['count'] > 0:
-            ui.notify(
-                f'Exported {result["count"]} URLs to {result["csv"]}',
-                type='positive'
-            )
-            # Download the file
-            ui.download(result['csv'])
-        else:
-            ui.notify('No new URLs in last 7 days', type='warning')
-
-    except Exception as e:
-        ui.notify(f'Export failed: {str(e)}', type='negative')
-
-
 def build_yellow_pages_ui(container):
     """Build Yellow Pages discovery UI in the given container."""
     with container:
@@ -524,13 +668,13 @@ def build_yellow_pages_ui(container):
             # Pages per pair
             ui.label('Crawl Settings').classes('font-semibold mb-2 mt-4')
             pages_input = ui.number(
-                label='Pages per category/state pair',
+                label='Search Depth',
                 value=1,
                 min=1,
-                max=10,
+                max=50,
                 step=1
             ).classes('w-64')
-            ui.label('⚠ More pages = more URLs but slower crawling').classes('text-xs text-yellow-400')
+            ui.label('⚠ Higher depth = more URLs but slower crawling').classes('text-xs text-yellow-400')
 
         # Stats and controls
         with ui.card().classes('w-full mb-4'):
@@ -547,9 +691,15 @@ def build_yellow_pages_ui(container):
             # Control buttons
             with ui.row().classes('gap-2'):
                 run_button = ui.button('START DISCOVERY', icon='play_arrow', color='positive')
-                stop_button = ui.button('STOP', icon='stop', color='negative').props('disable')
-                ui.button('Export Last Run', icon='download', on_click=export_last_run).classes('ml-auto')
-                ui.button('Export New URLs', icon='file_download', on_click=export_new_urls)
+                stop_button = ui.button('STOP', icon='stop', color='negative')
+
+                # Set initial button states based on global discovery state
+                if discovery_state.running:
+                    run_button.disable()
+                    stop_button.enable()
+                else:
+                    run_button.enable()
+                    stop_button.disable()
 
         # Live output
         with ui.card().classes('w-full'):
@@ -648,9 +798,15 @@ def build_google_maps_ui(container):
             # Control buttons
             with ui.row().classes('gap-2'):
                 run_button = ui.button('START DISCOVERY', icon='play_arrow', color='positive')
-                stop_button = ui.button('STOP', icon='stop', color='negative').props('disable')
-                ui.button('Export Last Run', icon='download', on_click=export_last_run).classes('ml-auto')
-                ui.button('Export New URLs', icon='file_download', on_click=export_new_urls)
+                stop_button = ui.button('STOP', icon='stop', color='negative')
+
+                # Set initial button states based on global discovery state
+                if discovery_state.running:
+                    run_button.disable()
+                    stop_button.enable()
+                else:
+                    run_button.enable()
+                    stop_button.disable()
 
         # Live output
         with ui.card().classes('w-full'):
@@ -824,6 +980,147 @@ def build_facebook_ui(container):
             ui.label('Facebook scraper implementation is planned. This will allow discovery of business pages and contact information.').classes('text-gray-400')
 
 
+def build_homeadvisor_ui(container):
+    """Build HomeAdvisor discovery UI in the given container."""
+    with container:
+        # Configuration card
+        with ui.card().classes('w-full mb-4'):
+            ui.label('HomeAdvisor Discovery Configuration').classes('text-xl font-bold mb-4')
+
+            # Info banner
+            with ui.card().classes('w-full bg-teal-900 border-l-4 border-teal-500 mb-4'):
+                ui.label('✨ HomeAdvisor Discovery - Now Available!').classes('text-lg font-bold text-teal-200')
+                ui.label('• Search home service professionals on HomeAdvisor').classes('text-sm text-teal-100')
+                ui.label('• Extract ratings, reviews, and verified contractor information').classes('text-sm text-teal-100')
+                ui.label('• Great source for home improvement and maintenance services').classes('text-sm text-teal-100')
+
+            # Category selection
+            ui.label('Service Categories').classes('font-semibold mb-2')
+            ui.label('Select categories to search (click to toggle):').classes('text-sm text-gray-400 mb-2')
+
+            # HomeAdvisor categories (from ha_crawl.py)
+            HA_CATEGORIES = [
+                "power washing",
+                "window cleaning services",
+                "deck staining or painting",
+                "fence painting or staining",
+            ]
+
+            category_checkboxes = {}
+            with ui.grid(columns=2).classes('w-full gap-2 mb-4'):
+                for cat in HA_CATEGORIES:
+                    category_checkboxes[cat] = ui.checkbox(cat, value=True).classes('text-sm')
+
+            # Quick select buttons
+            with ui.row().classes('gap-2 mb-4'):
+                def select_all_categories():
+                    for cb in category_checkboxes.values():
+                        cb.value = True
+
+                def deselect_all_categories():
+                    for cb in category_checkboxes.values():
+                        cb.value = False
+
+                ui.button('Select All', icon='check_box', on_click=select_all_categories).props('flat dense')
+                ui.button('Deselect All', icon='check_box_outline_blank', on_click=deselect_all_categories).props('flat dense')
+
+            ui.separator()
+
+            # State selection
+            ui.label('US States').classes('font-semibold mb-2 mt-4')
+            ui.label('Select states to search (click to toggle):').classes('text-sm text-gray-400 mb-2')
+
+            state_checkboxes = {}
+            with ui.grid(columns=10).classes('w-full gap-1 mb-4'):
+                for state in ALL_STATES:
+                    state_checkboxes[state] = ui.checkbox(state, value=False).classes('text-xs')
+
+            # Quick select buttons
+            with ui.row().classes('gap-2 mb-4'):
+                def select_all_states():
+                    for cb in state_checkboxes.values():
+                        cb.value = True
+
+                def deselect_all_states():
+                    for cb in state_checkboxes.values():
+                        cb.value = False
+
+                ui.button('Select All', icon='check_box', on_click=select_all_states).props('flat dense')
+                ui.button('Deselect All', icon='check_box_outline_blank', on_click=deselect_all_states).props('flat dense')
+
+            ui.separator()
+
+            # Pages per pair
+            ui.label('Crawl Settings').classes('font-semibold mb-2 mt-4')
+            pages_input = ui.number(
+                label='Search Depth',
+                value=1,
+                min=1,
+                max=50,
+                step=1
+            ).classes('w-64')
+            ui.label('⚠ Higher depth = more URLs but slower crawling').classes('text-xs text-yellow-400')
+
+        # Stats and controls
+        with ui.card().classes('w-full mb-4'):
+            ui.label('Discovery Status').classes('text-xl font-bold mb-4')
+
+            # Stats card
+            stats_card = ui.column().classes('w-full mb-4')
+            with stats_card:
+                ui.label('Ready to start').classes('text-lg')
+
+            # Progress bar
+            progress_bar = ui.linear_progress(value=0).classes('w-full mb-4')
+
+            # Control buttons
+            with ui.row().classes('gap-2'):
+                run_button = ui.button('START DISCOVERY', icon='play_arrow', color='positive')
+                stop_button = ui.button('STOP', icon='stop', color='negative')
+
+                # Set initial button states based on global discovery state
+                if discovery_state.running:
+                    run_button.disable()
+                    stop_button.enable()
+                else:
+                    run_button.enable()
+                    stop_button.disable()
+
+        # Live output
+        with ui.card().classes('w-full'):
+            ui.label('Live Output').classes('text-xl font-bold mb-4')
+            log_container = ui.column().classes('w-full h-96 overflow-y-auto bg-gray-900 p-4 rounded')
+            discovery_state.log_element = log_container
+
+        # Run button click handler
+        async def start_discovery():
+            # Get selected categories and states
+            selected_categories = [cat for cat, cb in category_checkboxes.items() if cb.value]
+            selected_states = [state for state, cb in state_checkboxes.items() if cb.value]
+
+            # Validate
+            if not selected_categories:
+                ui.notify('Please select at least one category', type='warning')
+                return
+            if not selected_states:
+                ui.notify('Please select at least one state', type='warning')
+                return
+
+            # Run HomeAdvisor discovery
+            await run_homeadvisor_discovery(
+                selected_categories,
+                selected_states,
+                int(pages_input.value),
+                stats_card,
+                progress_bar,
+                run_button,
+                stop_button
+            )
+
+        run_button.on('click', start_discovery)
+        stop_button.on('click', stop_discovery)
+
+
 def discover_page():
     """Render unified discovery page with source selection."""
     ui.label('URL Discovery').classes('text-3xl font-bold mb-4')
@@ -833,7 +1130,7 @@ def discover_page():
         ui.label('Discovery Source').classes('text-xl font-bold mb-4')
 
         source_select = ui.select(
-            options=['Yellow Pages', 'Google Maps', 'Bing', 'Yelp', 'BBB', 'Facebook'],
+            options=['Yellow Pages', 'Google Maps', 'HomeAdvisor', 'Bing', 'Yelp', 'BBB', 'Facebook'],
             value='Yellow Pages',
             label='Choose discovery source'
         ).classes('w-64')
@@ -853,6 +1150,8 @@ def discover_page():
             build_yellow_pages_ui(main_content)
         elif source == 'Google Maps':
             build_google_maps_ui(main_content)
+        elif source == 'HomeAdvisor':
+            build_homeadvisor_ui(main_content)
         elif source == 'Bing':
             build_bing_ui(main_content)
         elif source == 'Yelp':

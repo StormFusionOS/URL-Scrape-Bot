@@ -28,7 +28,7 @@ async def run_discover_job(
     Args:
         categories: List of category strings
         states: List of state codes
-        pages_per_pair: Pages to crawl per category-state pair
+        pages_per_pair: Search depth (pages per category-state search)
         on_line_callback: Called for each output line (line_type, line)
         on_complete_callback: Called when job completes (exit_code, duration, result)
 

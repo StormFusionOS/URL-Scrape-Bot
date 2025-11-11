@@ -8,6 +8,7 @@ from .database import database_page
 from .logs import logs_page
 from .status import status_page
 from .settings import settings_page
+from .scheduler import scheduler_page
 
 __all__ = [
     'dashboard_page',
@@ -16,4 +17,5 @@ __all__ = [
     'logs_page',
     'status_page',
     'settings_page',
+    'scheduler_page',
 ]
