@@ -24,6 +24,7 @@ class LiveLogViewer:
         self.max_lines = max_lines
         self.auto_scroll = auto_scroll
         self.log_element = None
+        self.scroll_area = None
         self.timer = None
         self.file_position = 0
         self.is_tailing = False
@@ -56,7 +57,8 @@ class LiveLogViewer:
                 ).props('flat dense').tooltip('Clear output')
 
             # Log display with scrolling
-            with ui.scroll_area().classes('w-full h-96 bg-gray-900 p-4 rounded font-mono text-sm'):
+            self.scroll_area = ui.scroll_area().classes('w-full h-96 bg-gray-900 p-4 rounded font-mono text-sm')
+            with self.scroll_area:
                 self.log_element = ui.column().classes('w-full gap-0')
 
         return self
@@ -132,14 +134,26 @@ class LiveLogViewer:
         with self.log_element:
             ui.label(line).classes(f'{color_class} leading-tight text-xs whitespace-pre-wrap')
 
+        # Auto-scroll to bottom if enabled
+        if self.auto_scroll and self.scroll_area:
+            self.scroll_area.scroll_to(percent=1.0)
+
     def _get_line_color(self, line: str) -> str:
         """Determine color class based on line content."""
         line_lower = line.lower()
 
-        # Error levels (highest priority)
-        if ' error ' in line_lower or 'error:' in line_lower or 'exception' in line_lower:
+        # Error levels (highest priority) - check for multiple patterns
+        error_patterns = [
+            ' error ', 'error:', '- error -',
+            'exception', 'traceback', 'fatal',
+            'fail ', 'failed'
+        ]
+        if any(pattern in line_lower for pattern in error_patterns):
             return 'text-red-400'
-        if ' warning ' in line_lower or 'warning:' in line_lower:
+
+        # Warnings
+        warning_patterns = [' warning ', 'warning:', '- warning -', 'warn:']
+        if any(pattern in line_lower for pattern in warning_patterns):
             return 'text-yellow-400'
 
         # Success indicators
