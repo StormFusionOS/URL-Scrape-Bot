@@ -4,6 +4,8 @@ Discovery page - configure and run URL discovery from multiple sources with real
 
 from nicegui import ui, run
 from ..backend_facade import backend
+from ..widgets.live_log_viewer import LiveLogViewer
+from ..utils.process_manager import process_manager
 from datetime import datetime
 import asyncio
 
@@ -16,6 +18,7 @@ class DiscoveryState:
         self.last_run_summary = None
         self.start_time = None
         self.log_element = None
+        self.log_viewer = None  # LiveLogViewer instance
 
     def cancel(self):
         self.cancel_requested = True
@@ -92,11 +95,20 @@ async def run_yellow_pages_discovery(
     discovery_state.reset()
     discovery_state.start_time = datetime.now()
 
+    # Register job in process manager
+    job_id = 'discovery_yp'
+    process_manager.register(job_id, 'YP Discovery', log_file='logs/yp_crawl.log')
+
     # Disable run button, enable stop button
     run_button.disable()
     stop_button.enable()
 
-    # Clear log
+    # Start tailing log file
+    if discovery_state.log_viewer:
+        discovery_state.log_viewer.load_last_n_lines(50)  # Load last 50 lines first
+        discovery_state.log_viewer.start_tailing()
+
+    # Clear old log element if it exists
     if discovery_state.log_element:
         discovery_state.log_element.clear()
 
@@ -261,6 +273,13 @@ async def run_yellow_pages_discovery(
         ui.notify(f'Discovery failed: {str(e)}', type='negative')
 
     finally:
+        # Stop tailing log file
+        if discovery_state.log_viewer:
+            discovery_state.log_viewer.stop_tailing()
+
+        # Mark job as completed in process manager
+        process_manager.mark_completed('discovery_yp', success=not discovery_state.cancel_requested)
+
         # Re-enable run button, disable stop button
         discovery_state.running = False
         run_button.enable()
@@ -450,6 +469,13 @@ async def run_homeadvisor_discovery(
         ui.notify(f'Discovery failed: {str(e)}', type='negative')
 
     finally:
+        # Stop tailing log file
+        if discovery_state.log_viewer:
+            discovery_state.log_viewer.stop_tailing()
+
+        # Mark job as completed in process manager
+        process_manager.mark_completed('discovery_yp', success=not discovery_state.cancel_requested)
+
         # Re-enable run button, disable stop button
         discovery_state.running = False
         run_button.enable()
@@ -596,6 +622,13 @@ async def run_google_maps_discovery(
         ui.notify(f'Google discovery failed: {str(e)}', type='negative')
 
     finally:
+        # Stop tailing log file
+        if discovery_state.log_viewer:
+            discovery_state.log_viewer.stop_tailing()
+
+        # Mark job as completed in process manager
+        process_manager.mark_completed('discovery_yp', success=not discovery_state.cancel_requested)
+
         # Re-enable run button, disable stop button
         discovery_state.running = False
         run_button.enable()
@@ -603,11 +636,23 @@ async def run_google_maps_discovery(
         progress_bar.value = 0
 
 
-def stop_discovery():
-    """Stop the running discovery."""
+async def stop_discovery():
+    """Stop the running discovery immediately."""
     if discovery_state.running:
+        # Set cancel flag (soft stop)
         discovery_state.cancel()
-        ui.notify('Cancelling discovery...', type='warning')
+
+        # Try to kill via process manager (instant hard stop)
+        killed = process_manager.kill('discovery_yp', force=True)
+
+        if killed:
+            ui.notify('Discovery stopped immediately (force killed)', type='warning')
+        else:
+            ui.notify('Stop requested - waiting for current batch to finish', type='info')
+
+        # Stop log tailing
+        if discovery_state.log_viewer:
+            discovery_state.log_viewer.stop_tailing()
 
 
 def build_yellow_pages_ui(container):
@@ -701,11 +746,13 @@ def build_yellow_pages_ui(container):
                     run_button.enable()
                     stop_button.disable()
 
-        # Live output
-        with ui.card().classes('w-full'):
-            ui.label('Live Output').classes('text-xl font-bold mb-4')
-            log_container = ui.column().classes('w-full h-96 overflow-y-auto bg-gray-900 p-4 rounded')
-            discovery_state.log_element = log_container
+        # Live output with real-time log tailing
+        log_viewer = LiveLogViewer('logs/yp_crawl.log', max_lines=500, auto_scroll=True)
+        log_viewer.create()
+
+        # Store references (keep log_element for backward compatibility)
+        discovery_state.log_viewer = log_viewer
+        discovery_state.log_element = ui.column()  # Dummy element for old code
 
         # Run button click handler
         async def start_discovery():
@@ -808,11 +855,13 @@ def build_google_maps_ui(container):
                     run_button.enable()
                     stop_button.disable()
 
-        # Live output
-        with ui.card().classes('w-full'):
-            ui.label('Live Output').classes('text-xl font-bold mb-4')
-            log_container = ui.column().classes('w-full h-96 overflow-y-auto bg-gray-900 p-4 rounded')
-            discovery_state.log_element = log_container
+        # Live output with real-time log tailing
+        log_viewer = LiveLogViewer('logs/yp_crawl.log', max_lines=500, auto_scroll=True)
+        log_viewer.create()
+
+        # Store references (keep log_element for backward compatibility)
+        discovery_state.log_viewer = log_viewer
+        discovery_state.log_element = ui.column()  # Dummy element for old code
 
         # Run button click handler
         async def start_discovery():
@@ -1086,11 +1135,13 @@ def build_homeadvisor_ui(container):
                     run_button.enable()
                     stop_button.disable()
 
-        # Live output
-        with ui.card().classes('w-full'):
-            ui.label('Live Output').classes('text-xl font-bold mb-4')
-            log_container = ui.column().classes('w-full h-96 overflow-y-auto bg-gray-900 p-4 rounded')
-            discovery_state.log_element = log_container
+        # Live output with real-time log tailing
+        log_viewer = LiveLogViewer('logs/yp_crawl.log', max_lines=500, auto_scroll=True)
+        log_viewer.create()
+
+        # Store references (keep log_element for backward compatibility)
+        discovery_state.log_viewer = log_viewer
+        discovery_state.log_element = ui.column()  # Dummy element for old code
 
         # Run button click handler
         async def start_discovery():
