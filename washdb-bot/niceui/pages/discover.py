@@ -108,9 +108,7 @@ async def run_yellow_pages_discovery(
         discovery_state.log_viewer.load_last_n_lines(50)  # Load last 50 lines first
         discovery_state.log_viewer.start_tailing()
 
-    # Clear old log element if it exists
-    if discovery_state.log_element:
-        discovery_state.log_element.clear()
+    # Old log element disabled (using log viewer instead)
 
     # Add initial log messages
     discovery_state.add_log('=' * 60, 'info')
@@ -750,9 +748,9 @@ def build_yellow_pages_ui(container):
         log_viewer = LiveLogViewer('logs/yp_crawl.log', max_lines=500, auto_scroll=True)
         log_viewer.create()
 
-        # Store references (keep log_element for backward compatibility)
+        # Store references (log_element set to None - add_log will skip)
         discovery_state.log_viewer = log_viewer
-        discovery_state.log_element = ui.column()  # Dummy element for old code
+        discovery_state.log_element = None  # Disable old logging, use log viewer instead
 
         # Run button click handler
         async def start_discovery():
@@ -859,9 +857,9 @@ def build_google_maps_ui(container):
         log_viewer = LiveLogViewer('logs/yp_crawl.log', max_lines=500, auto_scroll=True)
         log_viewer.create()
 
-        # Store references (keep log_element for backward compatibility)
+        # Store references (log_element set to None - add_log will skip)
         discovery_state.log_viewer = log_viewer
-        discovery_state.log_element = ui.column()  # Dummy element for old code
+        discovery_state.log_element = None  # Disable old logging, use log viewer instead
 
         # Run button click handler
         async def start_discovery():
@@ -1139,9 +1137,9 @@ def build_homeadvisor_ui(container):
         log_viewer = LiveLogViewer('logs/yp_crawl.log', max_lines=500, auto_scroll=True)
         log_viewer.create()
 
-        # Store references (keep log_element for backward compatibility)
+        # Store references (log_element set to None - add_log will skip)
         discovery_state.log_viewer = log_viewer
-        discovery_state.log_element = ui.column()  # Dummy element for old code
+        discovery_state.log_element = None  # Disable old logging, use log viewer instead
 
         # Run button click handler
         async def start_discovery():
