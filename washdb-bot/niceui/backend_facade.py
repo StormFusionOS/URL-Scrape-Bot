@@ -11,7 +11,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 # Import actual scraper modules
-from scrape_yp.yp_crawl import crawl_all_states, CATEGORIES as DEFAULT_CATEGORIES, STATES as DEFAULT_STATES
+# NOTE: YP scraper now uses city-first approach via CLI subprocess (see niceui/pages/discover.py)
+# from scrape_yp.yp_crawl import crawl_all_states, CATEGORIES as DEFAULT_CATEGORIES, STATES as DEFAULT_STATES
 from scrape_ha.ha_crawl import crawl_all_states as ha_crawl_all, CATEGORIES_HA
 from scrape_site.site_scraper import scrape_website
 from db.save_discoveries import upsert_discovered, create_session
@@ -46,7 +47,10 @@ class BackendFacade:
         pages_per_pair: int,
         cancel_flag: Optional[Callable[[], bool]] = None,
         progress_callback: Optional[Callable[[dict], None]] = None,
-        providers: List[str] = None
+        providers: List[str] = None,
+        use_enhanced_filter: bool = True,
+        min_score: float = 50.0,
+        include_sponsored: bool = False
     ) -> Dict[str, int]:
         """
         Run multi-provider discovery across category×state with pagination and dedup.
@@ -58,6 +62,9 @@ class BackendFacade:
             cancel_flag: Optional callable that returns True to cancel operation
             progress_callback: Optional callable to receive progress updates
             providers: List of provider codes to use (e.g., ["YP", "HA"]). Default: ["YP"]
+            use_enhanced_filter: Use enhanced YP filtering with category tags (default: False)
+            min_score: Minimum confidence score for enhanced filter (0-100, default: 50)
+            include_sponsored: Include sponsored/ad listings with enhanced filter (default: False)
 
         Returns:
             Dict with keys:
@@ -128,14 +135,16 @@ class BackendFacade:
 
             # Create generators for each provider
             generators = []
+
+            # NOTE: YP scraper now uses city-first approach via CLI subprocess
+            # The GUI calls cli_crawl_yp.py directly (see niceui/pages/discover.py)
+            # Old state-first code has been removed.
             if use_yp and yp_categories:
-                logger.info(f"Adding YP crawler: {len(yp_categories)} categories")
-                generators.append(crawl_all_states(
-                    categories=yp_categories,
-                    states=states,
-                    limit_per_state=pages_per_pair,
-                    page_callback=page_callback
-                ))
+                logger.warning(
+                    "YP scraper is now city-first and uses CLI subprocess. "
+                    "Please use the Discovery page in the GUI to run YP scraping."
+                )
+                # Skip YP in this legacy backend facade method
             if use_ha and ha_categories:
                 logger.info(f"Adding HA crawler: {len(ha_categories)} categories")
                 generators.append(ha_crawl_all(

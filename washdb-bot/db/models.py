@@ -5,6 +5,8 @@ Models:
 - Company: Stores business/company information scraped from various sources
 - ScheduledJob: Stores scheduled crawl/scrape jobs with cron schedules
 - JobExecutionLog: Logs execution history of scheduled jobs
+- CityRegistry: US cities dataset for city-first scraping
+- YPTarget: Target list for Yellow Pages city-first crawling
 """
 
 from datetime import datetime
@@ -259,6 +261,229 @@ class JobExecutionLog(Base):
     def __repr__(self) -> str:
         """String representation of JobExecutionLog."""
         return f"<JobExecutionLog(id={self.id}, job_id={self.job_id}, status='{self.status}', started='{self.started_at}')>"
+
+
+class CityRegistry(Base):
+    """
+    US Cities Registry for city-first scraping.
+
+    Populated from uscities.csv dataset with ~31,255 cities across all US states.
+    Used to generate city-level scraping targets for Yellow Pages and other providers.
+
+    Attributes:
+        id: Primary key
+        city: Full city name (may include special characters)
+        city_ascii: ASCII-normalized city name
+        state_id: 2-letter state code (e.g., 'CA', 'TX')
+        state_name: Full state name (e.g., 'California', 'Texas')
+        county_fips: 5-digit FIPS code for county
+        county_name: County name
+        lat: Latitude (decimal degrees)
+        lng: Longitude (decimal degrees)
+        population: Population estimate
+        density: Population density per square mile
+        timezone: IANA timezone (e.g., 'America/New_York')
+        zips: Space-separated list of ZIP codes
+        ranking: City size ranking (1=largest, 5=smallest)
+        source: Data source (typically 'shape')
+        military: Military base flag
+        incorporated: Incorporation status
+        active: Whether this city is active for scraping
+        city_slug: YP-style city-state slug (e.g., 'los-angeles-ca')
+        yp_geo: Fallback search format (e.g., 'Los Angeles, CA')
+        priority: Computed priority based on population tier (1-3)
+        created_at: Record creation timestamp
+        updated_at: Last update timestamp
+    """
+
+    __tablename__ = "city_registry"
+
+    # Primary Key
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Core City Information (from uscities.csv)
+    city: Mapped[str] = mapped_column(String(255), nullable=False)
+    city_ascii: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    state_id: Mapped[str] = mapped_column(
+        String(2), nullable=False, index=True,
+        comment="2-letter state code (e.g., CA, TX)"
+    )
+    state_name: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # Geographic Details
+    county_fips: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)
+    county_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    lat: Mapped[float] = mapped_column(Float, nullable=False)
+    lng: Mapped[float] = mapped_column(Float, nullable=False)
+
+    # Demographics
+    population: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, index=True,
+        comment="Population estimate (used for prioritization)"
+    )
+    density: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # Time & Location
+    timezone: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True,
+        comment="IANA timezone (e.g., America/New_York)"
+    )
+    zips: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Space-separated list of ZIP codes"
+    )
+
+    # Metadata from Dataset
+    ranking: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="City size ranking (1=largest, 5=smallest)"
+    )
+    source: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True, default='shape'
+    )
+    military: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    incorporated: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    # Scraping Configuration
+    active: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False, index=True,
+        comment="Whether this city is active for scraping"
+    )
+    city_slug: Mapped[str] = mapped_column(
+        String(255), nullable=False, unique=True, index=True,
+        comment="YP-style city-state slug (e.g., 'los-angeles-ca')"
+    )
+    yp_geo: Mapped[str] = mapped_column(
+        String(255), nullable=False,
+        comment="Fallback search format (e.g., 'Los Angeles, CA')"
+    )
+    priority: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=2, index=True,
+        comment="Scraping priority based on population tier (1=high, 2=medium, 3=low)"
+    )
+
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, onupdate=func.now(), nullable=True
+    )
+
+    def __repr__(self) -> str:
+        """String representation of CityRegistry."""
+        return f"<CityRegistry(id={self.id}, city='{self.city}', state='{self.state_id}', slug='{self.city_slug}')>"
+
+
+class YPTarget(Base):
+    """
+    Yellow Pages scraping target (city × category).
+
+    Each row represents a city-category combination to be scraped.
+    Generated from CityRegistry × allowed categories.
+
+    Attributes:
+        id: Primary key
+        provider: Source provider (always 'YP')
+        state_id: 2-letter state code
+        city: City name
+        city_slug: YP city-state slug
+        yp_geo: Fallback search format
+        category_label: Human-readable category name
+        category_slug: YP URL slug for category
+        primary_url: City-category URL (e.g., /los-angeles-ca/window-cleaning)
+        fallback_url: Search URL with geo_location_terms
+        max_pages: Maximum pages to crawl (based on population tier)
+        priority: Scraping priority (from city registry)
+        status: Current status (planned, in_progress, done, failed, parked)
+        last_attempt_ts: Last attempt timestamp
+        attempts: Number of scraping attempts
+        note: Optional note (e.g., reason for failure)
+        created_at: Record creation timestamp
+        updated_at: Last update timestamp
+    """
+
+    __tablename__ = "yp_targets"
+
+    # Primary Key
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Provider & Location
+    provider: Mapped[str] = mapped_column(
+        String(10), nullable=False, default='YP', index=True
+    )
+    state_id: Mapped[str] = mapped_column(
+        String(2), nullable=False, index=True,
+        comment="2-letter state code"
+    )
+    city: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    city_slug: Mapped[str] = mapped_column(
+        String(255), nullable=False, index=True,
+        comment="YP city-state slug (e.g., 'los-angeles-ca')"
+    )
+    yp_geo: Mapped[str] = mapped_column(
+        String(255), nullable=False,
+        comment="Fallback search format (e.g., 'Los Angeles, CA')"
+    )
+
+    # Category
+    category_label: Mapped[str] = mapped_column(
+        String(255), nullable=False, index=True,
+        comment="Human-readable category name (e.g., 'Window Cleaning')"
+    )
+    category_slug: Mapped[str] = mapped_column(
+        String(255), nullable=False,
+        comment="YP URL slug (e.g., 'window-cleaning')"
+    )
+
+    # URLs
+    primary_url: Mapped[str] = mapped_column(
+        Text, nullable=False,
+        comment="City-category URL (e.g., /los-angeles-ca/window-cleaning)"
+    )
+    fallback_url: Mapped[str] = mapped_column(
+        Text, nullable=False,
+        comment="Search URL with geo_location_terms"
+    )
+
+    # Crawl Configuration
+    max_pages: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1,
+        comment="Max pages to crawl (1-3 based on population tier)"
+    )
+    priority: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=2, index=True,
+        comment="Priority (1=high, 2=medium, 3=low)"
+    )
+
+    # Status Tracking
+    status: Mapped[str] = mapped_column(
+        String(50), nullable=False, default='planned', index=True,
+        comment="planned, in_progress, done, failed, parked"
+    )
+    last_attempt_ts: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Number of scraping attempts"
+    )
+    note: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Optional note (e.g., 'no results page 1', 'blocked')"
+    )
+
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, onupdate=func.now(), nullable=True
+    )
+
+    def __repr__(self) -> str:
+        """String representation of YPTarget."""
+        return f"<YPTarget(id={self.id}, city='{self.city}', state='{self.state_id}', category='{self.category_label}', status='{self.status}')>"
 
 
 # Helper Functions

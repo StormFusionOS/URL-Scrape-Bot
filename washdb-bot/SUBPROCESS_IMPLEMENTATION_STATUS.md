@@ -37,13 +37,13 @@ Replace thread-based `backend.discover()` with actual subprocess execution for:
 - Can register jobs with PIDs
 - Kill by job_id
 
-## Remaining Work 🚧
+## Completed Integration ✅
 
-### 3. Integrate Subprocess into Discovery Page
+### 3. Subprocess Integration in Discovery Page
 
-**File to modify:** `niceui/pages/discover.py`
+**File modified:** `niceui/pages/discover.py`
 
-**Changes needed:**
+**Changes completed:**
 
 #### A. Add imports:
 ```python
@@ -116,18 +116,24 @@ killed = process_manager.kill('discovery_yp', force=True)
 # Returns True and kills immediately via SIGKILL
 ```
 
-### 4. Testing Checklist
+### 4. Testing Checklist ✅
 
-After integration:
-- [ ] Start YP discovery
+Integration complete! Ready for testing:
+- [ ] Start YP discovery from dashboard
+- [ ] Verify notification shows PID of started crawler
 - [ ] Verify logs stream in real-time in LiveLogViewer
 - [ ] Verify `ps aux | grep cli_crawl_yp` shows process
 - [ ] Click STOP button during active crawl
 - [ ] Verify process dies instantly (< 1 second)
-- [ ] Verify "Discovery stopped immediately (force killed)" notification
-- [ ] Check log file continues to have all output
+- [ ] Verify "Discovery stopped immediately (subprocess killed)" notification
+- [ ] Check log file has all output
 - [ ] Verify auto-scroll works
-- [ ] Verify errors show in red
+- [ ] Verify errors show in red text
+
+**Dashboard Status:**
+- ✅ Dashboard running on http://127.0.0.1:8080
+- ✅ Subprocess integration active
+- ✅ Ready for testing
 
 ### 5. Standardize All Sources
 
@@ -162,21 +168,35 @@ If subprocess refactoring is too complex:
 
 Just need to accept ~30 second stop delay.
 
-## Recommendation
+## Implementation Complete! ✅
 
-**Complete subprocess integration** - It's 80% done:
-- CLI wrapper: ✅ Done
-- SubprocessRunner: ✅ Done
-- LiveLogViewer: ✅ Done
-- Process Manager: ✅ Done
-- Integration: 🚧 20% of work remaining
+**Subprocess integration: 100% DONE**
+- CLI wrapper: ✅ Done (`cli_crawl_yp.py`)
+- SubprocessRunner: ✅ Done (`niceui/utils/subprocess_runner.py`)
+- LiveLogViewer: ✅ Done (`niceui/widgets/live_log_viewer.py`)
+- Process Manager: ✅ Done (`niceui/utils/process_manager.py`)
+- Integration: ✅ Done (modified `discover.py`)
+- Stop Button: ✅ Done (instant kill with subprocess runner)
 
-The hardest parts are done. Just need to wire it up in `discover.py`.
+## Testing Required
+
+The dashboard is running at **http://127.0.0.1:8080** with full subprocess integration.
+
+**Test the instant kill feature:**
+1. Navigate to Discover page
+2. Select Yellow Pages source
+3. Choose 1-2 categories and 1 state
+4. Click "START DISCOVERY"
+5. You should see: "Crawler started with PID XXXXX"
+6. Wait a few seconds for crawl to start
+7. Click "STOP" button
+8. Process should die instantly (< 1 second)
+9. You should see: "Discovery stopped immediately (subprocess killed)"
+10. Verify logs in live output viewer
 
 ## Next Steps
 
-1. Modify `run_yellow_pages_discovery()` in `discover.py`
-2. Test with real crawl
-3. Verify instant kill works
-4. Apply to Google and HA
-5. Done!
+1. Test YP instant stop with real crawl
+2. Apply subprocess approach to Google Maps discovery
+3. Apply subprocess approach to HomeAdvisor discovery
+4. Standardize all sources with LiveLogViewer

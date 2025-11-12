@@ -6,8 +6,11 @@ from nicegui import ui, run
 from ..backend_facade import backend
 from ..widgets.live_log_viewer import LiveLogViewer
 from ..utils.process_manager import process_manager
+from ..utils.subprocess_runner import SubprocessRunner
 from datetime import datetime
 import asyncio
+import sys
+import os
 
 
 # Global state for discovery
@@ -19,6 +22,7 @@ class DiscoveryState:
         self.start_time = None
         self.log_element = None
         self.log_viewer = None  # LiveLogViewer instance
+        self.subprocess_runner = None  # SubprocessRunner instance for instant kill
 
     def cancel(self):
         self.cancel_requested = True
@@ -81,23 +85,104 @@ ALL_STATES = [
 ]
 
 
+async def generate_yp_targets(states, clear_existing=True):
+    """Generate Yellow Pages targets for the selected states."""
+    try:
+        cmd = [
+            sys.executable,
+            '-m', 'scrape_yp.generate_city_targets',
+            '--states', ','.join(states)
+        ]
+
+        if clear_existing:
+            cmd.append('--clear')
+
+        # Run synchronously and capture output
+        import subprocess
+        result = subprocess.run(
+            cmd,
+            cwd=os.getcwd(),
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+
+        if result.returncode == 0:
+            return True, result.stdout
+        else:
+            return False, result.stderr or result.stdout
+
+    except Exception as e:
+        return False, str(e)
+
+
+async def get_yp_target_stats(states):
+    """Get statistics about Yellow Pages targets for the selected states."""
+    try:
+        from db.models import YPTarget
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from dotenv import load_dotenv
+        load_dotenv()
+
+        engine = create_engine(os.getenv('DATABASE_URL'))
+        Session = sessionmaker(bind=engine)
+        session = Session()
+
+        try:
+            total = session.query(YPTarget).filter(YPTarget.state_id.in_(states)).count()
+            planned = session.query(YPTarget).filter(
+                YPTarget.state_id.in_(states),
+                YPTarget.status == 'planned'
+            ).count()
+            in_progress = session.query(YPTarget).filter(
+                YPTarget.state_id.in_(states),
+                YPTarget.status == 'in_progress'
+            ).count()
+            done = session.query(YPTarget).filter(
+                YPTarget.state_id.in_(states),
+                YPTarget.status == 'done'
+            ).count()
+            failed = session.query(YPTarget).filter(
+                YPTarget.state_id.in_(states),
+                YPTarget.status == 'failed'
+            ).count()
+
+            return {
+                'total': total,
+                'planned': planned,
+                'in_progress': in_progress,
+                'done': done,
+                'failed': failed
+            }
+        finally:
+            session.close()
+
+    except Exception as e:
+        return None
+
+
 async def run_yellow_pages_discovery(
-    categories,
     states,
-    pages_per_pair,
+    max_targets,
     stats_card,
     progress_bar,
     run_button,
-    stop_button
+    stop_button,
+    min_score=50.0,
+    include_sponsored=False,
+    enable_monitoring=True,
+    enable_adaptive_rate_limiting=True,
+    enable_session_breaks=True
 ):
-    """Run Yellow Pages discovery in background with progress updates."""
+    """Run Yellow Pages city-first discovery in background with progress updates."""
     discovery_state.running = True
     discovery_state.reset()
     discovery_state.start_time = datetime.now()
 
     # Register job in process manager
     job_id = 'discovery_yp'
-    process_manager.register(job_id, 'YP Discovery', log_file='logs/yp_crawl.log')
+    process_manager.register(job_id, 'YP Discovery', log_file='logs/yp_crawl_city_first.log')
 
     # Disable run button, enable stop button
     run_button.disable()
@@ -108,16 +193,18 @@ async def run_yellow_pages_discovery(
         discovery_state.log_viewer.load_last_n_lines(50)  # Load last 50 lines first
         discovery_state.log_viewer.start_tailing()
 
-    # Old log element disabled (using log viewer instead)
-
     # Add initial log messages
     discovery_state.add_log('=' * 60, 'info')
-    discovery_state.add_log('Starting Yellow Pages Discovery', 'info')
+    discovery_state.add_log('Starting Yellow Pages Discovery (City-First)', 'info')
     discovery_state.add_log('=' * 60, 'info')
-    discovery_state.add_log(f'Categories: {", ".join(categories)}', 'info')
     discovery_state.add_log(f'States: {", ".join(states)}', 'info')
-    discovery_state.add_log(f'Pages per pair: {pages_per_pair}', 'info')
-    discovery_state.add_log(f'Total pairs: {len(categories)} × {len(states)} = {len(categories) * len(states)}', 'info')
+    discovery_state.add_log(f'Max Targets: {max_targets or "All"}', 'info')
+    discovery_state.add_log(f'Min Score: {min_score}', 'info')
+    discovery_state.add_log(f'Include Sponsored: {include_sponsored}', 'info')
+    discovery_state.add_log('-' * 60, 'info')
+    discovery_state.add_log(f'Monitoring: {"Enabled" if enable_monitoring else "Disabled"}', 'info')
+    discovery_state.add_log(f'Adaptive Rate Limiting: {"Enabled" if enable_adaptive_rate_limiting else "Disabled"}', 'info')
+    discovery_state.add_log(f'Session Breaks: {"Enabled" if enable_session_breaks else "Disabled"}', 'info')
     discovery_state.add_log('-' * 60, 'info')
 
     # Clear stats
@@ -129,87 +216,94 @@ async def run_yellow_pages_discovery(
             'new': ui.label('New: 0'),
             'updated': ui.label('Updated: 0'),
             'errors': ui.label('Errors: 0'),
-            'progress': ui.label('Progress: 0/0 pairs')
+            'progress': ui.label('Progress: 0/0 targets')
         }
 
     try:
-        discovery_state.add_log('Starting Yellow Pages crawler...', 'info')
+        ui.notify('Starting YP city-first crawler as subprocess...', type='info')
 
-        # Progress callback to update UI in real-time
-        def progress_callback(progress):
-            """Handle progress updates from backend."""
-            progress_type = progress.get('type')
+        # Build command for subprocess (NEW CLI arguments)
+        states_str = ','.join(states)
 
-            if progress_type == 'batch_start':
-                category = progress.get('category', '')
-                state = progress.get('state', '')
-                pairs_done = progress.get('pairs_done', 0)
-                pairs_total = progress.get('pairs_total', 0)
-                discovery_state.add_log(
-                    f"Processing pair {pairs_done}/{pairs_total}: {category} × {state}",
-                    'info'
-                )
+        cmd = [
+            sys.executable,  # Python interpreter from venv
+            'cli_crawl_yp.py',
+            '--states', states_str,
+            '--min-score', str(min_score)
+        ]
 
-            elif progress_type == 'page_complete':
-                page = progress.get('page', 0)
-                total_pages = progress.get('total_pages', 0)
-                new_results = progress.get('new_results', 0)
-                total_results = progress.get('total_results', 0)
-                category = progress.get('category', '')
-                state = progress.get('state', '')
-                discovery_state.add_log(
-                    f"Page {page}/{total_pages}: Found {new_results} new results ({total_results} total) - {category} in {state}",
-                    'processing'
-                )
+        # Add optional flags
+        if include_sponsored:
+            cmd.append('--include-sponsored')
 
-            elif progress_type == 'batch_complete':
-                category = progress.get('category', '')
-                state = progress.get('state', '')
-                found = progress.get('found', 0)
-                new = progress.get('new', 0)
-                updated = progress.get('updated', 0)
-                discovery_state.add_log(
-                    f"✓ {category} × {state}: Found {found}, New {new}, Updated {updated}",
-                    'success'
-                )
+        if max_targets:
+            cmd.extend(['--max-targets', str(max_targets)])
 
-                # Update stats card with current totals
-                totals = progress.get('totals', {})
-                stat_labels['found'].set_text(f"Found: {totals.get('found', 0)}")
-                stat_labels['new'].set_text(f"New: {totals.get('new', 0)}")
-                stat_labels['updated'].set_text(f"Updated: {totals.get('updated', 0)}")
-                stat_labels['errors'].set_text(f"Errors: {totals.get('errors', 0)}")
+        # Add monitoring flags
+        if not enable_monitoring:
+            cmd.append('--disable-monitoring')
 
-                # Update progress bar
-                pairs_done = progress.get('pairs_done', 0)
-                pairs_total = progress.get('pairs_total', 1)
-                progress_bar.value = pairs_done / pairs_total
-                stat_labels['progress'].set_text(f"Progress: {pairs_done}/{pairs_total} pairs")
+        if not enable_adaptive_rate_limiting:
+            cmd.append('--disable-adaptive-rate-limiting')
 
-            elif progress_type == 'error':
-                error_msg = progress.get('error', 'Unknown error')
-                discovery_state.add_log(f"✗ Error: {error_msg}", 'error')
+        if not enable_session_breaks:
+            cmd.append('--no-session-breaks')
 
-            # Check if cancelled
+        # Create subprocess runner
+        runner = SubprocessRunner(job_id, 'logs/yp_crawl_city_first.log')
+        discovery_state.subprocess_runner = runner
+
+        # Start subprocess
+        pid = runner.start(cmd, cwd=os.getcwd())
+        ui.notify(f'Crawler started with PID {pid}', type='positive')
+
+        # Update process manager with actual PID
+        process_manager.update_pid(job_id, pid)
+
+        # Get initial target count
+        target_stats = await get_yp_target_stats(states)
+        total_targets = target_stats['planned'] if target_stats else max_targets or 0
+
+        # Wait for subprocess to complete (check every second)
+        while runner.is_running():
+            await asyncio.sleep(1.0)
+
+            # Update progress bar based on time elapsed (rough estimate)
+            elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
+            # City-first: ~10 seconds per target
+            estimated_done = min(int(elapsed / 10), total_targets) if total_targets > 0 else 0
+            progress_bar.value = estimated_done / total_targets if total_targets > 0 else 0
+            stat_labels['progress'].set_text(f"Progress: ~{estimated_done}/{total_targets} targets (estimated)")
+
+            # Check for cancellation
             if discovery_state.is_cancelled():
-                discovery_state.add_log('Cancellation requested, stopping...', 'warning')
-                return True  # Signal to stop
+                ui.notify('Killing crawler process...', type='warning')
+                runner.kill()  # INSTANT KILL!
+                break
 
-            return False
+        # Get final status
+        status = runner.get_status()
+        return_code = status['return_code']
 
-        # Run discovery through backend
-        # Use YP provider by default (can be extended to support multiple providers)
-        result = await run.io_bound(
-            backend.discover,
-            categories,
-            states,
-            pages_per_pair,
-            discovery_state.is_cancelled,  # cancel_flag - callable that returns True when cancelled
-            progress_callback,
-            ["YP"]  # providers - defaults to Yellow Pages
-        )
+        if return_code == 0:
+            ui.notify('Crawler completed successfully!', type='positive')
+        elif return_code == -9:
+            ui.notify('Crawler was killed by user', type='warning')
+        else:
+            ui.notify(f'Crawler exited with code {return_code}', type='negative')
 
-        discovery_state.add_log('Crawler completed!', 'success')
+        # Parse results from database (crawler saves directly to DB)
+        result = await run.io_bound(backend.kpis)
+        final_target_stats = await get_yp_target_stats(states)
+
+        result = {
+            'found': result.get('total_companies', 0),
+            'new': result.get('new_7d', 0),
+            'updated': 0,  # Don't have this info from subprocess
+            'errors': 0,  # Check log file for errors
+            'targets_done': final_target_stats['done'] if final_target_stats else 0,
+            'targets_total': final_target_stats['total'] if final_target_stats else total_targets
+        }
 
         # Update final stats
         elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
@@ -222,7 +316,7 @@ async def run_yellow_pages_discovery(
         discovery_state.add_log(f'New: {result["new"]} businesses added', 'success')
         discovery_state.add_log(f'Updated: {result["updated"]} businesses updated', 'info')
         discovery_state.add_log(f'Errors: {result["errors"]}', 'error' if result["errors"] > 0 else 'info')
-        discovery_state.add_log(f'Pairs processed: {result["pairs_done"]}/{result["pairs_total"]}', 'info')
+        discovery_state.add_log(f'Targets processed: {result["targets_done"]}/{result["targets_total"]}', 'info')
         discovery_state.add_log('=' * 60, 'info')
 
         stats_card.clear()
@@ -234,11 +328,11 @@ async def run_yellow_pages_discovery(
             ui.label(f'New: {result["new"]}').classes('text-lg text-green-500')
             ui.label(f'Updated: {result["updated"]}').classes('text-lg text-blue-500')
             ui.label(f'Errors: {result["errors"]}').classes('text-lg text-red-500')
-            ui.label(f'Pairs: {result["pairs_done"]}/{result["pairs_total"]}').classes('text-sm')
+            ui.label(f'Targets: {result["targets_done"]}/{result["targets_total"]}').classes('text-sm')
 
         # Update progress bar
-        if result["pairs_total"] > 0:
-            progress_bar.value = result["pairs_done"] / result["pairs_total"]
+        if result["targets_total"] > 0:
+            progress_bar.value = result["targets_done"] / result["targets_total"]
 
         # Store summary
         discovery_state.last_run_summary = {
@@ -299,13 +393,18 @@ async def run_homeadvisor_discovery(
     discovery_state.reset()
     discovery_state.start_time = datetime.now()
 
+    # Register job in process manager
+    job_id = 'discovery_ha'
+    process_manager.register(job_id, 'HA Discovery', log_file='logs/ha_crawl.log')
+
     # Disable run button, enable stop button
     run_button.disable()
     stop_button.enable()
 
-    # Clear log
-    if discovery_state.log_element:
-        discovery_state.log_element.clear()
+    # Start tailing log file
+    if discovery_state.log_viewer:
+        discovery_state.log_viewer.load_last_n_lines(50)
+        discovery_state.log_viewer.start_tailing()
 
     # Add initial log messages
     discovery_state.add_log('=' * 60, 'info')
@@ -330,82 +429,70 @@ async def run_homeadvisor_discovery(
         }
 
     try:
-        discovery_state.add_log('Starting HomeAdvisor crawler...', 'info')
+        ui.notify('Starting HomeAdvisor crawler as subprocess...', type='info')
 
-        # Progress callback to update UI in real-time
-        def progress_callback(progress):
-            """Handle progress updates from backend."""
-            progress_type = progress.get('type')
+        # Build command for subprocess
+        categories_str = ','.join(categories)
+        states_str = ','.join(states)
 
-            if progress_type == 'batch_start':
-                category = progress.get('category', '')
-                state = progress.get('state', '')
-                pairs_done = progress.get('pairs_done', 0)
-                pairs_total = progress.get('pairs_total', 0)
-                discovery_state.add_log(
-                    f"Processing pair {pairs_done}/{pairs_total}: {category} × {state}",
-                    'info'
-                )
+        cmd = [
+            sys.executable,
+            'cli_crawl_ha.py',
+            '--categories', categories_str,
+            '--states', states_str,
+            '--pages', str(pages_per_pair)
+        ]
 
-            elif progress_type == 'page_complete':
-                page = progress.get('page', 0)
-                total_pages = progress.get('total_pages', 0)
-                new_results = progress.get('new_results', 0)
-                total_results = progress.get('total_results', 0)
-                category = progress.get('category', '')
-                state = progress.get('state', '')
-                discovery_state.add_log(
-                    f"Page {page}/{total_pages}: Found {new_results} new results ({total_results} total) - {category} in {state}",
-                    'processing'
-                )
+        # Create subprocess runner
+        runner = SubprocessRunner(job_id, 'logs/ha_crawl.log')
+        discovery_state.subprocess_runner = runner
 
-            elif progress_type == 'batch_complete':
-                category = progress.get('category', '')
-                state = progress.get('state', '')
-                found = progress.get('found', 0)
-                new = progress.get('new', 0)
-                updated = progress.get('updated', 0)
-                discovery_state.add_log(
-                    f"✓ {category} × {state}: Found {found}, New {new}, Updated {updated}",
-                    'success'
-                )
+        # Start subprocess
+        pid = runner.start(cmd, cwd=os.getcwd())
+        ui.notify(f'Crawler started with PID {pid}', type='positive')
 
-                # Update stats card with current totals
-                totals = progress.get('totals', {})
-                stat_labels['found'].set_text(f"Found: {totals.get('found', 0)}")
-                stat_labels['new'].set_text(f"New: {totals.get('new', 0)}")
-                stat_labels['updated'].set_text(f"Updated: {totals.get('updated', 0)}")
-                stat_labels['errors'].set_text(f"Errors: {totals.get('errors', 0)}")
+        # Update process manager with actual PID
+        process_manager.update_pid(job_id, pid)
 
-                # Update progress bar
-                pairs_done = progress.get('pairs_done', 0)
-                pairs_total = progress.get('pairs_total', 1)
-                progress_bar.value = pairs_done / pairs_total
-                stat_labels['progress'].set_text(f"Progress: {pairs_done}/{pairs_total} pairs")
+        # Wait for subprocess to complete (check every second)
+        total_pairs = len(categories) * len(states)
+        while runner.is_running():
+            await asyncio.sleep(1.0)
 
-            elif progress_type == 'error':
-                error_msg = progress.get('error', 'Unknown error')
-                discovery_state.add_log(f"✗ Error: {error_msg}", 'error')
+            # Update progress bar based on time elapsed (rough estimate)
+            elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
+            # Rough estimate: 20 seconds per pair
+            estimated_pairs_done = min(int(elapsed / 20), total_pairs)
+            progress_bar.value = estimated_pairs_done / total_pairs if total_pairs > 0 else 0
+            stat_labels['progress'].set_text(f"Progress: ~{estimated_pairs_done}/{total_pairs} pairs (estimated)")
 
-            # Check if cancelled
+            # Check for cancellation
             if discovery_state.is_cancelled():
-                discovery_state.add_log('Cancellation requested, stopping...', 'warning')
-                return True  # Signal to stop
+                ui.notify('Killing crawler process...', type='warning')
+                runner.kill()
+                break
 
-            return False
+        # Get final status
+        status = runner.get_status()
+        return_code = status['return_code']
 
-        # Run discovery through backend with HomeAdvisor provider
-        result = await run.io_bound(
-            backend.discover,
-            categories,
-            states,
-            pages_per_pair,
-            discovery_state.is_cancelled,  # cancel_flag - callable that returns True when cancelled
-            progress_callback,
-            ["HA"]  # providers - use HomeAdvisor
-        )
+        if return_code == 0:
+            ui.notify('Crawler completed successfully!', type='positive')
+        elif return_code == -9:
+            ui.notify('Crawler was killed by user', type='warning')
+        else:
+            ui.notify(f'Crawler exited with code {return_code}', type='negative')
 
-        discovery_state.add_log('Crawler completed!', 'success')
+        # Parse results from database (crawler saves directly to DB)
+        result = await run.io_bound(backend.kpis)
+        result = {
+            'found': result.get('total_companies', 0),
+            'new': result.get('new_7d', 0),
+            'updated': 0,
+            'errors': 0,
+            'pairs_done': total_pairs if return_code == 0 else estimated_pairs_done,
+            'pairs_total': total_pairs
+        }
 
         # Update final stats
         elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
@@ -472,7 +559,7 @@ async def run_homeadvisor_discovery(
             discovery_state.log_viewer.stop_tailing()
 
         # Mark job as completed in process manager
-        process_manager.mark_completed('discovery_yp', success=not discovery_state.cancel_requested)
+        process_manager.mark_completed('discovery_ha', success=not discovery_state.cancel_requested)
 
         # Re-enable run button, disable stop button
         discovery_state.running = False
@@ -496,13 +583,18 @@ async def run_google_maps_discovery(
     discovery_state.reset()
     discovery_state.start_time = datetime.now()
 
+    # Register job in process manager
+    job_id = 'discovery_google'
+    process_manager.register(job_id, 'Google Discovery', log_file='logs/google_scrape.log')
+
     # Disable run button, enable stop button
     run_button.disable()
     stop_button.enable()
 
-    # Clear log
-    if discovery_state.log_element:
-        discovery_state.log_element.clear()
+    # Start tailing log file
+    if discovery_state.log_viewer:
+        discovery_state.log_viewer.load_last_n_lines(50)
+        discovery_state.log_viewer.start_tailing()
 
     # Add initial log messages
     discovery_state.add_log('=' * 60, 'info')
@@ -514,55 +606,76 @@ async def run_google_maps_discovery(
     discovery_state.add_log(f'Scrape Details: {scrape_details}', 'info')
     discovery_state.add_log('-' * 60, 'info')
 
-    # Progress callback
-    def update_progress(progress_data):
-        """Handle progress updates from backend."""
-        msg_type = progress_data.get('type', 'info')
-        message = progress_data.get('message', '')
-
-        # Log the message
-        discovery_state.add_log(message, msg_type)
-
-        # Update stats card
-        stats_card.clear()
-        with stats_card:
-            ui.label('Running Google Maps Discovery...').classes('text-lg font-bold')
-            ui.separator()
-            if 'found' in progress_data:
-                ui.label(f"Found: {progress_data['found']}").classes('text-lg')
-            if 'saved' in progress_data:
-                ui.label(f"Saved: {progress_data['saved']}").classes('text-lg text-green-500')
-            if 'duplicates' in progress_data:
-                ui.label(f"Duplicates: {progress_data['duplicates']}").classes('text-lg text-yellow-500')
-            if 'errors' in progress_data:
-                ui.label(f"Errors: {progress_data['errors']}").classes('text-lg text-red-500')
-
-        # Check if cancelled
-        if discovery_state.is_cancelled():
-            discovery_state.add_log('Cancellation requested, stopping...', 'warning')
-            return True
-
-        return False
+    # Clear stats
+    stats_card.clear()
+    with stats_card:
+        ui.label('Running discovery...').classes('text-lg font-bold')
+        stat_labels = {
+            'found': ui.label('Found: 0'),
+            'saved': ui.label('Saved: 0'),
+            'duplicates': ui.label('Duplicates: 0')
+        }
 
     try:
-        discovery_state.add_log('Starting Google Maps scraper...', 'info')
-        discovery_state.add_log(f'Searching for \'{query}\' in \'{location}\'...', 'searching')
+        ui.notify('Starting Google Maps scraper as subprocess...', type='info')
 
-        # Clear stats
-        stats_card.clear()
-        with stats_card:
-            ui.label('Initializing...').classes('text-lg font-bold')
+        # Build command for subprocess
+        cmd = [
+            sys.executable,
+            'cli_crawl_google.py',
+            '--query', query,
+            '--location', location,
+            '--max-results', str(max_results)
+        ]
 
-        # Run discovery through backend
-        result = await run.io_bound(
-            backend.discover_google,
-            query,
-            location,
-            max_results,
-            scrape_details,
-            discovery_state.is_cancelled,  # cancel_flag - callable that returns True when cancelled
-            update_progress
-        )
+        if scrape_details:
+            cmd.append('--scrape-details')
+
+        # Create subprocess runner
+        runner = SubprocessRunner(job_id, 'logs/google_scrape.log')
+        discovery_state.subprocess_runner = runner
+
+        # Start subprocess
+        pid = runner.start(cmd, cwd=os.getcwd())
+        ui.notify(f'Google scraper started with PID {pid}', type='positive')
+
+        # Update process manager with actual PID
+        process_manager.update_pid(job_id, pid)
+
+        # Wait for subprocess to complete (check every second)
+        while runner.is_running():
+            await asyncio.sleep(1.0)
+
+            # Update progress bar (rough estimate based on time)
+            elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
+            # Google is slow: ~60 seconds per result
+            estimated_done = min(int(elapsed / 60), max_results)
+            progress_bar.value = estimated_done / max_results if max_results > 0 else 0
+
+            # Check for cancellation
+            if discovery_state.is_cancelled():
+                ui.notify('Killing scraper process...', type='warning')
+                runner.kill()
+                break
+
+        # Get final status
+        status = runner.get_status()
+        return_code = status['return_code']
+
+        if return_code == 0:
+            ui.notify('Google scraper completed successfully!', type='positive')
+        elif return_code == -9:
+            ui.notify('Google scraper was killed by user', type='warning')
+        else:
+            ui.notify(f'Google scraper exited with code {return_code}', type='negative')
+
+        # Parse results from database (scraper saves directly to DB)
+        result = await run.io_bound(backend.kpis)
+        result = {
+            'found': result.get('total_companies', 0),
+            'saved': result.get('new_7d', 0),
+            'duplicates': 0  # Don't have this info from subprocess
+        }
 
         # Calculate elapsed time
         elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
@@ -573,7 +686,6 @@ async def run_google_maps_discovery(
         discovery_state.add_log(f'Duration: {elapsed:.1f}s', 'info')
         discovery_state.add_log(f'Found: {result["found"]} businesses', 'success')
         discovery_state.add_log(f'Saved: {result["saved"]} new businesses', 'success')
-        discovery_state.add_log(f'Duplicates: {result["duplicates"]} skipped', 'warning')
         discovery_state.add_log('=' * 60, 'info')
 
         # Update final stats card
@@ -584,7 +696,6 @@ async def run_google_maps_discovery(
             ui.separator()
             ui.label(f'Found: {result["found"]}').classes('text-lg')
             ui.label(f'Saved: {result["saved"]}').classes('text-lg text-green-500')
-            ui.label(f'Duplicates: {result["duplicates"]}').classes('text-lg text-yellow-500')
 
         # Progress bar to full
         progress_bar.value = 1.0
@@ -625,7 +736,7 @@ async def run_google_maps_discovery(
             discovery_state.log_viewer.stop_tailing()
 
         # Mark job as completed in process manager
-        process_manager.mark_completed('discovery_yp', success=not discovery_state.cancel_requested)
+        process_manager.mark_completed('discovery_google', success=not discovery_state.cancel_requested)
 
         # Re-enable run button, disable stop button
         discovery_state.running = False
@@ -640,13 +751,20 @@ async def stop_discovery():
         # Set cancel flag (soft stop)
         discovery_state.cancel()
 
-        # Try to kill via process manager (instant hard stop)
-        killed = process_manager.kill('discovery_yp', force=True)
+        # Try to kill subprocess directly (instant hard stop)
+        killed = False
+        if discovery_state.subprocess_runner:
+            killed = discovery_state.subprocess_runner.kill()
+            if killed:
+                ui.notify('Discovery stopped immediately (subprocess killed)', type='warning')
 
-        if killed:
-            ui.notify('Discovery stopped immediately (force killed)', type='warning')
-        else:
-            ui.notify('Stop requested - waiting for current batch to finish', type='info')
+        # Fallback: Try to kill via process manager if no subprocess runner
+        if not killed:
+            killed = process_manager.kill('discovery_yp', force=True)
+            if killed:
+                ui.notify('Discovery stopped immediately (force killed)', type='warning')
+            else:
+                ui.notify('Stop requested - waiting for current batch to finish', type='info')
 
         # Stop log tailing
         if discovery_state.log_viewer:
@@ -654,44 +772,29 @@ async def stop_discovery():
 
 
 def build_yellow_pages_ui(container):
-    """Build Yellow Pages discovery UI in the given container."""
+    """Build Yellow Pages City-First discovery UI in the given container."""
     with container:
+        # Info banner about city-first approach
+        with ui.card().classes('w-full bg-purple-900 border-l-4 border-purple-500 mb-4'):
+            ui.label('🎯 Yellow Pages City-First Scraper').classes('text-lg font-bold text-purple-200')
+            ui.label('• Scrapes 31,254 US cities with population-based prioritization').classes('text-sm text-purple-100')
+            ui.label('• Shallow pagination (1-3 pages per city) with early-exit optimization').classes('text-sm text-purple-100')
+            ui.label('• 85%+ precision filtering with 10 predefined categories').classes('text-sm text-purple-100')
+            ui.label('• Step 1: Generate targets → Step 2: Run crawler').classes('text-sm text-purple-100')
+
         # Configuration card
         with ui.card().classes('w-full mb-4'):
             ui.label('Yellow Pages Configuration').classes('text-xl font-bold mb-4')
 
-            # Category selection
-            ui.label('Business Categories').classes('font-semibold mb-2')
-            ui.label('Select categories to search (click to toggle):').classes('text-sm text-gray-400 mb-2')
-
-            category_checkboxes = {}
-            with ui.grid(columns=3).classes('w-full gap-2 mb-4'):
-                for cat in DEFAULT_CATEGORIES:
-                    category_checkboxes[cat] = ui.checkbox(cat, value=True).classes('text-sm')
-
-            # Quick select buttons
-            with ui.row().classes('gap-2 mb-4'):
-                def select_all_categories():
-                    for cb in category_checkboxes.values():
-                        cb.value = True
-
-                def deselect_all_categories():
-                    for cb in category_checkboxes.values():
-                        cb.value = False
-
-                ui.button('Select All', icon='check_box', on_click=select_all_categories).props('flat dense')
-                ui.button('Deselect All', icon='check_box_outline_blank', on_click=deselect_all_categories).props('flat dense')
-
-            ui.separator()
-
             # State selection
-            ui.label('US States').classes('font-semibold mb-2 mt-4')
-            ui.label('Select states to search (click to toggle):').classes('text-sm text-gray-400 mb-2')
+            ui.label('US States').classes('font-semibold mb-2')
+            ui.label('Select states to scrape (generates targets for all cities in selected states):').classes('text-sm text-gray-400 mb-2')
 
             state_checkboxes = {}
             with ui.grid(columns=10).classes('w-full gap-1 mb-4'):
                 for state in ALL_STATES:
-                    state_checkboxes[state] = ui.checkbox(state, value=False).classes('text-xs')
+                    # Rhode Island selected by default for testing
+                    state_checkboxes[state] = ui.checkbox(state, value=(state == 'RI')).classes('text-xs')
 
             # Quick select buttons
             with ui.row().classes('gap-2 mb-4'):
@@ -708,16 +811,81 @@ def build_yellow_pages_ui(container):
 
             ui.separator()
 
-            # Pages per pair
-            ui.label('Crawl Settings').classes('font-semibold mb-2 mt-4')
-            pages_input = ui.number(
-                label='Search Depth',
-                value=1,
+            # Target generation section
+            ui.label('Step 1: Generate Targets').classes('font-semibold mb-2 mt-4')
+            ui.label('Generate scraping targets (city × category combinations) before running the crawler').classes('text-sm text-gray-400 mb-2')
+
+            # Target stats display (dynamic)
+            target_stats_container = ui.column().classes('w-full mb-3')
+
+            with ui.row().classes('gap-2 mb-4 items-center'):
+                generate_button = ui.button(
+                    'GENERATE TARGETS',
+                    icon='add_circle',
+                    color='secondary'
+                ).props('size=md')
+
+                refresh_stats_button = ui.button(
+                    'Refresh Stats',
+                    icon='refresh',
+                    on_click=lambda: None  # Will be set below
+                ).props('flat dense')
+
+            ui.separator()
+
+            # Crawler settings
+            ui.label('Step 2: Crawler Settings').classes('font-semibold mb-2 mt-4')
+
+            # Max targets
+            max_targets_input = ui.number(
+                label='Max Targets (leave empty for all)',
+                value=None,
                 min=1,
-                max=50,
-                step=1
-            ).classes('w-64')
-            ui.label('⚠ Higher depth = more URLs but slower crawling').classes('text-xs text-yellow-400')
+                max=100000,
+                step=10
+            ).classes('w-64 mb-2')
+            ui.label('Limit number of targets to process (useful for testing)').classes('text-xs text-gray-400 mb-3')
+
+            # Minimum score slider
+            min_score_slider = ui.slider(
+                min=0,
+                max=100,
+                value=50,
+                step=5
+            ).classes('w-full mb-1').props('label-always')
+            ui.label('Minimum Confidence Score (lower = more results, higher = better precision)').classes('text-xs text-gray-400 mb-2')
+
+            # Include sponsored checkbox
+            include_sponsored_checkbox = ui.checkbox(
+                'Include Sponsored/Ad Listings',
+                value=False
+            ).classes('mb-1')
+            ui.label('Check to include paid ads (usually excluded for quality)').classes('text-xs text-gray-400')
+
+            ui.separator().classes('my-4')
+
+            # Monitoring & Anti-Detection Settings
+            ui.label('Anti-Detection & Monitoring').classes('font-semibold mb-2 mt-2')
+            ui.label('Enhanced monitoring and stealth features (recommended for production)').classes('text-xs text-gray-400 mb-2')
+
+            with ui.column().classes('gap-2'):
+                enable_monitoring_checkbox = ui.checkbox(
+                    '✓ Enable Monitoring & Health Checks',
+                    value=True
+                ).classes('text-sm')
+                ui.label('Real-time metrics, CAPTCHA detection, health monitoring').classes('text-xs text-gray-400 ml-6 -mt-2')
+
+                enable_adaptive_rate_limiting_checkbox = ui.checkbox(
+                    '✓ Enable Adaptive Rate Limiting',
+                    value=True
+                ).classes('text-sm')
+                ui.label('Automatically slows down on errors, speeds up on success').classes('text-xs text-gray-400 ml-6 -mt-2')
+
+                enable_session_breaks_checkbox = ui.checkbox(
+                    '✓ Enable Session Breaks',
+                    value=True
+                ).classes('text-sm')
+                ui.label('Takes 30-90s breaks every 50 requests for human-like behavior').classes('text-xs text-gray-400 ml-6 -mt-2')
 
         # Stats and controls
         with ui.card().classes('w-full mb-4'):
@@ -733,7 +901,7 @@ def build_yellow_pages_ui(container):
 
             # Control buttons
             with ui.row().classes('gap-2'):
-                run_button = ui.button('START DISCOVERY', icon='play_arrow', color='positive')
+                run_button = ui.button('START CRAWLER', icon='play_arrow', color='positive')
                 stop_button = ui.button('STOP', icon='stop', color='negative')
 
                 # Set initial button states based on global discovery state
@@ -745,37 +913,114 @@ def build_yellow_pages_ui(container):
                     stop_button.disable()
 
         # Live output with real-time log tailing
-        log_viewer = LiveLogViewer('logs/yp_crawl.log', max_lines=500, auto_scroll=True)
+        log_viewer = LiveLogViewer('logs/yp_crawl_city_first.log', max_lines=500, auto_scroll=True)
         log_viewer.create()
 
         # Store references (log_element set to None - add_log will skip)
         discovery_state.log_viewer = log_viewer
         discovery_state.log_element = None  # Disable old logging, use log viewer instead
 
-        # Run button click handler
-        async def start_discovery():
-            # Get selected categories and states
-            selected_categories = [cat for cat, cb in category_checkboxes.items() if cb.value]
+        # Helper function to update target stats display
+        async def update_target_stats():
+            selected_states = [state for state, cb in state_checkboxes.items() if cb.value]
+            if not selected_states:
+                target_stats_container.clear()
+                with target_stats_container:
+                    ui.label('No states selected').classes('text-gray-400 italic')
+                return
+
+            stats = await get_yp_target_stats(selected_states)
+
+            target_stats_container.clear()
+            if stats and stats['total'] > 0:
+                with target_stats_container:
+                    with ui.card().classes('w-full bg-slate-800 p-3'):
+                        ui.label('Target Statistics').classes('text-sm font-bold mb-2')
+                        with ui.grid(columns=5).classes('gap-2'):
+                            ui.label(f'Total: {stats["total"]}').classes('text-xs')
+                            ui.label(f'Planned: {stats["planned"]}').classes('text-xs text-blue-400')
+                            ui.label(f'In Progress: {stats["in_progress"]}').classes('text-xs text-yellow-400')
+                            ui.label(f'Done: {stats["done"]}').classes('text-xs text-green-400')
+                            ui.label(f'Failed: {stats["failed"]}').classes('text-xs text-red-400')
+            else:
+                with target_stats_container:
+                    ui.label('No targets generated yet for selected states').classes('text-yellow-400 italic text-sm')
+
+        # Generate targets button handler
+        async def handle_generate_targets():
             selected_states = [state for state, cb in state_checkboxes.items() if cb.value]
 
-            # Validate
-            if not selected_categories:
-                ui.notify('Please select at least one category', type='warning')
-                return
             if not selected_states:
                 ui.notify('Please select at least one state', type='warning')
                 return
 
-            # Run Yellow Pages discovery
+            # Confirm with user
+            with ui.dialog() as dialog, ui.card():
+                ui.label('Generate Targets?').classes('text-lg font-bold mb-2')
+                ui.label(f'This will generate targets for {len(selected_states)} state(s):').classes('text-sm mb-1')
+                ui.label(f'{", ".join(selected_states)}').classes('text-sm text-blue-400 mb-3')
+                ui.label('Existing targets for these states will be cleared.').classes('text-xs text-yellow-400 mb-3')
+
+                with ui.row().classes('gap-2'):
+                    ui.button('Cancel', on_click=dialog.close).props('flat')
+                    async def confirm_generate():
+                        dialog.close()
+                        generate_button.disable()
+
+                        ui.notify('Generating targets...', type='info')
+                        success, output = await generate_yp_targets(selected_states, clear_existing=True)
+
+                        if success:
+                            ui.notify(f'Targets generated successfully for {len(selected_states)} state(s)!', type='positive')
+                            await update_target_stats()
+                        else:
+                            ui.notify(f'Failed to generate targets: {output[:200]}', type='negative')
+
+                        generate_button.enable()
+
+                    ui.button('Generate', on_click=confirm_generate, color='positive')
+
+            dialog.open()
+
+        generate_button.on('click', handle_generate_targets)
+        refresh_stats_button.on('click', update_target_stats)
+
+        # Initialize stats display
+        asyncio.create_task(update_target_stats())
+
+        # Run button click handler
+        async def start_discovery():
+            # Get selected states
+            selected_states = [state for state, cb in state_checkboxes.items() if cb.value]
+
+            # Validate
+            if not selected_states:
+                ui.notify('Please select at least one state', type='warning')
+                return
+
+            # Check if targets exist
+            stats = await get_yp_target_stats(selected_states)
+            if not stats or stats['planned'] == 0:
+                ui.notify('No planned targets found. Please generate targets first!', type='warning')
+                return
+
+            # Run Yellow Pages city-first discovery
             await run_yellow_pages_discovery(
-                selected_categories,
                 selected_states,
-                int(pages_input.value),
+                int(max_targets_input.value) if max_targets_input.value else None,
                 stats_card,
                 progress_bar,
                 run_button,
-                stop_button
+                stop_button,
+                min_score=min_score_slider.value,
+                include_sponsored=include_sponsored_checkbox.value,
+                enable_monitoring=enable_monitoring_checkbox.value,
+                enable_adaptive_rate_limiting=enable_adaptive_rate_limiting_checkbox.value,
+                enable_session_breaks=enable_session_breaks_checkbox.value
             )
+
+            # Refresh stats after completion
+            await update_target_stats()
 
         run_button.on('click', start_discovery)
         stop_button.on('click', stop_discovery)
@@ -854,7 +1099,7 @@ def build_google_maps_ui(container):
                     stop_button.disable()
 
         # Live output with real-time log tailing
-        log_viewer = LiveLogViewer('logs/yp_crawl.log', max_lines=500, auto_scroll=True)
+        log_viewer = LiveLogViewer('logs/google_scrape.log', max_lines=500, auto_scroll=True)
         log_viewer.create()
 
         # Store references (log_element set to None - add_log will skip)
@@ -1134,7 +1379,7 @@ def build_homeadvisor_ui(container):
                     stop_button.disable()
 
         # Live output with real-time log tailing
-        log_viewer = LiveLogViewer('logs/yp_crawl.log', max_lines=500, auto_scroll=True)
+        log_viewer = LiveLogViewer('logs/ha_crawl.log', max_lines=500, auto_scroll=True)
         log_viewer.create()
 
         # Store references (log_element set to None - add_log will skip)
@@ -1172,7 +1417,10 @@ def build_homeadvisor_ui(container):
 
 def discover_page():
     """Render unified discovery page with source selection."""
-    ui.label('URL Discovery').classes('text-3xl font-bold mb-4')
+    # Version badge to verify code updates
+    with ui.row().classes('gap-2 mb-2'):
+        ui.label('URL Discovery').classes('text-3xl font-bold')
+        ui.badge('v2.0-CITY-FIRST', color='purple').classes('mt-2')
 
     # Source selection (stays at top)
     with ui.card().classes('w-full mb-4'):
