@@ -1278,6 +1278,48 @@ class BackendFacade:
                 'failed_24h': 0
             }
 
+    def clear_database(self) -> Dict[str, Any]:
+        """
+        Clear all companies from the database (for testing purposes).
+
+        Returns:
+            Dict with keys:
+            - success: Boolean indicating if operation completed successfully
+            - deleted_count: Number of companies deleted
+            - message: Status message
+        """
+        logger.warning("Clearing all companies from database")
+
+        try:
+            session = create_session()
+
+            # Count companies before deletion
+            count_stmt = select(func.count(Company.id))
+            deleted_count = session.execute(count_stmt).scalar() or 0
+
+            # Delete all companies
+            from sqlalchemy import delete
+            delete_stmt = delete(Company)
+            session.execute(delete_stmt)
+            session.commit()
+            session.close()
+
+            logger.info(f"Cleared {deleted_count} companies from database")
+
+            return {
+                'success': True,
+                'deleted_count': deleted_count,
+                'message': f'Successfully deleted {deleted_count} companies from database'
+            }
+
+        except Exception as e:
+            logger.error(f"Error clearing database: {e}", exc_info=True)
+            return {
+                'success': False,
+                'deleted_count': 0,
+                'message': f'Error clearing database: {str(e)}'
+            }
+
 
 # Global backend instance
 backend = BackendFacade()

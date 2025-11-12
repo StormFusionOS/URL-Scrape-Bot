@@ -181,6 +181,62 @@ async def rescrape_selected():
     )
 
 
+def show_clear_database_dialog():
+    """Show confirmation dialog for clearing database."""
+    with ui.dialog() as dialog, ui.card():
+        ui.label('Clear Database?').classes('text-2xl font-bold mb-4')
+        ui.label(
+            'This will DELETE ALL companies from the database. This action cannot be undone!'
+        ).classes('text-red-400 mb-4')
+
+        async def confirm_clear():
+            """Confirm and clear database."""
+            dialog.close()
+            await clear_database()
+
+        with ui.row().classes('gap-2'):
+            ui.button(
+                'Cancel',
+                color='secondary',
+                on_click=lambda: dialog.close()
+            ).props('outline')
+
+            ui.button(
+                'Delete All Companies',
+                color='negative',
+                on_click=confirm_clear
+            )
+
+    dialog.open()
+
+
+async def clear_database():
+    """Clear all companies from the database."""
+    ui.notify('Clearing database...', type='info')
+
+    try:
+        # Run in I/O bound thread
+        result = await run.io_bound(backend.clear_database)
+
+        if result.get('success'):
+            ui.notify(
+                f'Database cleared: {result.get("deleted_count")} companies deleted',
+                type='positive',
+                timeout=5000
+            )
+            # Reload the grid
+            await load_companies()
+        else:
+            ui.notify(
+                f'Error clearing database: {result.get("message")}',
+                type='negative',
+                timeout=5000
+            )
+
+    except Exception as e:
+        ui.notify(f'Error: {str(e)}', type='negative')
+
+
 def database_page():
     """Render database page."""
     ui.label('Database Browser').classes('text-3xl font-bold mb-4')
@@ -222,6 +278,14 @@ def database_page():
                 icon='download',
                 color='positive',
                 on_click=lambda: export_selected()
+            ).props('outline')
+
+            # Clear database button (for testing)
+            ui.button(
+                'Clear Database',
+                icon='delete_forever',
+                color='negative',
+                on_click=show_clear_database_dialog
             ).props('outline')
 
     # Row actions toolbar
