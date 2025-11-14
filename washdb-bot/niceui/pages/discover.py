@@ -85,33 +85,33 @@ ALL_STATES = [
 ]
 
 
-async def generate_yp_targets(states, clear_existing=True):
-    """Generate Yellow Pages targets for the selected states."""
+def generate_yp_targets_detached(states, clear_existing=True):
+    """Launch Yellow Pages target generation as a detached background process."""
+    import subprocess
+
+    cmd = [
+        sys.executable,
+        '-m', 'scrape_yp.generate_city_targets',
+        '--states', ','.join(states)
+    ]
+
+    if clear_existing:
+        cmd.append('--clear')
+
     try:
-        cmd = [
-            sys.executable,
-            '-m', 'scrape_yp.generate_city_targets',
-            '--states', ','.join(states)
-        ]
+        # Launch as completely detached background process
+        # Redirect output to log file
+        log_file = 'logs/generate_targets.log'
+        with open(log_file, 'w') as f:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=os.getcwd(),
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                start_new_session=True  # Detach from parent process
+            )
 
-        if clear_existing:
-            cmd.append('--clear')
-
-        # Run synchronously and capture output
-        import subprocess
-        result = subprocess.run(
-            cmd,
-            cwd=os.getcwd(),
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-
-        if result.returncode == 0:
-            return True, result.stdout
-        else:
-            return False, result.stderr or result.stdout
-
+        return True, f"Target generation started (PID: {proc.pid}). Check {log_file} for progress."
     except Exception as e:
         return False, str(e)
 
@@ -771,9 +771,66 @@ async def stop_discovery():
             discovery_state.log_viewer.stop_tailing()
 
 
+def detect_running_yp_scraper():
+    """Detect if a YP scraper is already running and reconnect to it."""
+    import subprocess
+    import os
+
+    try:
+        # Check for running cli_crawl_yp.py processes
+        result = subprocess.run(
+            ['ps', 'aux'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+
+        for line in result.stdout.split('\n'):
+            if 'cli_crawl_yp.py' in line and 'grep' not in line:
+                # Extract PID
+                parts = line.split()
+                if len(parts) > 1:
+                    pid = int(parts[1])
+
+                    # Verify the process is actually still running
+                    try:
+                        os.kill(pid, 0)  # Signal 0 checks if process exists without killing it
+                    except OSError:
+                        # Process doesn't exist anymore
+                        continue
+
+                    # Register with process manager if not already registered
+                    if not process_manager.get('discovery_yp'):
+                        process_manager.register('discovery_yp', 'YP Discovery',
+                                                pid=pid,
+                                                log_file='logs/yp_crawl_city_first.log')
+                        discovery_state.running = True
+                        return True, pid
+                    else:
+                        # Already registered, update state
+                        discovery_state.running = True
+                        return True, pid
+    except Exception as e:
+        print(f"Error detecting running scraper: {e}")
+
+    # If we get here, no running scraper found - ensure state is clean
+    discovery_state.running = False
+    return False, None
+
+
 def build_yellow_pages_ui(container):
     """Build Yellow Pages City-First discovery UI in the given container."""
+
+    # Check if scraper is already running on page load
+    is_running, pid = detect_running_yp_scraper()
+
     with container:
+        # Show reconnection banner if scraper detected
+        if is_running:
+            with ui.card().classes('w-full bg-green-900 border-l-4 border-green-500 mb-4'):
+                ui.label(f'✅ Reconnected to running scraper (PID: {pid})').classes('text-lg font-bold text-green-200')
+                ui.label('Live output resumed below. You can stop the scraper at any time.').classes('text-sm text-green-100')
+
         # Info banner about city-first approach
         with ui.card().classes('w-full bg-purple-900 border-l-4 border-purple-500 mb-4'):
             ui.label('🎯 Yellow Pages City-First Scraper').classes('text-lg font-bold text-purple-200')
@@ -904,21 +961,29 @@ def build_yellow_pages_ui(container):
                 run_button = ui.button('START CRAWLER', icon='play_arrow', color='positive')
                 stop_button = ui.button('STOP', icon='stop', color='negative')
 
-                # Set initial button states based on global discovery state
-                if discovery_state.running:
+                # Set initial button states based on detected or global discovery state
+                if discovery_state.running or is_running:
                     run_button.disable()
                     stop_button.enable()
                 else:
                     run_button.enable()
                     stop_button.disable()
 
-        # Live output with real-time log tailing
-        log_viewer = LiveLogViewer('logs/yp_crawl_city_first.log', max_lines=500, auto_scroll=True)
-        log_viewer.create()
+        # Live output
+        with ui.card().classes('w-full'):
+            ui.label('Live Crawler Output').classes('text-lg font-bold mb-2')
 
-        # Store references (log_element set to None - add_log will skip)
-        discovery_state.log_viewer = log_viewer
-        discovery_state.log_element = None  # Disable old logging, use log viewer instead
+            log_viewer = LiveLogViewer('logs/yp_crawl_city_first.log', max_lines=500, auto_scroll=True)
+            log_viewer.create()
+
+            # If scraper was detected as running, load last 100 lines and start tailing
+            if is_running:
+                log_viewer.load_last_n_lines(100)
+                log_viewer.start_tailing()
+
+            # Store references
+            discovery_state.log_viewer = log_viewer
+            discovery_state.log_element = None
 
         # Helper function to update target stats display
         async def update_target_stats():
@@ -965,18 +1030,25 @@ def build_yellow_pages_ui(container):
                     ui.button('Cancel', on_click=dialog.close).props('flat')
                     async def confirm_generate():
                         dialog.close()
-                        generate_button.disable()
 
-                        ui.notify('Generating targets...', type='info')
-                        success, output = await generate_yp_targets(selected_states, clear_existing=True)
+                        # Launch target generation in detached background process
+                        success, message = generate_yp_targets_detached(selected_states, clear_existing=True)
 
                         if success:
-                            ui.notify(f'Targets generated successfully for {len(selected_states)} state(s)!', type='positive')
-                            await update_target_stats()
+                            # Calculate estimated time
+                            estimated_minutes = max(2, int(10 * len(selected_states) / 50))
+                            ui.notify(
+                                f'Target generation started for {len(selected_states)} state(s)! '
+                                f'Check logs/generate_targets.log for progress. Refresh in ~{estimated_minutes} minutes.',
+                                type='positive',
+                                timeout=10000
+                            )
                         else:
-                            ui.notify(f'Failed to generate targets: {output[:200]}', type='negative')
-
-                        generate_button.enable()
+                            ui.notify(
+                                f'Failed to start target generation: {message}',
+                                type='negative',
+                                timeout=5000
+                            )
 
                     ui.button('Generate', on_click=confirm_generate, color='positive')
 
