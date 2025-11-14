@@ -1284,7 +1284,7 @@ def build_multiworker_yp_ui(container):
         # EVENT HANDLERS
         # ====================================================================
 
-        async def start_all_workers():
+        def start_all_workers():
             """Start all workers using the state worker pool manager."""
             try:
                 start_button.disable()
@@ -1378,7 +1378,7 @@ def build_multiworker_yp_ui(container):
                 ui.notify(f'Error stopping workers: {e}', type='negative')
 
         # Bind button handlers
-        start_button.on('click', lambda: asyncio.create_task(start_all_workers()))
+        start_button.on('click', start_all_workers)
         stop_button.on('click', stop_all_workers)
 
 
