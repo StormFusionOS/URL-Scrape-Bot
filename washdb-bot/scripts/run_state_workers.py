@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
+from sqlalchemy import text
 from runner.logging_setup import get_logger
 from scrape_yp.state_assignments import get_states_for_worker, get_proxy_assignments, validate_assignments
 from scrape_yp.state_worker_pool import StateWorkerPoolManager
@@ -72,7 +73,7 @@ def validate_environment():
     # Check database connectivity
     try:
         session = create_session()
-        result = session.execute("SELECT 1").scalar()
+        result = session.execute(text("SELECT 1")).scalar()
         session.close()
         logger.info("✓ Database connection successful")
     except Exception as e:
