@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HomeAdvisor crawling orchestration (mirrors scrape_yp.yp_crawl).
+HomeAdvisor crawling orchestration (Phase 1 of pipeline - saves to staging).
 """
 from __future__ import annotations
 from typing import Generator, List, Dict, Optional
@@ -8,8 +8,9 @@ from urllib.parse import urlparse
 
 from runner.logging_setup import get_logger
 from db.models import canonicalize_url, domain_from_url
+from db.save_to_staging import save_to_staging, get_staging_stats
 from scrape_ha.ha_client import (
-    build_search_url, fetch_url, parse_list_page, parse_profile_for_company, HA_BASE
+    build_search_url, fetch_url, parse_list_page, HA_BASE
 )
 
 logger = get_logger("ha_crawl")
@@ -31,108 +32,127 @@ STATES = [
 ]
 
 def crawl_category_state(category: str, state: str, max_pages: int = 3) -> list[dict]:
-    logger.info(f"[HA] Crawl: '{category}' in {state} (max {max_pages} pages)")
+    """
+    Crawl HomeAdvisor list pages and extract basic business info for staging.
+
+    PIPELINE Phase 1: Extracts only name, address, phone, ratings from list pages.
+    Data is saved to ha_staging table where Phase 2 (URL finder) will process it.
+    """
+    logger.info(f"[HA Phase 1] Crawl: '{category}' in {state} (max {max_pages} pages)")
     results: list[dict] = []
-    seen_domains = set()
-    seen_websites = set()
+    seen_profile_urls = set()
 
     for page in range(1, max_pages + 1):
         search_url = build_search_url(category, state, page)
         html = fetch_url(search_url)
         if not html:
-            logger.info(f"[HA] No HTML for {search_url}, stopping page loop")
+            logger.info(f"[HA Phase 1] No HTML for {search_url}, stopping page loop")
             break
 
         cards = parse_list_page(html)
         if not cards:
-            logger.info(f"[HA] No cards on page {page}, stopping")
+            logger.info(f"[HA Phase 1] No cards on page {page}, stopping")
             break
 
         new_this_page = 0
         for card in cards:
             profile_url = card.get("profile_url")
             if not profile_url:
-                continue
-            profile_html = fetch_url(profile_url, delay=0)  # small/no extra delay ok
-            if not profile_html:
-                continue
-            info = parse_profile_for_company(profile_html)
-
-            # Must have external website to keep consistent with your DB logic
-            website = info.get("website")
-            if not website:
-                logger.debug(f"[HA] Skip (no external site): {card.get('name')}")
+                logger.debug(f"[HA Phase 1] Skip (no profile URL): {card.get('name')}")
                 continue
 
-            try:
-                website = canonicalize_url(website)
-                domain = domain_from_url(website)
-            except Exception as e:
-                logger.debug(f"[HA] Bad URL '{website}': {e}")
+            # Skip duplicates
+            if profile_url in seen_profile_urls:
+                logger.debug(f"[HA Phase 1] Duplicate profile URL: {profile_url}")
                 continue
 
-            if domain in seen_domains or website in seen_websites:
-                logger.debug(f"[HA] Duplicate domain/site: {domain}")
-                continue
+            seen_profile_urls.add(profile_url)
 
-            seen_domains.add(domain); seen_websites.add(website)
-
+            # Prepare data for staging table (no website/domain needed yet)
             results.append({
-                "name": info.get("name") or card.get("name"),
-                "website": website,
-                "domain": domain,
-                "phone": info.get("phone"),
-                "address": info.get("address"),
-                "rating_ha": (float(info.get("rating_ha")) if info.get("rating_ha") else None),
-                "reviews_ha": (int(info.get("reviews_ha")) if info.get("reviews_ha") else None),
-                "source": "HA",
+                "name": card.get("name"),
+                "phone": card.get("phone"),
+                "address": card.get("address"),
                 "profile_url": profile_url,
+                "rating_ha": (float(card.get("rating_ha")) if card.get("rating_ha") else None),
+                "reviews_ha": (int(card.get("reviews_ha")) if card.get("reviews_ha") else None),
             })
             new_this_page += 1
 
-        logger.info(f"[HA] Page {page}: kept {new_this_page}/{len(cards)}")
+        logger.info(f"[HA Phase 1] Page {page}: extracted {new_this_page}/{len(cards)} businesses")
         if new_this_page == 0:
             break
 
+    logger.info(f"[HA Phase 1] Total extracted for {category}/{state}: {len(results)} businesses")
     return results
 
 def crawl_all_states(categories: list[str] = None,
                      states: list[str] = None,
-                     limit_per_state: int = 3) -> Generator[dict, None, None]:
+                     limit_per_state: int = 3,
+                     save_to_db: bool = True) -> dict:
     """
-    Crawl all state-category combinations and yield batches.
+    Crawl all state-category combinations and save to staging table.
 
-    Yields dicts with keys: category, state, results, count (matching YP format)
+    PIPELINE Phase 1: Discovers businesses and saves to ha_staging table.
+    Phase 2 (URL finder worker) will process items from the queue.
+
+    Args:
+        categories: List of service categories to search
+        states: List of US state codes to search
+        limit_per_state: Number of pages to scrape per category/state pair
+        save_to_db: If True, save to staging table; if False, return results
+
+    Returns:
+        Dict with summary stats: total_found, total_saved, total_skipped
     """
     if categories is None:
         categories = CATEGORIES_HA
     if states is None:
         states = STATES
 
-    total = len(categories) * len(states)
+    total_pairs = len(categories) * len(states)
+    total_found = 0
+    total_saved = 0
+    total_skipped = 0
+
     i = 0
     for state in states:
         for cat in categories:
             i += 1
-            logger.info(f"[HA] ({i}/{total}) {cat} in {state}")
+            logger.info(f"[HA Phase 1] ({i}/{total_pairs}) {cat} in {state}")
             try:
                 results = crawl_category_state(cat, state, max_pages=limit_per_state)
-                # Yield batch in same format as YP crawler
-                batch = {
-                    "category": cat,
-                    "state": state,
-                    "results": results,
-                    "count": len(results),
-                }
-                logger.info(f"[HA] Yielding batch: {cat} in {state}, {len(results)} results")
-                yield batch
+                total_found += len(results)
+
+                if save_to_db and results:
+                    # Save batch to staging table
+                    inserted, skipped = save_to_staging(results)
+                    total_saved += inserted
+                    total_skipped += skipped
+                    logger.info(
+                        f"[HA Phase 1] Saved batch: {cat}/{state}, "
+                        f"{inserted} new, {skipped} duplicates"
+                    )
+
             except Exception as e:
-                logger.error(f"[HA] Error for {cat}/{state}: {e}", exc_info=True)
-                # Yield error batch
-                yield {
-                    "category": cat,
-                    "state": state,
-                    "error": str(e),
-                    "results": [],
-                    "count": 0,
-                }
+                logger.error(f"[HA Phase 1] Error for {cat}/{state}: {e}", exc_info=True)
+                continue
+
+    # Final summary
+    logger.info("=" * 60)
+    logger.info(f"[HA Phase 1] COMPLETE - {total_pairs} pairs processed")
+    logger.info(f"[HA Phase 1] Found: {total_found} businesses")
+    logger.info(f"[HA Phase 1] Saved: {total_saved} to staging")
+    logger.info(f"[HA Phase 1] Skipped: {total_skipped} duplicates")
+
+    # Get staging stats
+    if save_to_db:
+        stats = get_staging_stats()
+        logger.info(f"[HA Phase 1] Queue size: {stats['pending']} pending")
+        logger.info("=" * 60)
+
+    return {
+        "total_found": total_found,
+        "total_saved": total_saved,
+        "total_skipped": total_skipped
+    }

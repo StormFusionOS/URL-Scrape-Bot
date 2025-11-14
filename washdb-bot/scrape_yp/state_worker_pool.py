@@ -25,17 +25,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from runner.logging_setup import get_logger
+from runner.logging_setup import setup_logging
 from scrape_yp.proxy_pool import WorkerProxyPool
 from scrape_yp.state_assignments import get_states_for_worker, get_proxy_assignments
 from scrape_yp.yp_crawl_city_first import crawl_single_target
 from scrape_yp.yp_filter import YPFilter
 from scrape_yp.yp_monitor import ScraperMonitor
-from db.models import YPTarget
+from db.models import YPTarget, Company
 from db import create_session
 
 # Setup logger for pool manager
-logger = get_logger("state_worker_pool")
+logger = setup_logging("state_worker_pool")
 
 
 def worker_main(
@@ -64,7 +64,7 @@ def worker_main(
         config: Configuration dictionary
     """
     # Set up worker-specific logger
-    worker_logger = get_logger(f"worker_{worker_id}", log_file=f"logs/state_worker_{worker_id}.log")
+    worker_logger = setup_logging(f"worker_{worker_id}", log_file=f"logs/state_worker_{worker_id}.log")
 
     worker_logger.info("="*70)
     worker_logger.info(f"WORKER {worker_id} STARTING")
@@ -91,46 +91,62 @@ def worker_main(
 
         while not shutdown_event.is_set():
             try:
-                # Acquire next target from assigned states
-                target = acquire_target_for_worker(state_ids, worker_logger)
+                # Acquire next target ID from assigned states
+                target_id = acquire_target_for_worker(state_ids, worker_logger)
 
-                if not target:
+                if not target_id:
                     worker_logger.info("No pending targets found. Sleeping 30s...")
                     time.sleep(30)
                     continue
-
-                worker_logger.info(
-                    f"Processing target {target.id}: {target.city}, {target.state_id} - {target.category_label}"
-                )
 
                 # Create a new database session for this target
                 session = create_session()
 
                 try:
+                    # Query the target object in this session
+                    target = session.query(YPTarget).filter(YPTarget.id == target_id).first()
+
+                    if not target:
+                        worker_logger.error(f"Target {target_id} not found in database")
+                        continue
+
+                    worker_logger.info(
+                        f"Processing target {target.id}: {target.city}, {target.state_id} - {target.category_label}"
+                    )
+
                     # Scrape the target using existing logic
                     # This will handle its own Playwright browser internally
                     accepted_results, stats = crawl_single_target(
                         target=target,
                         session=session,
                         yp_filter=yp_filter,
-                        min_score=config.get("min_confidence_score", 50.0),
+                        min_score=config.get("min_confidence_score", 40.0),
                         include_sponsored=config.get("include_sponsored", False),
                         use_fallback_on_404=True,
                         monitor=monitor
                     )
 
-                    # Log results
-                    worker_logger.info(
-                        f"✓ Target {target.id} completed: "
-                        f"{len(accepted_results)} accepted, "
-                        f"{stats.get('total_filtered_out', 0)} filtered out"
-                    )
+                    # Save results to database
+                    if accepted_results:
+                        new_count, updated_count = save_companies_to_db(accepted_results, session, worker_logger)
+                        worker_logger.info(
+                            f"✓ Target {target.id} completed: "
+                            f"{len(accepted_results)} accepted, "
+                            f"{stats.get('total_filtered_out', 0)} filtered out | "
+                            f"DB: {new_count} new, {updated_count} updated"
+                        )
+                    else:
+                        worker_logger.info(
+                            f"✓ Target {target.id} completed: "
+                            f"0 accepted, "
+                            f"{stats.get('total_filtered_out', 0)} filtered out"
+                        )
 
                     targets_processed += 1
 
                 except Exception as e:
-                    worker_logger.error(f"✗ Target {target.id} failed: {e}", exc_info=True)
-                    mark_target_failed(target.id, str(e), worker_logger)
+                    worker_logger.error(f"✗ Target {target_id} failed: {e}", exc_info=True)
+                    mark_target_failed(target_id, str(e), worker_logger)
 
                 finally:
                     session.close()
@@ -161,7 +177,7 @@ def worker_main(
         worker_logger.info(f"Worker {worker_id} stopped")
 
 
-def acquire_target_for_worker(state_ids: List[str], logger) -> Optional[YPTarget]:
+def acquire_target_for_worker(state_ids: List[str], logger) -> Optional[int]:
     """
     Acquire next pending target for worker's assigned states.
 
@@ -172,7 +188,7 @@ def acquire_target_for_worker(state_ids: List[str], logger) -> Optional[YPTarget
         logger: Logger instance
 
     Returns:
-        YPTarget object or None if no targets available
+        Target ID (int) or None if no targets available
     """
     session = None
     try:
@@ -191,13 +207,14 @@ def acquire_target_for_worker(state_ids: List[str], logger) -> Optional[YPTarget
         )
 
         if target:
+            target_id = target.id  # Get ID before closing session
             # Mark as in_progress
             target.status = "in_progress"
             target.last_attempt_ts = datetime.now()
             target.attempts = (target.attempts or 0) + 1
             session.commit()
 
-            return target
+            return target_id
 
         return None
 
@@ -229,6 +246,87 @@ def mark_target_failed(target_id: int, error_msg: str, logger) -> None:
     finally:
         if session:
             session.close()
+
+
+def save_companies_to_db(results: list, session, logger) -> tuple[int, int]:
+    """
+    Save scraped companies to database.
+
+    Args:
+        results: List of company dictionaries
+        session: SQLAlchemy session
+        logger: Logger instance
+
+    Returns:
+        Tuple of (new_count, updated_count)
+    """
+    new_count = 0
+    updated_count = 0
+
+    for result in results:
+        try:
+            # Check if company already exists by website
+            website = result.get("website")
+            if not website:
+                logger.warning(f"Skipping company without website: {result.get('name')}")
+                continue
+
+            # Check for existing company
+            existing = session.query(Company).filter(Company.website == website).first()
+
+            if existing:
+                # Update existing company
+                if result.get("name"):
+                    existing.name = result["name"]
+                if result.get("phone"):
+                    existing.phone = result["phone"]
+                if result.get("email"):
+                    existing.email = result["email"]
+                if result.get("address"):
+                    existing.address = result["address"]
+                if result.get("services"):
+                    existing.services = result["services"]
+                if result.get("rating_yp"):
+                    existing.rating_yp = result["rating_yp"]
+                if result.get("reviews_yp"):
+                    existing.reviews_yp = result["reviews_yp"]
+
+                existing.last_updated = datetime.now()
+                updated_count += 1
+                logger.debug(f"Updated company: {existing.name}")
+            else:
+                # Create new company
+                company = Company(
+                    name=result.get("name"),
+                    website=website,
+                    domain=result.get("domain"),
+                    phone=result.get("phone"),
+                    email=result.get("email"),
+                    address=result.get("address"),
+                    services=result.get("services"),
+                    source=result.get("source", "YP"),
+                    rating_yp=result.get("rating_yp"),
+                    reviews_yp=result.get("reviews_yp"),
+                    active=True,
+                )
+                session.add(company)
+                new_count += 1
+                logger.debug(f"Added new company: {company.name}")
+
+        except Exception as e:
+            logger.error(f"Error saving company {result.get('name')}: {e}")
+            continue
+
+    try:
+        session.commit()
+        logger.info(f"Saved to database: {new_count} new, {updated_count} updated")
+    except Exception as e:
+        logger.error(f"Error committing companies: {e}")
+        session.rollback()
+        new_count = 0
+        updated_count = 0
+
+    return new_count, updated_count
 
 
 class StateWorkerPoolManager:

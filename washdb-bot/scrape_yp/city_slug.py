@@ -112,9 +112,9 @@ def calculate_population_tier(population: int, percentile_90: int, percentile_50
     Calculate population tier for page limit.
 
     Tiers:
-    - Tier 1 (High): Top 10% by population → max_pages=3
-    - Tier 2 (Medium): Next 40% → max_pages=2
-    - Tier 3 (Low): Bottom 50% → max_pages=1
+    - Tier 1 (High): Top 10% by population → max_pages=20
+    - Tier 2 (Medium): Next 40% → max_pages=15
+    - Tier 3 (Low): Bottom 50% → max_pages=10
 
     Args:
         population: City population
@@ -152,18 +152,18 @@ def tier_to_max_pages(tier: int) -> int:
 
     Examples:
         >>> tier_to_max_pages(1)
-        3
+        20
         >>> tier_to_max_pages(2)
-        2
+        15
         >>> tier_to_max_pages(3)
-        1
+        10
     """
     tier_pages = {
-        1: 3,  # High priority - 3 pages
-        2: 2,  # Medium priority - 2 pages
-        3: 1,  # Low priority - 1 page
+        1: 20,  # High priority - 20 pages (2000 results max)
+        2: 15,  # Medium priority - 15 pages (1500 results max)
+        3: 10,  # Low priority - 10 pages (1000 results max)
     }
-    return tier_pages.get(tier, 1)  # Default to 1 page if unknown tier
+    return tier_pages.get(tier, 10)  # Default to 10 pages if unknown tier
 
 
 # Test the functions if run directly

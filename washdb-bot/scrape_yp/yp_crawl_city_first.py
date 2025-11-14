@@ -185,7 +185,7 @@ def crawl_single_target(
     target: YPTarget,
     session,
     yp_filter: YPFilter,
-    min_score: float = 50.0,
+    min_score: float = 40.0,
     include_sponsored: bool = False,
     use_fallback_on_404: bool = True,
     monitor: Optional[ScraperMonitor] = None,
@@ -193,9 +193,10 @@ def crawl_single_target(
     """
     Crawl a single target (city × category).
 
-    Implements shallow pagination and early-exit logic:
+    Implements pagination with smart exit logic:
     - Fetches pages 1 to max_pages
-    - Stops early if page 1 has 0 accepted results
+    - Stops early if page has 0 parsed results (empty page)
+    - Stops if page has all duplicate results (domain dedup)
     - Updates target status in database
 
     Args:
@@ -289,20 +290,9 @@ def crawl_single_target(
                         filtered=filter_stats['rejected']
                     )
 
-                # Early-exit logic: if page 1 has 0 accepted results, stop
-                if page == 1 and filter_stats['accepted'] == 0:
-                    logger.info(f"  Early exit: page 1 had 0 accepted results")
-                    target.status = "done"
-                    target.note = "early_exit_no_results_page1"
-                    session.commit()
-
-                    return [], {
-                        'total_parsed': total_parsed,
-                        'total_filtered_out': total_filtered_out,
-                        'total_accepted': 0,
-                        'early_exit': True,
-                        'pages_fetched': 1,
-                    }
+                # Note: Early-exit logic removed to allow pagination even when filters reject all results
+                # This ensures we don't stop pagination just because our filters are strict
+                # We only stop when YP actually has no more results (handled by empty page check above)
 
                 # Process filtered results
                 new_results = 0
@@ -415,7 +405,7 @@ def crawl_single_target(
 def crawl_city_targets(
     state_ids: list[str],
     session,
-    min_score: float = 50.0,
+    min_score: float = 40.0,
     include_sponsored: bool = False,
     max_targets: Optional[int] = None,
     progress_callback: Optional[callable] = None,

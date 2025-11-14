@@ -109,12 +109,53 @@ class MultiWorkerState:
         return sum(w.items_found for w in self.workers.values())
 
     def stop_all(self):
+        """Stop all workers - both GUI-tracked and external processes."""
+        import subprocess as sp
+
+        # First, kill GUI-tracked processes
         if self.manager_subprocess and self.manager_subprocess.is_running():
             self.manager_subprocess.kill()
         for worker in self.workers.values():
             if worker.subprocess_runner and worker.subprocess_runner.is_running():
                 worker.subprocess_runner.kill()
             worker.status = 'stopped'
+
+        # Second, find and kill ALL worker processes on the system
+        # (including those started externally, not from GUI)
+        try:
+            result = sp.run(
+                ["ps", "aux"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
+            pids_to_kill = []
+            for line in result.stdout.split('\n'):
+                # Match worker processes: run_state_workers, worker_pool, state_worker_
+                if any(pattern in line for pattern in ['run_state_workers', 'worker_pool', 'state_worker_']):
+                    if 'grep' not in line:  # Exclude grep itself
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            try:
+                                pid = int(parts[1])
+                                pids_to_kill.append(pid)
+                            except (ValueError, IndexError):
+                                continue
+
+            # Kill all found PIDs
+            if pids_to_kill:
+                for pid in pids_to_kill:
+                    try:
+                        sp.run(['kill', '-9', str(pid)], check=False)
+                    except Exception as e:
+                        print(f"Error killing PID {pid}: {e}")
+
+                print(f"Killed {len(pids_to_kill)} worker processes")
+
+        except Exception as e:
+            print(f"Error finding/killing external workers: {e}")
+
         self.running = False
 
 
@@ -1381,6 +1422,83 @@ def build_multiworker_yp_ui(container):
         start_button.on('click', start_all_workers)
         stop_button.on('click', stop_all_workers)
 
+        # ====================================================================
+        # CHECK IF WORKERS ARE ALREADY RUNNING (on page load)
+        # ====================================================================
+        def check_workers_running():
+            """Check if workers are already running and update UI accordingly."""
+            import subprocess
+            try:
+                # Check for running state_worker processes
+                result = subprocess.run(
+                    ['ps', 'aux'],
+                    capture_output=True,
+                    text=True
+                )
+
+                # Count running worker processes
+                running_count = 0
+                for line in result.stdout.split('\n'):
+                    if 'run_state_workers.py' in line and 'grep' not in line:
+                        running_count += 1
+
+                # If workers are running, update UI
+                if running_count > 0:
+                    multi_worker_state.running = True
+
+                    # Update worker statuses
+                    for worker in multi_worker_state.workers.values():
+                        worker.status = 'running'
+                        if worker.status_badge:
+                            worker.status_badge.text = 'RUNNING'
+                            worker.status_badge.props(f'color={worker.get_status_color()}')
+
+                    # Update buttons
+                    start_button.disable()
+                    stop_button.enable()
+
+                    # Start log tailing
+                    log_viewer_all.start_tailing()
+                    for log_viewer in worker_log_viewers:
+                        log_viewer.start_tailing()
+
+                    # Update stats
+                    active_count = multi_worker_state.get_active_count()
+                    active_workers_label.set_text(f'{active_count}/{multi_worker_state.num_workers}')
+
+                    ui.notify(f'Detected {running_count} running worker processes', type='info')
+
+                    # Start update timer
+                    def update_worker_stats():
+                        """Update worker statistics from log files."""
+                        if not multi_worker_state.running:
+                            return
+
+                        # Update active count
+                        active_count = multi_worker_state.get_active_count()
+                        active_workers_label.set_text(f'{active_count}/{multi_worker_state.num_workers}')
+
+                        # Update totals
+                        total_processed = multi_worker_state.get_total_processed()
+                        total_found = multi_worker_state.get_total_found()
+
+                        total_processed_label.set_text(str(total_processed))
+                        total_found_label.set_text(str(total_found))
+
+                        # Update progress
+                        if total_processed > 0:
+                            progress = min(total_processed / 10000, 1.0)
+                            aggregate_progress.value = progress
+
+                    ui.timer(2.0, update_worker_stats)
+
+            except Exception as e:
+                # Silently fail - workers just aren't running
+                pass
+
+        # Check on page load
+        check_workers_running()
+
 
 def build_google_maps_ui(container):
     """Build Google Maps discovery UI in the given container."""
@@ -1637,10 +1755,10 @@ def build_homeadvisor_ui(container):
 
             # Info banner
             with ui.card().classes('w-full bg-teal-900 border-l-4 border-teal-500 mb-4'):
-                ui.label('✨ HomeAdvisor Discovery - Now Available!').classes('text-lg font-bold text-teal-200')
-                ui.label('• Search home service professionals on HomeAdvisor').classes('text-sm text-teal-100')
-                ui.label('• Extract ratings, reviews, and verified contractor information').classes('text-sm text-teal-100')
-                ui.label('• Great source for home improvement and maintenance services').classes('text-sm text-teal-100')
+                ui.label('✨ HomeAdvisor Two-Phase Discovery').classes('text-lg font-bold text-teal-200')
+                ui.label('• Phase 1: Extract business names, addresses, phones from list pages (fast)').classes('text-sm text-teal-100')
+                ui.label('• Phase 2: Search DuckDuckGo to find real external websites (slower)').classes('text-sm text-teal-100')
+                ui.label('• Uses HomeAdvisor profile URLs as temporary placeholders').classes('text-sm text-teal-100')
 
             # Category selection
             ui.label('Service Categories').classes('font-semibold mb-2')
@@ -1701,17 +1819,18 @@ def build_homeadvisor_ui(container):
             # Pages per pair
             ui.label('Crawl Settings').classes('font-semibold mb-2 mt-4')
             pages_input = ui.number(
-                label='Search Depth',
-                value=1,
+                label='Pages Per State (Phase 1)',
+                value=3,
                 min=1,
                 max=50,
                 step=1
             ).classes('w-64')
-            ui.label('⚠ Higher depth = more URLs but slower crawling').classes('text-xs text-yellow-400')
+            ui.label('Number of list pages to scrape per category/state pair').classes('text-xs text-gray-400')
 
-        # Stats and controls
+        # Phase 1: Discovery
         with ui.card().classes('w-full mb-4'):
-            ui.label('Discovery Status').classes('text-xl font-bold mb-4')
+            ui.label('Phase 1: Discover Businesses').classes('text-xl font-bold mb-4')
+            ui.label('Extract business names, addresses, and phones from HomeAdvisor list pages').classes('text-sm text-gray-400 mb-3')
 
             # Stats card
             stats_card = ui.column().classes('w-full mb-4')
@@ -1723,7 +1842,7 @@ def build_homeadvisor_ui(container):
 
             # Control buttons
             with ui.row().classes('gap-2'):
-                run_button = ui.button('START DISCOVERY', icon='play_arrow', color='positive')
+                run_button = ui.button('START PHASE 1', icon='play_arrow', color='positive')
                 stop_button = ui.button('STOP', icon='stop', color='negative')
 
                 # Set initial button states based on global discovery state
@@ -1734,16 +1853,56 @@ def build_homeadvisor_ui(container):
                     run_button.enable()
                     stop_button.disable()
 
-        # Live output with real-time log tailing
-        log_viewer = LiveLogViewer('logs/ha_crawl.log', max_lines=500, auto_scroll=True)
-        log_viewer.create()
+            # Live output for Phase 1
+            with ui.card().classes('w-full mt-3'):
+                ui.label('Live Output').classes('text-sm font-bold mb-2')
+                log_viewer_phase1 = LiveLogViewer('logs/ha_crawl.log', max_lines=300, auto_scroll=True)
+                log_viewer_phase1.create()
 
-        # Store references (log_element set to None - add_log will skip)
-        discovery_state.log_viewer = log_viewer
-        discovery_state.log_element = None  # Disable old logging, use log viewer instead
+        # Phase 2: URL Finding
+        with ui.card().classes('w-full mb-4'):
+            ui.label('Phase 2: Find External URLs').classes('text-xl font-bold mb-4')
+            ui.label('Search DuckDuckGo to find real external websites for discovered businesses').classes('text-sm text-gray-400 mb-3')
 
-        # Run button click handler
-        async def start_discovery():
+            # URL finder settings
+            ui.label('URL Finder Settings').classes('font-semibold mb-2')
+            url_limit_input = ui.number(
+                label='Max Companies to Process (Phase 2)',
+                value=10,
+                min=1,
+                max=1000,
+                step=10
+            ).classes('w-64 mb-2')
+            ui.label('Limit number of companies to find URLs for (leave small for testing)').classes('text-xs text-gray-400 mb-3')
+
+            # Stats for Phase 2
+            stats_card_phase2 = ui.column().classes('w-full mb-4')
+            with stats_card_phase2:
+                ui.label('Ready to start').classes('text-lg')
+
+            # Progress bar
+            progress_bar_phase2 = ui.linear_progress(value=0).classes('w-full mb-4')
+
+            # Control buttons for Phase 2
+            with ui.row().classes('gap-2'):
+                run_button_phase2 = ui.button('START PHASE 2', icon='search', color='secondary')
+                stop_button_phase2 = ui.button('STOP', icon='stop', color='negative')
+
+                run_button_phase2.enable()
+                stop_button_phase2.disable()
+
+            # Live output for Phase 2
+            with ui.card().classes('w-full mt-3'):
+                ui.label('Live Output').classes('text-sm font-bold mb-2')
+                log_viewer_phase2 = LiveLogViewer('logs/url_finder.log', max_lines=300, auto_scroll=True)
+                log_viewer_phase2.create()
+
+        # Store references
+        discovery_state.log_viewer = log_viewer_phase1
+        discovery_state.log_element = None
+
+        # Run button click handler for Phase 1
+        async def start_phase1():
             # Get selected categories and states
             selected_categories = [cat for cat, cb in category_checkboxes.items() if cb.value]
             selected_states = [state for state, cb in state_checkboxes.items() if cb.value]
@@ -1756,7 +1915,7 @@ def build_homeadvisor_ui(container):
                 ui.notify('Please select at least one state', type='warning')
                 return
 
-            # Run HomeAdvisor discovery
+            # Run HomeAdvisor discovery (Phase 1)
             await run_homeadvisor_discovery(
                 selected_categories,
                 selected_states,
@@ -1767,8 +1926,82 @@ def build_homeadvisor_ui(container):
                 stop_button
             )
 
-        run_button.on('click', start_discovery)
+        # Run button click handler for Phase 2
+        async def start_phase2():
+            """Start URL finder bot."""
+            run_button_phase2.disable()
+            stop_button_phase2.enable()
+
+            # Start log tailing
+            log_viewer_phase2.load_last_n_lines(50)
+            log_viewer_phase2.start_tailing()
+
+            # Clear stats
+            stats_card_phase2.clear()
+            with stats_card_phase2:
+                ui.label('Finding URLs...').classes('text-lg font-bold')
+                stat_labels_phase2 = {
+                    'found': ui.label('Found: 0'),
+                    'failed': ui.label('Failed: 0'),
+                }
+
+            try:
+                ui.notify('Starting URL finder as subprocess...', type='info')
+
+                # Build command
+                cmd = [
+                    sys.executable,
+                    'cli_find_urls.py',
+                    '--limit', str(int(url_limit_input.value))
+                ]
+
+                # Create subprocess runner
+                job_id = 'url_finder_ha'
+                runner = SubprocessRunner(job_id, 'logs/url_finder.log')
+
+                # Start subprocess
+                pid = runner.start(cmd, cwd=os.getcwd())
+                ui.notify(f'URL finder started with PID {pid}', type='positive')
+
+                # Wait for subprocess to complete
+                while runner.is_running():
+                    await asyncio.sleep(1.0)
+                    # Update progress (estimate based on time)
+                    # Check for cancellation if needed
+
+                # Get final status
+                status = runner.get_status()
+                return_code = status['return_code']
+
+                if return_code == 0:
+                    ui.notify('URL finder completed successfully!', type='positive')
+                else:
+                    ui.notify(f'URL finder exited with code {return_code}', type='negative')
+
+                # Update final stats
+                stats_card_phase2.clear()
+                with stats_card_phase2:
+                    ui.label('URL Finding Complete!').classes('text-lg font-bold text-green-500')
+                    ui.label('Check log output for details').classes('text-sm text-gray-400')
+
+                progress_bar_phase2.value = 1.0
+
+            except Exception as e:
+                ui.notify(f'URL finder failed: {str(e)}', type='negative')
+                stats_card_phase2.clear()
+                with stats_card_phase2:
+                    ui.label('Failed').classes('text-lg font-bold text-red-500')
+                    ui.label(f'Error: {str(e)}').classes('text-sm text-red-400')
+
+            finally:
+                log_viewer_phase2.stop_tailing()
+                run_button_phase2.enable()
+                stop_button_phase2.disable()
+                progress_bar_phase2.value = 0
+
+        run_button.on('click', start_phase1)
         stop_button.on('click', stop_discovery)
+        run_button_phase2.on('click', start_phase2)
 
 
 def discover_page():

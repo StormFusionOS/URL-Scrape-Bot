@@ -109,6 +109,73 @@ class Company(Base):
         return f"<Company(id={self.id}, name='{self.name}', domain='{self.domain}')>"
 
 
+class HAStaging(Base):
+    """
+    HomeAdvisor staging table for pipeline workflow.
+
+    Stores businesses discovered from HomeAdvisor (Phase 1) before URL finding (Phase 2).
+    This table acts as a queue for the url_finder_worker to process.
+
+    Attributes:
+        id: Primary key
+        name: Business name
+        address: Full address (city, state, zip extracted from this)
+        phone: Contact phone number
+        profile_url: HomeAdvisor profile URL (unique identifier)
+        rating_ha: HomeAdvisor rating
+        reviews_ha: Number of HomeAdvisor reviews
+        created_at: When business was discovered
+        processed: Whether URL finding has been completed
+        retry_count: Number of URL finding attempts
+        next_retry_at: When to retry URL finding (exponential backoff)
+        last_error: Error message from last URL finding attempt
+    """
+
+    __tablename__ = "ha_staging"
+
+    # Primary Key
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Business Information
+    name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    phone: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    profile_url: Mapped[str] = mapped_column(
+        Text, unique=True, index=True, nullable=False,
+        comment="HomeAdvisor profile URL (unique identifier)"
+    )
+
+    # Ratings
+    rating_ha: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    reviews_ha: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Pipeline Status
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False,
+        comment="When business was discovered"
+    )
+    processed: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, index=True,
+        comment="Whether URL finding has been completed"
+    )
+    retry_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False,
+        comment="Number of URL finding attempts"
+    )
+    next_retry_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+        comment="When to retry URL finding (exponential backoff)"
+    )
+    last_error: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Error message from last URL finding attempt"
+    )
+
+    def __repr__(self) -> str:
+        """String representation of HAStaging."""
+        return f"<HAStaging(id={self.id}, name='{self.name}', processed={self.processed}, retry_count={self.retry_count})>"
+
+
 class ScheduledJob(Base):
     """
     Scheduled crawl/scrape job model.

@@ -20,6 +20,7 @@ Filtering logic:
 import re
 from pathlib import Path
 from typing import List, Dict, Set, Tuple
+from urllib.parse import urlparse
 
 from runner.logging_setup import get_logger
 
@@ -165,6 +166,87 @@ class YPFilter:
             'has_equipment': has_equipment
         }
 
+    def _is_ecommerce_url(self, url: str) -> Tuple[bool, str]:
+        """
+        Detect e-commerce sites based on URL patterns.
+
+        This method blocks websites that are clearly selling products online
+        rather than providing services. Detection is done purely by URL analysis
+        with no HTTP requests, making it fast and efficient.
+
+        Args:
+            url: Website URL to check
+
+        Returns:
+            Tuple of (is_ecommerce, detected_pattern)
+            - is_ecommerce: True if URL indicates an e-commerce site
+            - detected_pattern: String describing what pattern was detected
+        """
+        if not url:
+            return False, ""
+
+        url_lower = url.lower()
+
+        # E-commerce platform subdomains (100% confidence)
+        ecommerce_domains = [
+            '.myshopify.com',      # Shopify stores
+            '.bigcartel.com',      # Big Cartel
+            '.square.site',        # Square online stores
+            '.ecwid.com',          # Ecwid stores
+            '.shoplightspeed.com', # Lightspeed
+            '.shoplo.com',         # Shoplo
+            '.3dcart.com',         # 3dcart
+            '.squarespace.com/commerce',  # Squarespace commerce
+            '.wixsite.com/shop',   # Wix commerce (with /shop)
+        ]
+
+        for domain in ecommerce_domains:
+            if domain in url_lower:
+                return True, f"e-commerce platform: {domain}"
+
+        # E-commerce URL paths (95%+ confidence)
+        ecommerce_paths = [
+            '/shop/',
+            '/shop',
+            '/store/',
+            '/store',
+            '/products/',
+            '/product/',
+            '/cart/',
+            '/cart',
+            '/checkout/',
+            '/checkout',
+            '/collections/',      # Shopify pattern
+            '/buy-now',
+            '/order-online',
+            '/merchandise',
+            '/merch',
+            '/add-to-cart',
+        ]
+
+        for path in ecommerce_paths:
+            if path in url_lower:
+                return True, f"e-commerce path: {path}"
+
+        # Check domain for shop/store keywords (conservative)
+        # Only flag if it's clearly an online store in the domain itself
+        try:
+            parsed = urlparse(url_lower)
+            domain = parsed.netloc.replace('www.', '')
+
+            # Be conservative - only flag obvious e-commerce domain names
+            # Don't flag "Joe's Pressure Wash Shop" type business names
+            ecommerce_domain_keywords = ['onlinestore', 'webstore', 'webshop', 'eshop', 'e-shop']
+            for kw in ecommerce_domain_keywords:
+                if kw in domain.replace('-', '').replace('_', ''):
+                    return True, f"e-commerce domain keyword: {kw}"
+
+        except Exception:
+            # If URL parsing fails, don't block
+            pass
+
+        return False, ""
+
     def should_include(self, listing: Dict) -> Tuple[bool, str, float]:
         """
         Determine if a listing should be included based on filtering rules.
@@ -228,6 +310,13 @@ class YPFilter:
             if not has_other_positive and not has_positive_hint:
                 return False, "Equipment category without service indicators", 0.0
 
+        # Rule 5: Check for e-commerce URLs
+        website = listing.get('website', '')
+        if website:
+            is_ecommerce, ecommerce_reason = self._is_ecommerce_url(website)
+            if is_ecommerce:
+                return False, f"E-commerce site detected: {ecommerce_reason}", 0.0
+
         # Calculate confidence score
         score = self._calculate_score(listing, allowed_tags, combined_text)
 
@@ -245,7 +334,7 @@ class YPFilter:
         Scoring:
         - +10 points per allowed category tag
         - +5 points per positive hint phrase in text
-        - -20 points if "Equipment & Services" is only allowed tag
+        - -10 points if "Equipment & Services" is only allowed tag
         - +5 points if has website
         - +3 points if has rating
         - -10 points per anti-keyword in description (not name, already filtered)
@@ -267,9 +356,9 @@ class YPFilter:
         has_positive, hint_matches = self._has_positive_hint(combined_text)
         score += min(len(hint_matches) * 5, 25)
 
-        # Penalize if only equipment tag
+        # Penalize if only equipment tag (reduced from -20 to -10 to be less aggressive)
         if "equipment" in " ".join(allowed_tags).lower() and len(allowed_tags) == 1:
-            score -= 20
+            score -= 10
 
         # Bonus for having website
         if listing.get('website'):
@@ -296,7 +385,7 @@ class YPFilter:
     def filter_listings(
         self,
         listings: List[Dict],
-        min_score: float = 50.0,
+        min_score: float = 40.0,
         include_sponsored: bool = False
     ) -> Tuple[List[Dict], Dict[str, int]]:
         """
@@ -359,7 +448,7 @@ class YPFilter:
 # Convenience function for quick filtering
 def filter_yp_listings(
     listings: List[Dict],
-    min_score: float = 50.0,
+    min_score: float = 40.0,
     include_sponsored: bool = False
 ) -> Tuple[List[Dict], Dict[str, int]]:
     """
