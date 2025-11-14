@@ -209,6 +209,7 @@ def main():
     parser = argparse.ArgumentParser(description="Launch state-partitioned worker pool")
     parser.add_argument("--workers", type=int, default=10, help="Number of workers (default: 10)")
     parser.add_argument("--test", action="store_true", help="Test mode: only 2 workers")
+    parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
     args = parser.parse_args()
 
     # Test mode: reduce workers
@@ -235,8 +236,8 @@ def main():
     logger.info(f"Ready to launch {num_workers} workers")
     logger.info("="*70)
 
-    # Ask for confirmation unless in test mode
-    if not args.test:
+    # Ask for confirmation unless --yes or --test flag is provided
+    if not args.yes and not args.test:
         response = input("\nStart workers? [y/N]: ")
         if response.lower() != 'y':
             logger.info("Cancelled by user")

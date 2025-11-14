@@ -1294,7 +1294,8 @@ def build_multiworker_yp_ui(container):
                 cmd = [
                     sys.executable,
                     'scripts/run_state_workers.py',
-                    '--workers', str(int(worker_count_slider.value))
+                    '--workers', str(int(worker_count_slider.value)),
+                    '--yes'  # Skip interactive confirmation prompt
                 ]
 
                 # Create subprocess runner
