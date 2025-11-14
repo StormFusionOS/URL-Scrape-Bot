@@ -349,6 +349,201 @@ class ProxyPool:
         return {"passed": passed, "failed": failed}
 
 
+class WorkerProxyPool:
+    """
+    Worker-specific proxy pool for state-partitioned workers.
+
+    Each worker gets a dedicated subset of proxies and rotates through them
+    on every request (not just on browser restart).
+
+    Features:
+    - Load only assigned proxies by index
+    - Per-request rotation (faster failover)
+    - Same health tracking and blacklisting as ProxyPool
+    - Thread-safe for worker's internal use
+    """
+
+    def __init__(
+        self,
+        proxy_file: str,
+        proxy_indices: List[int],
+        worker_id: int,
+        blacklist_threshold: int = 10,
+        blacklist_duration_minutes: int = 60
+    ):
+        """
+        Initialize worker-specific proxy pool.
+
+        Args:
+            proxy_file: Path to proxy file (Webshare format: host:port:user:pass)
+            proxy_indices: List of proxy indices this worker should use (e.g., [0, 1, 2, 3, 4])
+            worker_id: Worker ID for logging
+            blacklist_threshold: Number of consecutive failures before blacklisting
+            blacklist_duration_minutes: How long to blacklist a proxy
+        """
+        self.proxy_file = proxy_file
+        self.proxy_indices = proxy_indices
+        self.worker_id = worker_id
+        self.blacklist_threshold = blacklist_threshold
+        self.blacklist_duration = timedelta(minutes=blacklist_duration_minutes)
+
+        self.proxies: List[ProxyInfo] = []
+        self.current_index = 0
+        self.lock = threading.Lock()
+
+        self._load_proxies()
+
+    def _load_proxies(self) -> None:
+        """Load only assigned proxies from file."""
+        proxy_path = Path(self.proxy_file)
+
+        if not proxy_path.exists():
+            raise FileNotFoundError(f"Proxy file not found: {self.proxy_file}")
+
+        logger.info(f"Worker {self.worker_id}: Loading proxies from {self.proxy_file}...")
+
+        with open(proxy_path, 'r') as f:
+            lines = [line.strip() for line in f.readlines() if line.strip() and not line.startswith('#')]
+
+        # Load only assigned proxies
+        for idx in self.proxy_indices:
+            if idx >= len(lines):
+                logger.warning(f"Worker {self.worker_id}: Proxy index {idx} out of range (only {len(lines)} proxies in file)")
+                continue
+
+            line = lines[idx]
+
+            # Parse Webshare format: host:port:username:password
+            parts = line.split(':')
+            if len(parts) != 4:
+                logger.warning(f"Worker {self.worker_id}: Invalid format at index {idx}, expected host:port:user:pass")
+                continue
+
+            host, port, username, password = parts
+
+            try:
+                port_int = int(port)
+                proxy = ProxyInfo(
+                    host=host,
+                    port=port_int,
+                    username=username,
+                    password=password
+                )
+                self.proxies.append(proxy)
+                logger.info(f"Worker {self.worker_id}: Loaded proxy {len(self.proxies)}: {host}:{port}")
+            except ValueError:
+                logger.warning(f"Worker {self.worker_id}: Invalid port number at index {idx}: {port}")
+                continue
+
+        if not self.proxies:
+            raise ValueError(f"Worker {self.worker_id}: No valid proxies found for indices {self.proxy_indices}")
+
+        logger.info(f"Worker {self.worker_id}: Loaded {len(self.proxies)} proxies (indices: {self.proxy_indices})")
+
+    def get_proxy_for_request(self) -> Optional[ProxyInfo]:
+        """
+        Get next healthy proxy for a single request.
+
+        This rotates through proxies on EVERY call, not just browser restart.
+        This provides faster failover and better load distribution.
+
+        Returns:
+            ProxyInfo object or None if no healthy proxies available
+        """
+        with self.lock:
+            attempts = 0
+            max_attempts = len(self.proxies)
+
+            while attempts < max_attempts:
+                proxy = self.proxies[self.current_index]
+                self.current_index = (self.current_index + 1) % len(self.proxies)
+                attempts += 1
+
+                if proxy.is_healthy:
+                    proxy.last_used = datetime.now()
+                    return proxy
+
+            # No healthy proxies found
+            logger.error(f"Worker {self.worker_id}: No healthy proxies available!")
+            return None
+
+    def report_success(self, proxy: ProxyInfo) -> None:
+        """Report successful use of proxy."""
+        with self.lock:
+            proxy.success_count += 1
+
+            # Log milestone successes
+            if proxy.success_count in [1, 10, 50, 100, 500, 1000]:
+                logger.info(
+                    f"Worker {self.worker_id}: Proxy {proxy.host}:{proxy.port} "
+                    f"reached {proxy.success_count} successes (rate: {proxy.success_rate:.1%})"
+                )
+
+    def report_failure(self, proxy: ProxyInfo, error_type: str = "unknown") -> None:
+        """
+        Report failed use of proxy.
+
+        Args:
+            proxy: ProxyInfo object
+            error_type: Type of error (timeout, 403, 429, captcha, etc.)
+        """
+        with self.lock:
+            proxy.failure_count += 1
+
+            logger.warning(
+                f"Worker {self.worker_id}: Proxy {proxy.host}:{proxy.port} failure ({error_type}): "
+                f"{proxy.failure_count} total failures (rate: {proxy.success_rate:.1%})"
+            )
+
+            # Check if should blacklist
+            recent_failures = proxy.failure_count - proxy.success_count
+            if recent_failures >= self.blacklist_threshold:
+                proxy.blacklisted = True
+                proxy.blacklist_until = datetime.now() + self.blacklist_duration
+                logger.error(
+                    f"Worker {self.worker_id}: Proxy {proxy.host}:{proxy.port} BLACKLISTED "
+                    f"for {self.blacklist_duration.total_seconds()/60:.0f} minutes "
+                    f"(threshold: {self.blacklist_threshold} consecutive failures)"
+                )
+
+    def get_stats(self) -> Dict:
+        """Get pool statistics."""
+        with self.lock:
+            total = len(self.proxies)
+            healthy = sum(1 for p in self.proxies if p.is_healthy)
+            blacklisted = sum(1 for p in self.proxies if p.blacklisted)
+
+            total_success = sum(p.success_count for p in self.proxies)
+            total_failure = sum(p.failure_count for p in self.proxies)
+            overall_rate = total_success / (total_success + total_failure) if (total_success + total_failure) > 0 else 0.0
+
+            return {
+                "worker_id": self.worker_id,
+                "total_proxies": total,
+                "healthy_proxies": healthy,
+                "blacklisted_proxies": blacklisted,
+                "total_successes": total_success,
+                "total_failures": total_failure,
+                "overall_success_rate": overall_rate
+            }
+
+    def get_proxy_list(self, include_unhealthy: bool = False) -> List[ProxyInfo]:
+        """
+        Get list of proxies.
+
+        Args:
+            include_unhealthy: If True, include unhealthy/blacklisted proxies
+
+        Returns:
+            List of ProxyInfo objects
+        """
+        with self.lock:
+            if include_unhealthy:
+                return self.proxies.copy()
+            else:
+                return [p for p in self.proxies if p.is_healthy]
+
+
 def main():
     """Demo: Test proxy pool."""
     logger.info("=" * 60)
