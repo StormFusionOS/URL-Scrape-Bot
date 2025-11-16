@@ -35,7 +35,7 @@ async def load_companies(search_text=""):
         companies = await run.io_bound(
             backend.fetch_companies,
             search_text if search_text else None,
-            5000
+            50000
         )
 
         database_state.companies = companies
@@ -450,7 +450,7 @@ def database_page():
 
             ui.label('💡 Tips:').classes('font-semibold mb-2')
             with ui.column().classes('gap-1'):
-                ui.label('• The grid loads up to 5000 rows by default').classes('text-sm text-gray-400')
+                ui.label('• The grid loads up to 50,000 rows by default').classes('text-sm text-gray-400')
                 ui.label('• Use search to narrow down results before exporting').classes('text-sm text-gray-400')
                 ui.label('• Select all rows with Ctrl+A / Cmd+A in the grid').classes('text-sm text-gray-400')
                 ui.label('• Export creates a timestamped CSV file').classes('text-sm text-gray-400')
