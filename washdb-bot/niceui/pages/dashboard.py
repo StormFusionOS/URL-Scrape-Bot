@@ -253,10 +253,15 @@ def dashboard_page():
                     # Active Discovery Status
                     with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
                         ui.label('Discovery Status').classes('text-sm text-gray-200 mb-2')
-                        if discovery_state.running:
+                        # Check if discovery is running OR if there are active/pending YP targets
+                        active_targets = backend.count_yp_targets_by_status('in_progress')
+                        pending_targets = backend.count_yp_targets_by_status('planned')
+
+                        if discovery_state.running or active_targets > 0 or pending_targets > 0:
                             with ui.row().classes('items-center gap-2'):
                                 ui.spinner(size='sm', color='positive')
-                                ui.label('RUNNING').classes('text-2xl font-bold text-green-300')
+                                status_text = 'RUNNING' if discovery_state.running or active_targets > 0 else f'ACTIVE ({pending_targets} queued)'
+                                ui.label(status_text).classes('text-2xl font-bold text-green-300')
                         else:
                             ui.badge('IDLE', color='grey').classes('text-xl p-3')
 

@@ -1329,6 +1329,30 @@ class BackendFacade:
                 'message': f'Error clearing database: {str(e)}'
             }
 
+    def count_yp_targets_by_status(self, status: str) -> int:
+        """
+        Count YP targets by status.
+
+        Args:
+            status: Target status to count (e.g., 'planned', 'scraping', 'done')
+
+        Returns:
+            Count of targets with the specified status
+        """
+        try:
+            from sqlalchemy import text
+            session = create_session()
+
+            query = text("SELECT COUNT(*) FROM yp_targets WHERE status = :status")
+            count = session.execute(query, {"status": status}).scalar() or 0
+
+            session.close()
+            return count
+
+        except Exception as e:
+            logger.error(f"Error counting YP targets by status '{status}': {e}", exc_info=True)
+            return 0
+
 
 # Global backend instance
 backend = BackendFacade()
