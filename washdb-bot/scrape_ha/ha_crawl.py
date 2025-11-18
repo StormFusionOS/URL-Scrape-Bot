@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 """
-HomeAdvisor crawling orchestration (Phase 1 of pipeline - saves to staging).
+HomeAdvisor ZIP code-based crawling (Phase 1 of pipeline - saves to staging).
+
+This module implements ZIP code-based scraping for HomeAdvisor:
+- Crawls using ZIP codes from city_registry database
+- Prioritizes by population tier (A/B/C)
+- Reduces redundancy and improves targeting
+- Saves discoveries to ha_staging table for Phase 2 processing
 """
 from __future__ import annotations
-from typing import Generator, List, Dict, Optional
-from urllib.parse import urlparse
-
+from typing import Generator
+import psycopg2
 from runner.logging_setup import get_logger
-from db.models import canonicalize_url, domain_from_url
-from db.save_to_staging import save_to_staging, get_staging_stats
-from scrape_ha.ha_client import (
-    build_search_url, fetch_url, parse_list_page, HA_BASE
-)
+from db.save_to_staging import save_to_staging
+from scrape_ha.ha_client import build_search_url, fetch_url, parse_list_page
 
 logger = get_logger("ha_crawl")
+
+# Database connection
+DB_USER = "scraper_user"
+DB_PASSWORD = "ScraperPass123"
+DB_HOST = "localhost"
+DB_NAME = "scraper"
 
 CATEGORIES_HA = [
     "power washing",
@@ -22,31 +30,103 @@ CATEGORIES_HA = [
     "fence painting or staining",
 ]
 
-# US States list (previously imported from YP scraper)
-STATES = [
-    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
-    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
-    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
-    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
-    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
-]
+# Pages to crawl per tier (based on population)
+TIER_PAGES = {
+    'A': 3,  # Major cities (100k+): 3 pages
+    'B': 2,  # Medium cities (25k-100k): 2 pages
+    'C': 1,  # Small cities (<25k): 1 page
+}
 
-def crawl_category_state(category: str, state: str, max_pages: int = 3) -> list[dict]:
-    """
-    Crawl HomeAdvisor list pages and extract basic business info for staging.
 
-    PIPELINE Phase 1: Extracts only name, address, phone, ratings from list pages.
-    Data is saved to ha_staging table where Phase 2 (URL finder) will process it.
+def get_cities_from_db(states: list[str] = None, tiers: list[str] = None, limit: int = None):
     """
-    logger.info(f"[HA Phase 1] Crawl: '{category}' in {state} (max {max_pages} pages)")
+    Fetch cities from city_registry database.
+
+    Args:
+        states: List of state codes to filter (e.g., ['AL', 'TX'])
+        tiers: List of tiers to filter (e.g., ['A', 'B'])
+        limit: Maximum number of cities to return
+
+    Returns:
+        List of dicts with keys: city, state_id, primary_zip, tier
+    """
+    conn = psycopg2.connect(
+        host=DB_HOST,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD
+    )
+
+    try:
+        cur = conn.cursor()
+
+        # Build query with filters
+        query = """
+            SELECT city, state_id, primary_zip, tier, population
+            FROM city_registry
+            WHERE 1=1
+        """
+        params = []
+
+        if states:
+            query += " AND state_id = ANY(%s)"
+            params.append(states)
+
+        if tiers:
+            query += " AND tier = ANY(%s)"
+            params.append(tiers)
+
+        # Order by tier (A first), then population descending
+        query += " ORDER BY tier ASC, population DESC NULLS LAST"
+
+        if limit:
+            query += " LIMIT %s"
+            params.append(limit)
+
+        cur.execute(query, params)
+
+        cities = []
+        for row in cur.fetchall():
+            cities.append({
+                'city': row[0],
+                'state_id': row[1],
+                'primary_zip': row[2],
+                'tier': row[3],
+                'population': row[4],
+            })
+
+        cur.close()
+        return cities
+
+    finally:
+        conn.close()
+
+
+def crawl_category_zip(category: str, zip_code: str, city: str, state: str, max_pages: int = 3) -> list[dict]:
+    """
+    Crawl HomeAdvisor for a specific category in a specific ZIP code.
+
+    Args:
+        category: Service category (e.g., "power washing")
+        zip_code: ZIP code to search (e.g., "35218")
+        city: City name (for logging only)
+        state: State code (for logging only)
+        max_pages: Maximum number of pages to crawl
+
+    Returns:
+        List of business dicts ready for staging table
+    """
+    location = f"{city}, {state} ({zip_code})"
+    logger.info(f"[HA Phase 1] Crawl: '{category}' in {location} (max {max_pages} pages)")
     results: list[dict] = []
     seen_profile_urls = set()
 
     for page in range(1, max_pages + 1):
-        search_url = build_search_url(category, state, page)
+        search_url = build_search_url(category, page=page, zip_code=zip_code)
         html = fetch_url(search_url)
+
         if not html:
-            logger.info(f"[HA Phase 1] No HTML for {search_url}, stopping page loop")
+            logger.info(f"[HA Phase 1] No HTML for {search_url}, stopping")
             break
 
         cards = parse_list_page(html)
@@ -68,7 +148,7 @@ def crawl_category_state(category: str, state: str, max_pages: int = 3) -> list[
 
             seen_profile_urls.add(profile_url)
 
-            # Prepare data for staging table (no website/domain needed yet)
+            # Prepare data for staging table
             results.append({
                 "name": card.get("name"),
                 "phone": card.get("phone"),
@@ -83,76 +163,175 @@ def crawl_category_state(category: str, state: str, max_pages: int = 3) -> list[
         if new_this_page == 0:
             break
 
-    logger.info(f"[HA Phase 1] Total extracted for {category}/{state}: {len(results)} businesses")
+    logger.info(f"[HA Phase 1] Total extracted for {category}/{location}: {len(results)} businesses")
     return results
 
-def crawl_all_states(categories: list[str] = None,
-                     states: list[str] = None,
-                     limit_per_state: int = 3,
-                     save_to_db: bool = True) -> dict:
-    """
-    Crawl all state-category combinations and save to staging table.
 
-    PIPELINE Phase 1: Discovers businesses and saves to ha_staging table.
-    Phase 2 (URL finder worker) will process items from the queue.
+def crawl_zips(
+    categories: list[str] = None,
+    states: list[str] = None,
+    tiers: list[str] = None,
+    max_cities: int = None,
+    save_to_db: bool = True
+) -> Generator[dict, None, None]:
+    """
+    Crawl HomeAdvisor using ZIP code-based approach.
+
+    This generator yields batches of businesses discovered from ZIP code-category combinations.
+    Each batch is saved to ha_staging table for Phase 2 processing.
 
     Args:
-        categories: List of service categories to search
-        states: List of US state codes to search
-        limit_per_state: Number of pages to scrape per category/state pair
-        save_to_db: If True, save to staging table; if False, return results
+        categories: List of service categories (defaults to CATEGORIES_HA)
+        states: List of state codes to crawl (defaults to all states)
+        tiers: List of tiers to crawl (defaults to all tiers: A, B, C)
+        max_cities: Maximum number of cities to crawl (defaults to unlimited)
+        save_to_db: If True, save to staging table; if False, just return results
 
-    Returns:
-        Dict with summary stats: total_found, total_saved, total_skipped
+    Yields:
+        Dict batches with keys: category, city, state, zip_code, results, count, error (optional)
     """
     if categories is None:
         categories = CATEGORIES_HA
-    if states is None:
-        states = STATES
 
-    total_pairs = len(categories) * len(states)
-    total_found = 0
-    total_saved = 0
-    total_skipped = 0
+    if tiers is None:
+        tiers = ['A', 'B', 'C']
+
+    # Fetch cities from database
+    logger.info(f"Fetching cities from database (states={states}, tiers={tiers}, limit={max_cities})")
+    cities = get_cities_from_db(states=states, tiers=tiers, limit=max_cities)
+
+    if not cities:
+        logger.warning("No cities found in database matching criteria")
+        return
+
+    logger.info(f"Found {len(cities)} cities to crawl")
+
+    # Calculate total combinations
+    total_combinations = len(cities) * len(categories)
 
     i = 0
-    for state in states:
-        for cat in categories:
+    for city_data in cities:
+        city = city_data['city']
+        state = city_data['state_id']
+        zip_code = city_data['primary_zip']
+        tier = city_data['tier']
+        max_pages = TIER_PAGES.get(tier, 1)
+
+        for category in categories:
             i += 1
-            logger.info(f"[HA Phase 1] ({i}/{total_pairs}) {cat} in {state}")
+            logger.info(
+                f"[HA Phase 1] ({i}/{total_combinations}) "
+                f"{category} in {city}, {state} (ZIP: {zip_code}, Tier: {tier})"
+            )
+
             try:
-                results = crawl_category_state(cat, state, max_pages=limit_per_state)
-                total_found += len(results)
+                results = crawl_category_zip(
+                    category, zip_code, city, state, max_pages=max_pages
+                )
 
                 if save_to_db and results:
                     # Save batch to staging table
                     inserted, skipped = save_to_staging(results)
-                    total_saved += inserted
-                    total_skipped += skipped
                     logger.info(
-                        f"[HA Phase 1] Saved batch: {cat}/{state}, "
+                        f"[HA Phase 1] Saved batch: {category}/{city}/{state}, "
                         f"{inserted} new, {skipped} duplicates"
                     )
 
+                # Yield batch
+                yield {
+                    "category": category,
+                    "city": city,
+                    "state": state,
+                    "zip_code": zip_code,
+                    "tier": tier,
+                    "results": results,
+                    "count": len(results),
+                }
+
             except Exception as e:
-                logger.error(f"[HA Phase 1] Error for {cat}/{state}: {e}", exc_info=True)
-                continue
+                logger.error(
+                    f"[HA Phase 1] Error for {category}/{city}/{state}: {e}",
+                    exc_info=True
+                )
+                # Yield error batch
+                yield {
+                    "category": category,
+                    "city": city,
+                    "state": state,
+                    "zip_code": zip_code,
+                    "error": str(e),
+                    "results": [],
+                    "count": 0,
+                }
 
-    # Final summary
+
+def main():
+    """CLI entry point for ZIP code-based crawler."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="HomeAdvisor ZIP Code-Based Crawler (Phase 1)")
+    parser.add_argument(
+        "--states",
+        nargs="+",
+        help="State codes to crawl (e.g., AL TX CA). Defaults to all states."
+    )
+    parser.add_argument(
+        "--categories",
+        nargs="+",
+        help="Categories to crawl. Defaults to all HA categories."
+    )
+    parser.add_argument(
+        "--tiers",
+        nargs="+",
+        choices=['A', 'B', 'C'],
+        help="City tiers to crawl (A=major, B=medium, C=small). Defaults to all tiers."
+    )
+    parser.add_argument(
+        "--max-cities",
+        type=int,
+        help="Maximum number of cities to crawl (defaults to unlimited)"
+    )
+
+    args = parser.parse_args()
+
     logger.info("=" * 60)
-    logger.info(f"[HA Phase 1] COMPLETE - {total_pairs} pairs processed")
-    logger.info(f"[HA Phase 1] Found: {total_found} businesses")
-    logger.info(f"[HA Phase 1] Saved: {total_saved} to staging")
-    logger.info(f"[HA Phase 1] Skipped: {total_skipped} duplicates")
+    logger.info("HomeAdvisor ZIP Code-Based Crawler Starting (Phase 1)")
+    logger.info(f"States: {args.states or 'ALL'}")
+    logger.info(f"Categories: {args.categories or 'ALL'}")
+    logger.info(f"Tiers: {args.tiers or 'ALL'}")
+    logger.info(f"Max cities: {args.max_cities or 'UNLIMITED'}")
+    logger.info("=" * 60)
 
-    # Get staging stats
-    if save_to_db:
-        stats = get_staging_stats()
-        logger.info(f"[HA Phase 1] Queue size: {stats['pending']} pending")
-        logger.info("=" * 60)
+    total_discovered = 0
+    total_batches = 0
 
-    return {
-        "total_found": total_found,
-        "total_saved": total_saved,
-        "total_skipped": total_skipped
-    }
+    for batch in crawl_zips(
+        categories=args.categories,
+        states=args.states,
+        tiers=args.tiers,
+        max_cities=args.max_cities
+    ):
+        total_batches += 1
+        total_discovered += batch["count"]
+
+        if "error" in batch:
+            logger.warning(
+                f"Batch {total_batches}: {batch['category']}/{batch['city']}/{batch['state']} "
+                f"FAILED - {batch['error']}"
+            )
+        else:
+            logger.info(
+                f"Batch {total_batches}: {batch['category']}/{batch['city']}/{batch['state']} "
+                f"(ZIP: {batch['zip_code']}, Tier: {batch['tier']}) "
+                f"discovered {batch['count']} businesses"
+            )
+
+    logger.info("=" * 60)
+    logger.info("Crawl Complete")
+    logger.info(f"Total batches: {total_batches}")
+    logger.info(f"Total businesses discovered: {total_discovered}")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

@@ -10,6 +10,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from db.models import Base, HAStaging
 from db.save_discoveries import normalize_phone
@@ -68,13 +69,13 @@ def save_to_staging(businesses: list[dict]) -> tuple[int, int]:
 
     try:
         for business in businesses:
-            try:
-                # Ensure profile_url is present (required field)
-                if not business.get("profile_url"):
-                    logger.warning(f"Skipping business without profile_url: {business.get('name')}")
-                    skipped += 1
-                    continue
+            # Ensure profile_url is present (required field)
+            if not business.get("profile_url"):
+                logger.warning(f"Skipping business without profile_url: {business.get('name')}")
+                skipped += 1
+                continue
 
+            try:
                 # Normalize phone
                 phone = normalize_phone(business.get("phone"))
 
@@ -93,29 +94,33 @@ def save_to_staging(businesses: list[dict]) -> tuple[int, int]:
                 )
 
                 session.add(staging_record)
+                # Commit each record individually to handle duplicates properly
+                session.commit()
                 logger.debug(f"Added to staging: {business.get('name')}")
                 inserted += 1
 
-            except Exception as e:
-                # Check if it's a duplicate profile_url (unique constraint violation)
+            except IntegrityError as e:
+                # Handle duplicate profile_url (unique constraint violation)
+                session.rollback()
                 if "unique constraint" in str(e).lower() or "duplicate key" in str(e).lower():
                     logger.debug(
                         f"Duplicate profile_url (already in staging): {business.get('profile_url')}"
                     )
                     skipped += 1
-                    # Rollback this transaction and continue
-                    session.rollback()
-                    continue
                 else:
                     logger.error(
-                        f"Error saving to staging {business.get('name', 'Unknown')}: {e}"
+                        f"Integrity error saving to staging {business.get('name', 'Unknown')}: {e}"
                     )
                     skipped += 1
-                    session.rollback()
-                    continue
 
-        # Commit all successful inserts
-        session.commit()
+            except Exception as e:
+                # Handle other errors
+                session.rollback()
+                logger.error(
+                    f"Error saving to staging {business.get('name', 'Unknown')}: {e}"
+                )
+                skipped += 1
+
         logger.info(
             f"Staging save complete: {inserted} inserted, {skipped} skipped"
         )

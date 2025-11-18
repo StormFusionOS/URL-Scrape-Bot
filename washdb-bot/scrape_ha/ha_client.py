@@ -50,20 +50,56 @@ def _proxies():
     return {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
 # --- URL builder ---
-def build_search_url(category: str, state: str, page: int) -> str:
+def build_search_url(category: str, state: str = None, page: int = 1, zip_code: Optional[str] = None) -> str:
     """
-    Try common HA patterns. Keep flexible—fall back to a keyword search landing.
-    We normalize categories to dash‑separated tokens.
+    Build HomeAdvisor search URL.
 
-    We use multiple candidates; first one that returns 200 with content is used.
+    RECOMMENDED: Use ZIP code-based searches for better results.
+    LEGACY: State-level searches still supported but may return fewer results.
+
+    Args:
+        category: Service category (e.g., "power washing")
+        state: State code (e.g., "AL") - used for legacy state-level searches
+        page: Page number (default: 1)
+        zip_code: ZIP code for search (e.g., "35218") - RECOMMENDED
+
+    Returns:
+        Search URL string
     """
     cat_slug = re.sub(r"[^a-z0-9]+", "-", category.strip().lower())
-    candidates = [
-        f"{HA_BASE}/near-me/{quote_plus(cat_slug)}/?state={quote_plus(state)}&page={page}",
-        f"{HA_BASE}/c.{state.lower()}/{cat_slug}/?page={page}",
-        f"{HA_BASE}/search/?q={quote_plus(category)}&state={quote_plus(state)}&page={page}",
-    ]
-    return candidates[0]  # The fetch function will try alternates if needed.
+
+    # ZIP code-based search (RECOMMENDED)
+    if zip_code:
+        # Normalize category to query string format
+        query = category.strip().lower().replace(" ", "+")
+
+        # Build base URL with ZIP code search
+        base_url = (
+            f"{HA_BASE}/find"
+            f"?postalCode={zip_code}"
+            f"&query={query}"
+            f"&searchType=SiteTaskSearch"
+            f"&initialSearch=true"
+        )
+
+        # Add page parameter if page > 1
+        if page > 1:
+            base_url += f"&startIndex={20 * (page - 1)}"  # HomeAdvisor uses startIndex, 20 results per page
+
+        return base_url
+
+    # Legacy state-level search (backward compatibility)
+    elif state:
+        base_url = f"{HA_BASE}/near-me/{cat_slug}/?state={state}"
+
+        # Add page parameter if page > 1
+        if page > 1:
+            base_url += f"&page={page}"
+
+        return base_url
+
+    else:
+        raise ValueError("Either zip_code or state is required for HomeAdvisor searches")
 
 # --- Fetch with retries ---
 def fetch_url(url: str, delay: Optional[int] = None) -> Optional[str]:

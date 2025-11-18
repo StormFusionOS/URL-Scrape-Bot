@@ -13,7 +13,7 @@ from pathlib import Path
 # Import actual scraper modules
 # NOTE: YP scraper now uses city-first approach via CLI subprocess (see niceui/pages/discover.py)
 # from scrape_yp.yp_crawl import crawl_all_states, CATEGORIES as DEFAULT_CATEGORIES, STATES as DEFAULT_STATES
-from scrape_ha.ha_crawl import crawl_all_states as ha_crawl_all, CATEGORIES_HA
+# from scrape_ha.ha_crawl import crawl_all_states as ha_crawl_all, CATEGORIES_HA
 from scrape_site.site_scraper import scrape_website
 from db.save_discoveries import upsert_discovered, create_session
 from db.update_details import update_batch

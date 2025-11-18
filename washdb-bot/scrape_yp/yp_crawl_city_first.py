@@ -35,6 +35,12 @@ from scrape_yp.yp_stealth import (
     SessionBreakManager,
 )
 from scrape_yp.yp_monitor import ScraperMonitor
+from scrape_yp.yp_checkpoint import (
+    recover_orphaned_targets,
+    get_overall_progress,
+    save_progress_checkpoint,
+    load_progress_checkpoint,
+)
 
 # Initialize logger
 logger = get_logger("yp_crawl_city_first")
@@ -412,6 +418,10 @@ def crawl_city_targets(
     use_session_breaks: bool = True,
     use_monitoring: bool = True,
     use_adaptive_rate_limiting: bool = True,
+    checkpoint_file: Optional[str] = None,
+    checkpoint_interval: int = 10,
+    recover_orphans: bool = True,
+    orphan_timeout_minutes: int = 60,
 ) -> Generator[dict, None, None]:
     """
     Crawl all targets for specified states.
@@ -426,6 +436,12 @@ def crawl_city_targets(
         max_targets: Optional limit on number of targets to process
         progress_callback: Optional callback(target_index, total_targets, target, results, stats)
         use_session_breaks: Take breaks every 50 requests (default: True)
+        use_monitoring: Enable monitoring and health checks (default: True)
+        use_adaptive_rate_limiting: Enable adaptive rate limiting (default: True)
+        checkpoint_file: Path to checkpoint file for progress tracking (e.g., 'logs/yp_progress.json')
+        checkpoint_interval: Save checkpoint every N targets (default: 10)
+        recover_orphans: Recover orphaned targets on startup (default: True)
+        orphan_timeout_minutes: Minutes before marking target as orphaned (default: 60)
 
     Yields:
         Dict with keys:
@@ -434,6 +450,43 @@ def crawl_city_targets(
         - stats: Dict with parsing/filtering stats
     """
     logger.info(f"Starting city-first crawl for states: {', '.join(state_ids)}")
+
+    # Recover orphaned targets (targets stuck in 'in_progress')
+    if recover_orphans:
+        logger.info(f"\n{'='*80}")
+        logger.info("ORPHAN RECOVERY")
+        logger.info(f"{'='*80}")
+        recovery_result = recover_orphaned_targets(
+            session,
+            timeout_minutes=orphan_timeout_minutes,
+            state_ids=state_ids
+        )
+        if recovery_result['recovered'] > 0:
+            logger.warning(f"Recovered {recovery_result['recovered']} orphaned targets")
+        logger.info(f"{'='*80}\n")
+
+    # Load previous checkpoint if exists
+    if checkpoint_file:
+        prev_checkpoint = load_progress_checkpoint(checkpoint_file)
+        if prev_checkpoint:
+            logger.info(f"\n{'='*80}")
+            logger.info("PREVIOUS SESSION")
+            logger.info(f"{'='*80}")
+            # Previous session info already logged by load_progress_checkpoint
+            logger.info(f"{'='*80}\n")
+
+    # Show current progress
+    logger.info(f"\n{'='*80}")
+    logger.info("CURRENT PROGRESS")
+    logger.info(f"{'='*80}")
+    progress = get_overall_progress(session, state_ids=state_ids)
+    logger.info(f"Total targets: {progress['total']}")
+    logger.info(f"Completed: {progress['done']} ({progress['progress_pct']:.1f}%)")
+    logger.info(f"Remaining (planned): {progress['planned']}")
+    logger.info(f"In progress: {progress['in_progress']}")
+    logger.info(f"Failed: {progress['failed']}")
+    logger.info(f"Parked: {progress['parked']}")
+    logger.info(f"{'='*80}\n")
 
     # Initialize filter
     yp_filter = YPFilter()
@@ -534,26 +587,44 @@ def crawl_city_targets(
                 logger.info(f"Waiting {delay:.1f}s before next target...")
             time.sleep(delay)
 
-        # Periodic health check (every 10 targets)
-        if monitor and idx % 10 == 0:
-            status, issues, recommendations = monitor.check_health()
+        # Periodic checkpoint save and health check
+        if idx % checkpoint_interval == 0:
+            # Save checkpoint
+            if checkpoint_file:
+                try:
+                    current_progress = get_overall_progress(session, state_ids=state_ids)
+                    checkpoint_stats = {
+                        'idx': idx,
+                        'total_targets': total_targets,
+                        'total_results': total_results,
+                        'total_errors': total_errors,
+                        **current_progress
+                    }
+                    save_progress_checkpoint(checkpoint_file, checkpoint_stats, state_ids=state_ids)
+                    logger.info(f"Saved checkpoint: {checkpoint_stats['done']}/{checkpoint_stats['total']} targets complete")
+                except Exception as e:
+                    logger.error(f"Failed to save checkpoint: {e}")
 
-            logger.info(f"Health check #{idx//10}: {status.upper()}")
+            # Health check (if monitoring enabled)
+            if monitor:
+                status, issues, recommendations = monitor.check_health()
 
-            if issues:
-                logger.warning(f"Issues detected ({len(issues)}):")
-                for issue in issues:
-                    logger.warning(f"  - {issue}")
+                logger.info(f"Health check #{idx//checkpoint_interval}: {status.upper()}")
 
-            if status in ('unhealthy', 'critical'):
-                logger.error(f"Scraper health is {status}!")
-                if recommendations:
-                    logger.info("Recommendations:")
-                    for rec in recommendations[:3]:
-                        logger.info(f"  {rec}")
+                if issues:
+                    logger.warning(f"Issues detected ({len(issues)}):")
+                    for issue in issues:
+                        logger.warning(f"  - {issue}")
 
-            if status == 'critical':
-                logger.critical("CRITICAL health status - consider stopping!")
+                if status in ('unhealthy', 'critical'):
+                    logger.error(f"Scraper health is {status}!")
+                    if recommendations:
+                        logger.info("Recommendations:")
+                        for rec in recommendations[:3]:
+                            logger.info(f"  {rec}")
+
+                if status == 'critical':
+                    logger.critical("CRITICAL health status - consider stopping!")
 
             # Log summary
             summary = monitor.get_summary()
