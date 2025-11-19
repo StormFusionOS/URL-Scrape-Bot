@@ -1,5 +1,5 @@
 """
-Status & History page - comprehensive dashboard for live activity and past runs.
+Status, History & Logs page - comprehensive dashboard for live activity, past runs, and application logs.
 """
 
 import asyncio
@@ -9,6 +9,9 @@ from ..router import event_bus
 from ..utils import job_state, history_manager
 from ..layout import layout
 import tempfile
+from pathlib import Path
+from collections import deque
+import logging
 
 
 # Page state
@@ -31,6 +34,23 @@ class StatusPageState:
 
 
 status_state = StatusPageState()
+
+
+# Log viewing state (from logs.py)
+class LogState:
+    def __init__(self):
+        self.tailing = False
+        self.log_position = 0
+        self.error_entries = deque(maxlen=100)
+        self.timer = None
+        self.log_element = None
+        self.error_table = None
+        self.current_log_file = 'backend_facade.log'
+        self.search_text = ''
+        self.level_filter = 'ALL'
+
+
+log_state = LogState()
 
 
 def get_status_color(exit_code, is_running, is_stalled):
@@ -262,6 +282,14 @@ def clear_log():
         ui.notify('Log cleared', type='info')
 
 
+def clear_discovery_log():
+    """Clear the discovery log viewer."""
+    from .discover import discovery_state
+    if discovery_state.log_element:
+        discovery_state.log_element.clear()
+        ui.notify('Discovery log cleared', type='info')
+
+
 def copy_log():
     """Copy log to clipboard."""
     if not job_state.logs:
@@ -292,8 +320,9 @@ def load_history_table(job_filter=None, search_text=None):
             try:
                 dt = datetime.fromisoformat(timestamp)
                 timestamp = dt.strftime('%Y-%m-%d %H:%M:%S')
-            except:
-                pass
+            except (ValueError, TypeError) as e:
+                logging.debug(f"Failed to parse timestamp '{timestamp}': {e}")
+                # Keep original timestamp string
 
         rows.append({
             'timestamp': timestamp,
@@ -336,83 +365,173 @@ def clear_history():
     ui.notify('History cleared', type='warning')
 
 
-def status_page():
-    """Render status & history page."""
-    ui.label('Status & History').classes('text-3xl font-bold mb-4')
+# ============================================================================
+# LOG VIEWING FUNCTIONS (from logs.py)
+# ============================================================================
 
-    # ======================
-    # LIVE ACTIVITY SECTION
-    # ======================
-    ui.label('Live Activity').classes('text-2xl font-bold mb-2')
+def get_log_files():
+    """Get list of available log files with metadata."""
+    log_dir = Path('logs')
+    if not log_dir.exists():
+        return []
+
+    log_files = []
+    for log_file in log_dir.glob('*.log'):
+        size = log_file.stat().st_size
+        size_str = f"{size / 1024:.1f} KB" if size < 1024 * 1024 else f"{size / (1024 * 1024):.1f} MB"
+        log_files.append({
+            'name': log_file.name,
+            'size': size,
+            'size_str': size_str,
+            'modified': datetime.fromtimestamp(log_file.stat().st_mtime)
+        })
+
+    return sorted(log_files, key=lambda x: x['size'], reverse=True)
+
+
+def load_log_content(log_file, max_lines=500, filter_level='ALL', search=''):
+    """Load log file content with filtering."""
+    try:
+        log_path = Path(f'logs/{log_file}')
+        if not log_path.exists():
+            return [f"Log file not found: {log_file}"]
+
+        with open(log_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        # Get last N lines
+        lines = lines[-max_lines:]
+
+        # Apply filters
+        filtered_lines = []
+        for line in lines:
+            line = line.rstrip()
+            if not line:
+                continue
+
+            # Level filter
+            if filter_level != 'ALL' and filter_level not in line:
+                continue
+
+            # Search filter
+            if search and search.lower() not in line.lower():
+                continue
+
+            filtered_lines.append(line)
+
+        return filtered_lines
+    except Exception as e:
+        return [f"Error loading log: {str(e)}"]
+
+
+def switch_log_file(new_file):
+    """Switch to a different log file."""
+    log_state.current_log_file = new_file
+    log_state.log_position = 0
+    refresh_logs()
+    ui.notify(f'Switched to {new_file}', type='info')
+
+
+def refresh_logs():
+    """Refresh the log display."""
+    if log_state.log_element:
+        log_state.log_element.clear()
+        lines = load_log_content(
+            log_state.current_log_file,
+            max_lines=500,
+            filter_level=log_state.level_filter,
+            search=log_state.search_text
+        )
+        for line in lines:
+            log_state.log_element.push(line)
+
+
+def apply_filters():
+    """Apply current filters to log display."""
+    refresh_logs()
+    ui.notify('Filters applied', type='positive')
+
+
+def toggle_tail():
+    """Toggle log tailing on/off."""
+    if log_state.timer:
+        log_state.tailing = not log_state.tailing
+        log_state.timer.active = log_state.tailing
+        ui.notify(f'Tailing {"enabled" if log_state.tailing else "disabled"}',
+                  type='positive' if log_state.tailing else 'warning')
+
+
+def clear_logs():
+    """Clear the log display."""
+    if log_state.log_element:
+        log_state.log_element.clear()
+        ui.notify('Log view cleared', type='info')
+
+
+def tail_log_file(log_file_path, log_element):
+    """Read new lines from log file."""
+    try:
+        log_path = Path(log_file_path)
+        if not log_path.exists():
+            return
+
+        with open(log_path, 'r', encoding='utf-8') as f:
+            f.seek(log_state.log_position)
+            new_lines = f.readlines()
+            log_state.log_position = f.tell()
+
+            for line in new_lines:
+                line = line.rstrip()
+                if line:
+                    if 'ERROR' in line:
+                        log_state.error_entries.append({
+                            'time': datetime.now().strftime('%H:%M:%S'),
+                            'message': line[:100] + '...' if len(line) > 100 else line
+                        })
+                    log_element.push(line)
+    except Exception as e:
+        pass
+
+
+def status_page():
+    """Render combined status, history & logs page."""
+    ui.label('Status, History & Logs').classes('text-3xl font-bold mb-4')
+
+    # Create tabs
+    with ui.tabs().classes('w-full') as tabs:
+        tab_status = ui.tab('Status & History', icon='dashboard')
+        tab_logs = ui.tab('Application Logs', icon='description')
+
+    with ui.tab_panels(tabs, value=tab_status).classes('w-full'):
+        # ======================
+        # TAB 1: STATUS & HISTORY
+        # ======================
+        with ui.tab_panel(tab_status):
+            # ======================
+            # LIVE ACTIVITY SECTION
+            # ======================
+            ui.label('Live Activity').classes('text-2xl font-bold mb-2')
 
     with ui.card().classes('w-full mb-4'):
-        ui.label('System Status').classes('text-xl font-bold mb-3')
-
-        # Status cards
-        with ui.row().classes('w-full gap-4 mb-4'):
-            # Active job card
-            with ui.card().classes('flex-1'):
-                ui.label('Active Job').classes('text-sm text-gray-400 mb-1')
-                status_state.job_name_label = ui.label('No active job').classes('text-lg font-semibold')
-
-            # Status badge card
-            with ui.card().classes('flex-1'):
-                ui.label('Status').classes('text-sm text-gray-400 mb-1')
-                status_state.status_badge = ui.badge('IDLE', color='grey').classes('text-lg')
-
-            # Start time card
-            with ui.card().classes('flex-1'):
-                ui.label('Start Time').classes('text-sm text-gray-400 mb-1')
-                status_state.start_time_label = ui.label('-').classes('text-lg')
-
-            # Elapsed card
-            with ui.card().classes('flex-1'):
-                ui.label('Elapsed').classes('text-sm text-gray-400 mb-1')
-                status_state.elapsed_label = ui.label('0s').classes('text-lg')
-
-        # Metrics row
-        with ui.row().classes('w-full gap-4 mb-4'):
-            with ui.card().classes('flex-1'):
-                ui.label('Items').classes('text-sm text-gray-400 mb-1')
-                status_state.items_label = ui.label('0').classes('text-lg font-semibold')
-
-            with ui.card().classes('flex-1'):
-                ui.label('Errors').classes('text-sm text-gray-400 mb-1')
-                status_state.errors_label = ui.label('0').classes('text-lg font-semibold text-red-400')
-
-            with ui.card().classes('flex-1'):
-                ui.label('Throughput').classes('text-sm text-gray-400 mb-1')
-                status_state.throughput_label = ui.label('0.0 items/min').classes('text-lg')
-
-        # Progress bar
-        ui.label('Progress').classes('text-sm text-gray-400 mb-1')
-        status_state.progress_bar = ui.linear_progress(value=0, show_value=True).classes('w-full mb-4')
-
-        # Control buttons
-        with ui.row().classes('gap-2 mb-4'):
-            ui.button('Start Test Job', icon='play_arrow', color='positive',
-                      on_click=lambda: start_test_job()).props('outline')
-            ui.button('Cancel Job', icon='stop', color='negative',
-                      on_click=lambda: cancel_job()).props('outline')
-
-        # Log viewer
-        ui.label('Live Output').classes('text-lg font-bold mb-2')
+        # Log viewer - displays discovery logs
+        ui.label('Live Output (Discovery Runs)').classes('text-lg font-bold mb-2')
 
         with ui.row().classes('w-full gap-2 mb-2'):
-            ui.button('Clear Log', icon='delete', on_click=clear_log).props('flat dense')
-            ui.button('Copy Log', icon='content_copy', on_click=copy_log).props('flat dense')
+            ui.button('Clear Log', icon='delete', on_click=lambda: clear_discovery_log()).props('flat dense')
 
-            ui.space()
+        # Display discovery logs
+        log_container = ui.scroll_area().classes('w-full h-96 bg-gray-900 rounded p-2')
 
-            ui.label('Auto-scroll:').classes('text-sm')
-            ui.checkbox(value=True, on_change=lambda e: setattr(status_state, 'auto_scroll', e.value))
-
-        # Log container with scrolling
-        with ui.element('div').props('id=log-container').style(
-            'background: #1a1a1a; border-radius: 8px; padding: 12px; '
-            'height: 400px; overflow-y: auto; font-family: monospace;'
-        ) as log_container:
-            status_state.log_element = log_container
+        with log_container:
+            # Import discovery state to show discovery logs
+            from .discover import discovery_state
+            if discovery_state.log_element:
+                # Reference the same log element from discovery
+                status_state.log_element = discovery_state.log_element
+            else:
+                # Create a placeholder
+                status_state.log_element = ui.column().classes('w-full gap-0 font-mono text-xs')
+                ui.label('No discovery runs yet. Start a discovery run from the Discover page.').classes('text-gray-400 italic text-sm')
 
     # ======================
     # HISTORY SECTION
@@ -483,5 +602,142 @@ def status_page():
         # Load initial data
         load_history_table()
 
-    # Start update timer for live stats
+        # ======================
+        # TAB 2: APPLICATION LOGS
+        # ======================
+        with ui.tab_panel(tab_logs):
+            # Get available log files
+            log_files = get_log_files()
+            log_file_names = [f['name'] for f in log_files]
+
+            # File browser card
+            with ui.card().classes('w-full mb-4'):
+                with ui.row().classes('w-full items-center mb-2'):
+                    ui.label('Log Files').classes('text-xl font-bold')
+                    ui.space()
+                    ui.label(f'{len(log_files)} files found').classes('text-sm text-gray-400')
+
+                # Log file grid
+                with ui.grid(columns=4).classes('w-full gap-2'):
+                    for log_file in log_files[:12]:  # Show top 12
+                        with ui.card().classes('p-3 cursor-pointer hover:bg-gray-700').on('click', lambda f=log_file['name']: switch_log_file(f)):
+                            ui.label(log_file['name']).classes('text-sm font-semibold truncate')
+                            ui.label(log_file['size_str']).classes('text-xs text-gray-400')
+                            if log_file['name'] == log_state.current_log_file:
+                                ui.badge('ACTIVE', color='positive').classes('absolute top-2 right-2')
+
+            # Control bar
+            with ui.card().classes('w-full mb-4'):
+                ui.label('Log Viewer Controls').classes('text-lg font-bold mb-3')
+
+                # Row 1: File selector and filters
+                with ui.row().classes('w-full items-center gap-4 mb-3'):
+                    # Current file selector
+                    ui.label('File:').classes('font-semibold')
+                    file_select = ui.select(
+                        log_file_names if log_file_names else ['No logs'],
+                        value=log_state.current_log_file if log_state.current_log_file in log_file_names else (log_file_names[0] if log_file_names else 'No logs'),
+                        label='Select Log File',
+                        on_change=lambda e: switch_log_file(e.value)
+                    ).classes('w-64')
+
+                    # Level filter
+                    ui.label('Level:').classes('font-semibold ml-4')
+                    level_select = ui.select(
+                        ['ALL', 'DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                        value=log_state.level_filter,
+                        label='Filter Level',
+                        on_change=lambda e: setattr(log_state, 'level_filter', e.value) or apply_filters()
+                    ).classes('w-32')
+
+                    # Search box
+                    ui.label('Search:').classes('font-semibold ml-4')
+                    search_input = ui.input(
+                        'Search text...',
+                        value=log_state.search_text,
+                        on_change=lambda e: setattr(log_state, 'search_text', e.value)
+                    ).classes('w-64')
+
+                    ui.button(
+                        'Apply',
+                        icon='search',
+                        on_click=apply_filters,
+                        color='primary'
+                    ).props('flat')
+
+                # Row 2: Action buttons
+                with ui.row().classes('w-full gap-2'):
+                    ui.button(
+                        'Refresh',
+                        icon='refresh',
+                        color='primary',
+                        on_click=refresh_logs
+                    ).props('outline')
+
+                    ui.button(
+                        'Tail File',
+                        icon='visibility',
+                        color='primary',
+                        on_click=toggle_tail
+                    ).props('outline')
+
+                    ui.button(
+                        'Clear View',
+                        icon='clear_all',
+                        color='warning',
+                        on_click=clear_logs
+                    ).props('outline')
+
+                    ui.space()
+
+                    # Stats
+                    ui.label(f'Viewing: {log_state.current_log_file}').classes('text-sm text-gray-400')
+
+            # Main log viewer
+            with ui.card().classes('w-full mb-4'):
+                with ui.row().classes('w-full items-center mb-2'):
+                    ui.label('Live Logs').classes('text-xl font-bold')
+                    ui.space()
+                    ui.label('Last 500 lines').classes('text-sm text-gray-400')
+
+                # Log display
+                log_element = ui.log(max_lines=500).classes('w-full h-96')
+
+                # Store reference
+                log_state.log_element = log_element
+
+                # Load initial content
+                initial_lines = load_log_content(
+                    log_state.current_log_file,
+                    max_lines=500,
+                    filter_level=log_state.level_filter,
+                    search=log_state.search_text
+                )
+                for line in initial_lines:
+                    log_element.push(line)
+
+                # Create timer for tailing
+                log_state.timer = ui.timer(
+                    1.0,
+                    lambda: tail_log_file(f'logs/{log_state.current_log_file}', log_element),
+                    active=False
+                )
+
+            # Error entries table
+            with ui.card().classes('w-full'):
+                ui.label('Recent Errors').classes('text-xl font-bold mb-4')
+
+                error_table = ui.table(
+                    columns=[
+                        {'name': 'time', 'label': 'Time', 'field': 'time', 'align': 'left'},
+                        {'name': 'message', 'label': 'Message', 'field': 'message', 'align': 'left'},
+                    ],
+                    rows=[],
+                    row_key='time'
+                ).classes('w-full')
+
+                # Store reference
+                log_state.error_table = error_table
+
+    # Start update timer for live stats (outside tabs)
     status_state.update_timer = ui.timer(1.0, lambda: update_live_stats())

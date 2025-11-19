@@ -1,0 +1,543 @@
+================================================================================
+WASHDB-BOT SCRAPER ARCHITECTURE EXPLORATION - COMPREHENSIVE SUMMARY
+================================================================================
+
+PROJECT: washdb-bot (URL Scraping Bot)
+ANALYZED: Yellow Pages + Website Enrichment scraper architecture
+OBJECTIVE: Design Google Business scraper based on existing patterns
+THOROUGHNESS: Very Detailed (all major components covered)
+
+================================================================================
+1. OVERALL ARCHITECTURE FINDINGS
+================================================================================
+
+Two-Phase Architecture:
+├─ Phase 1: Discovery (Yellow Pages API queries)
+│  └─ Finds businesses → stores basic info → database insert
+│
+└─ Phase 2: Enrichment (Website scraping)
+   └─ Visit discovered sites → extract details → merge & update database
+
+Technology Stack:
+- Language: Python 3.12
+- Frontend: NiceGUI (web framework)
+- Backend: Flask REST API + custom BackendFacade
+- Database: PostgreSQL with SQLAlchemy ORM
+- Scraping: Playwright (headless browser) + requests + BeautifulSoup4
+- Deployment: systemd service + log rotation
+
+================================================================================
+2. FILE STRUCTURE (15 core directories/modules)
+================================================================================
+
+DISCOVERY PHASE:
+  scrape_yp/
+    ├─ yp_client.py (fetching + parsing single pages)
+    ├─ yp_client_playwright.py (Playwright-specific implementation)
+    └─ yp_crawl.py (multi-page orchestration)
+
+ENRICHMENT PHASE:
+  scrape_site/
+    ├─ site_scraper.py (multi-page website scraping)
+    └─ site_parse.py (content extraction + regex patterns)
+
+DATABASE LAYER:
+  db/
+    ├─ models.py (SQLAlchemy Company model + URL helpers)
+    ├─ save_discoveries.py (upsert logic)
+    └─ update_details.py (batch enrichment logic)
+
+WEB GUI:
+  niceui/
+    ├─ backend_facade.py (API bridge to scrapers)
+    ├─ pages/
+    │  ├─ discover.py (YP discovery UI with real-time progress)
+    │  ├─ scrape.py (enrichment UI)
+    │  ├─ single_url.py (preview/test scraping)
+    │  └─ dashboard.py, database.py, logs.py (utility pages)
+    └─ layout.py, main.py (app setup)
+
+ORCHESTRATION:
+  runner/
+    ├─ main.py (CLI entry point with --discover-only/--scrape-only/--auto modes)
+    └─ logging_setup.py (centralized logging with rotation)
+
+LEGACY:
+  gui_backend/ (Flask REST API - appears superseded by NiceGUI)
+
+================================================================================
+3. DISCOVERY WORKFLOW (Yellow Pages)
+================================================================================
+
+INPUT:
+  - Categories: ["pressure washing", "window cleaning", ...]
+  - States: ["TX", "CA", "FL", ...]
+  - Pages per pair: 1-50
+
+PROCESS:
+  1. crawl_all_states() - Generator pattern
+     └─ For each state:
+        └─ For each category:
+           └─ crawl_category_location() - Multi-page crawl
+              └─ For each page 1..max_pages:
+                 ├─ fetch_yp_search_page()
+                 │  - Uses requests library OR Playwright
+                 │  - Rate limit: 10s + ±20% jitter (8-12s actual)
+                 │  - Retries: 3 attempts with exponential backoff (2,4,8s)
+                 │  - Handles 429, 500+, timeouts, connection errors
+                 │  
+                 ├─ parse_yp_results()
+                 │  - Extract: name, phone, address, website, rating, reviews
+                 │  - Returns list of dicts
+                 │  
+                 ├─ De-duplicate by domain (seen_domains set)
+                 ├─ Normalize URLs (canonicalize_url, domain_from_url)
+                 └─ Check if last page
+           └─ State cooldown: 15-25 seconds
+
+  2. upsert_discovered() - Database operations
+     - Check: does website already exist?
+     - If YES: UPDATE (merge non-null fields)
+     - If NO: INSERT new record
+     - Return: (inserted_count, updated_count, skipped_count)
+
+OUTPUT:
+  - Companies stored in `companies` table
+  - CSV export: data/new_urls_TIMESTAMP.csv
+  - Summary: total_discovered, total_inserted, total_updated
+
+EXAMPLE RESULT:
+  For "pressure washing" + "TX" + 3 pages:
+  - Found: 150 businesses
+  - New: 120 (unique domains)
+  - Updated: 15 (duplicate URLs)
+  - Skipped: 15 (invalid/no website)
+  - Time: ~5 minutes
+
+================================================================================
+4. ENRICHMENT WORKFLOW (Website Scraping)
+================================================================================
+
+INPUT:
+  - Limit: 100 companies to process
+  - Stale days: 30 (consider company stale if last_updated > 30 days ago)
+  - Filter: only_missing_email (optional)
+
+PROCESS:
+  1. Query database:
+     - Companies with website AND (never updated OR stale OR missing email)
+     - Limit to N companies
+     - Order by: oldest first
+
+  2. For each company:
+     a. fetch_page(homepage, delay=0)
+        - Standard headers (User-Agent, Accept, DNT, etc.)
+        - 30-second timeout
+        - Error handling (no exception, just log & continue)
+
+     b. parse_site_content(html, base_url)
+        - Extract JSON-LD structured data
+        - Regex patterns:
+          * Phones: \d{3}[-.]?\d{3}[-.]?\d{4}
+          * Emails: \b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b
+          * Keywords: services, pressure, power, wash, window, deck, etc.
+          * Service area keywords: "service area", "serving", "coverage"
+        - Parse company name from HTML tags
+
+     c. discover_internal_links(html, base_url)
+        - Scan all links for keywords:
+          * Contact: ["contact", "contact-us", "get-in-touch"]
+          * About: ["about", "about-us", "who-we-are"]
+          * Services: ["services", "what-we-do", "solutions"]
+        - Return: {contact: url or None, about: url or None, services: url or None}
+
+     d. Fetch up to 3 additional pages (only if homepage missing info)
+        - Apply 2-second delay between page fetches
+        - Don't fetch if homepage has all needed fields
+
+     e. merge_results(homepage_result, additional_results, base_url)
+        - Phones: collect unique values
+        - Emails: prefer business domain emails first
+        - Services/address: use first non-null
+        - Reviews: use highest count
+
+     f. update_company_details(website)
+        - Query company by website
+        - Merge scraped data with existing record
+        - Only update fields with new non-null values
+        - Track which fields were updated (email, phone, services, etc.)
+        - Set last_updated timestamp
+        - Commit to database
+
+  3. Return summary:
+     {
+       'total_processed': 100,
+       'updated': 45,
+       'skipped': 50,  # no new data
+       'errors': 5,    # scraping/parsing failures
+       'fields_updated': {
+         'email': 25,
+         'phone': 30,
+         'services': 15,
+         'address': 12,
+         'service_area': 8
+       }
+     }
+
+================================================================================
+5. DATABASE SCHEMA (PostgreSQL)
+================================================================================
+
+TABLE: companies
+
+COLUMNS:
+  id (int, PK, autoincrement)
+  
+  name (text) - Business name
+  website (text, UNIQUE, INDEXED) - Canonical URL
+  domain (text, INDEXED) - example.com
+  
+  phone (text) - Normalized phone number
+  email (text) - Normalized email address
+  
+  services (text) - Services description
+  service_area (text) - Geographic service area
+  address (text) - Physical address
+  
+  source (varchar 50) - Data source: 'YP', 'Google', 'Manual'
+  rating_yp (float) - Yellow Pages rating (0-5)
+  rating_google (float) - Google rating (0-5)
+  reviews_yp (int) - YP review count
+  reviews_google (int) - Google review count
+  
+  active (bool, default=True) - Is company active
+  created_at (datetime, server_default=now()) - Creation timestamp
+  last_updated (datetime) - Last enrichment timestamp
+
+HELPER FUNCTIONS:
+  canonicalize_url(raw_url)
+    - Ensure https:// scheme
+    - Remove #fragment
+    - Remove trailing slash
+    - Remove www. subdomain
+    - Convert to lowercase
+    Example: "http://www.example.com/" → "https://example.com"
+
+  domain_from_url(url)
+    - Extract registered domain (uses tldextract library)
+    Example: "https://www.example.com/path" → "example.com"
+
+================================================================================
+6. GUI INTEGRATION (NiceGUI Frontend)
+================================================================================
+
+ENTRY POINT: niceui/main.py → http://localhost:8000
+
+PAGES:
+  discover.py
+    - Select categories (checkbox chips, all togglable)
+    - Select states (multiselect, "Select All"/"Clear All" buttons)
+    - Pages per pair slider (1-10)
+    - RUN/STOP buttons (stop disabled until running)
+    - Real-time progress bar
+    - Live log output (color-coded: blue=info, green=success, red=error)
+    - Stats card (found, new, updated, errors, pairs progress)
+    - Export new URLs button (CSV download)
+
+  scrape.py
+    - Configure limit, stale_days, only_missing_email
+    - RUN/STOP buttons
+    - Progress tracking
+    - Summary statistics
+
+  single_url.py
+    - Input field for URL
+    - "Preview" button (scrape without saving)
+    - Display extracted data
+    - "Save to database" button
+
+  dashboard.py
+    - Total companies count
+    - Companies by source (YP, Google, etc.)
+    - Completeness metrics (% with email, phone, etc.)
+
+  database.py
+    - Search/filter companies
+    - Display full details in modal
+    - Toggle active status
+
+  logs.py
+    - Real-time log viewer
+    - Filter by level (DEBUG, INFO, WARNING, ERROR)
+    - Download logs
+
+BACKEND FACADE (niceui/backend_facade.py):
+  Synchronous wrapper around async scrapers
+  
+  Key methods:
+    discover(categories, states, pages_per_pair, cancel_flag, progress_callback)
+      → Returns: {found, new, updated, errors, pairs_done, pairs_total}
+      → Callbacks: 'batch_start', 'batch_complete', 'batch_error', 'save_error'
+
+    scrape_batch(limit, stale_days, only_missing_email, cancel_flag, progress_callback)
+      → Returns: {processed, updated, skipped, errors}
+
+    scrape_one_preview(url)
+      → Returns: extracted data (no database save)
+
+    upsert_from_scrape(scrape_result)
+      → Save preview result to database
+
+COMMUNICATION:
+  NiceGUI Frontend (async) → run.io_bound() → BackendFacade (sync) 
+    → Scraper modules → progress_callback() → Frontend update (real-time)
+
+================================================================================
+7. LOGGING IMPLEMENTATION
+================================================================================
+
+SETUP (runner/logging_setup.py):
+  - Level: from LOG_LEVEL env var (default: INFO)
+  - Console: "LEVEL - MESSAGE" format
+  - File: "TIMESTAMP - NAME - LEVEL - MESSAGE" format
+  - Rotation: 10 MB max, keeps 5 backups
+  - Location: logs/{name}.log
+
+USAGE PATTERN:
+  from runner.logging_setup import get_logger
+  logger = get_logger("module_name")
+  logger.info("Starting discovery...")
+  logger.warning("Rate limited!")
+  logger.error("Failed!", exc_info=True)
+
+LOG FILES:
+  logs/main.log - CLI runner
+  logs/yp_crawl.log - Discovery
+  logs/site_scraper.log - Website scraping
+  logs/save_discoveries.log - Database ops
+  logs/update_details.log - Detail enrichment
+  logs/backend_facade.log - Frontend API calls
+
+ROTATION:
+  - Automatic when >10 MB
+  - Keeps 5 backups
+  - Can use systemd logrotate service
+
+================================================================================
+8. ANTI-BLOCKING STRATEGIES
+================================================================================
+
+CURRENTLY IMPLEMENTED (Free):
+
+1. Rate Limiting
+   - Base delay: 10 seconds between requests
+   - Jitter: ±20% randomization (8-12 seconds actual)
+   - State cooldown: 15-25 seconds between states
+   - Config: CRAWL_DELAY_SECONDS environment variable
+
+2. Browser Fingerprint Randomization (Playwright)
+   - Per request randomization:
+     * Viewports: 1920x1080, 1366x768, 1536x864, 1440x900
+     * User agents: Chrome, Firefox, Safari (multiple versions)
+     * Timezones: EST, CST, MST, PST
+     * Locales: en-US, en-GB, en-CA
+     * Device scale factors: 1, 1.5, 2
+   - Browser args:
+     * --disable-blink-features=AutomationControlled (hide webdriver)
+     * --disable-dev-shm-usage (reduce memory)
+     * --no-sandbox (sandbox mode)
+   - Init script: override navigator.webdriver property
+
+3. Human Behavior Simulation
+   - Random page wait: 1-3 seconds after load
+   - Scrolling: 2-4 random scroll actions
+   - Mouse movements: 2-4 random positions on page
+   - Movement delays: 50-200ms between actions
+
+4. Request Headers
+   - User-Agent: Realistic desktop browser string
+   - Accept-Language: Rotated (en-US, en-GB, es)
+   - DNT: 1 (Do Not Track)
+   - Accept-Encoding: gzip, deflate, br
+   - Connection: keep-alive
+   - Upgrade-Insecure-Requests: 1
+
+5. Retry Strategy
+   - Max retries: 3 attempts
+   - Exponential backoff: 2, 4, 8 seconds
+   - Triggers:
+     * 429 (Too Many Requests)
+     * 500+ (Server errors)
+     * Timeout
+     * Connection errors
+
+DOCUMENTED ADVANCED OPTIONS (Not implemented):
+  - Residential proxy rotation ($75-500/month)
+  - Distributed VPS network ($20-50/month)
+  - CAPTCHA solving services ($2-3/1000 solves)
+  - Scraping API services ($29-249/month)
+  See: ADVANCED_ANTI_BLOCKING.md
+
+================================================================================
+9. KEY EXECUTION FLOWS
+================================================================================
+
+FLOW 1: CLI Discovery
+  python runner/main.py --discover-only --categories "pressure washing" --states "TX,CA" --pages-per-state 3
+  ├─ Parse arguments
+  ├─ Initialize logger
+  ├─ crawl_all_states() generator
+  ├─ For each batch: upsert_discovered() → database
+  ├─ Export CSV: data/new_urls_TIMESTAMP.csv
+  └─ Print summary
+
+FLOW 2: NiceGUI Discovery
+  1. User configures in UI (categories, states, pages)
+  2. Click RUN button
+  3. Calls backend.discover() in I/O thread
+  4. Progress updates via callback (real-time)
+  5. UI updates: logs, stats, progress bar
+  6. Final summary on completion/cancel
+
+FLOW 3: Website Enrichment
+  1. Query database for stale/missing companies
+  2. For each company (up to limit):
+     a. Scrape website (homepage + up to 3 pages)
+     b. Parse extracted data
+     c. Merge with existing record
+     d. Update database (last_updated timestamp)
+  3. Track field updates (email: 25, phone: 30, etc.)
+  4. Return summary
+
+================================================================================
+10. DESIGN INSIGHTS FOR GOOGLE SCRAPER
+================================================================================
+
+WHAT TO REUSE:
+  ✓ Database schema (Company model is generic)
+  ✓ URL normalization (canonicalize_url, domain_from_url)
+  ✓ Website enrichment (site_scraper.py, site_parse.py work for any site)
+  ✓ Batch processing framework (update_batch pattern scales)
+  ✓ Logging infrastructure (logging_setup.py)
+  ✓ GUI framework (NiceGUI + BackendFacade)
+  ✓ Anti-blocking strategies (rate limiting, Playwright, retries)
+  ✓ Deployment setup (systemd, log rotation)
+
+WHAT TO CREATE:
+  ✗ Google client (equivalent to yp_client.py)
+    - Google Maps API integration
+    - Google Search SERP scraping
+    - Google Business Profile handling
+  
+  ✗ Google crawl orchestration (equivalent to yp_crawl.py)
+    - Location-based searches (coordinates/radius)
+    - Category search on Google
+    - Pagination handling
+  
+  ✗ Google-specific parsing
+    - Rating/review extraction
+    - Business hours parsing
+    - Photo/image handling
+
+INTEGRATION POINTS:
+  - Add google_source to Company.source field
+  - rating_google / reviews_google already in schema
+  - Create scrape_google/ directory parallel to scrape_yp/
+  - Extend BackendFacade with google_discover() method
+  - Add Google config to .env (API keys, budget limits)
+  - Parallel UI page (google_discover.py) with cost calculator
+
+================================================================================
+11. COST & PERFORMANCE ESTIMATES
+================================================================================
+
+YELLOW PAGES DISCOVERY:
+  - Time: ~3-4 hours for all 50 states × 10 categories
+  - Cost: Free
+  - Data: ~50,000-300,000 unique businesses
+  - Rate: ~10-20 businesses per state-category pair
+
+WEBSITE ENRICHMENT:
+  - Time: ~100 companies at 2s/company = 3-4 minutes
+  - Cost: Free (internal requests)
+  - Data enrichment:
+    * ~50% get email address
+    * ~80% get phone number
+    * ~70% get services description
+
+GOOGLE MAPS API (Recommended):
+  - Nearby Search: $7/1000 requests
+  - Place Details: $17/1000 requests
+  - Estimate: 50 states × 10 categories = 5,000 searches → $30-85/run
+  - Monthly (2-3x/week): $200-300
+
+================================================================================
+12. DOCUMENTED FILES CREATED
+================================================================================
+
+Two comprehensive guides have been created:
+
+1. WASHDB_BOT_SCRAPER_ARCHITECTURE.md (780 lines, 26 KB)
+   - Complete architecture breakdown
+   - File structure and components
+   - YP discovery workflow (Phase 1)
+   - Website enrichment workflow (Phase 2)
+   - Database schema details
+   - GUI integration points
+   - Logging implementation
+   - Anti-blocking strategies
+   - Data flow diagrams
+   - Key execution flows
+   - Integration considerations for Google scraper
+
+2. GOOGLE_SCRAPER_DESIGN_GUIDE.md (668 lines, 19 KB)
+   - Three implementation approaches (API vs scraping)
+   - Recommended approach: Google Maps API
+   - Cost-benefit analysis
+   - Implementation roadmap (4 phases)
+   - Database field mappings
+   - BackendFacade integration
+   - Migration strategies
+   - Complete code examples
+
+Location: /home/rivercityscrape/URL-Scrape-Bot/
+
+================================================================================
+SUMMARY: KEY FINDINGS
+================================================================================
+
+STRENGTHS OF CURRENT ARCHITECTURE:
+  + Modular two-phase design (discovery + enrichment)
+  + Sophisticated anti-bot measures (fingerprinting, human behavior sim)
+  + Real-time GUI with progress tracking
+  + Generic database schema works for any source
+  + Clean separation of concerns (scraping, parsing, DB, UI)
+  + Comprehensive logging and monitoring
+  + Flexible CLI + GUI execution modes
+  + Built-in URL normalization and de-duplication
+
+AREAS FOR GOOGLE INTEGRATION:
+  + Can be added as parallel module (scrape_google/)
+  + Reuse 90% of infrastructure
+  + Main new work: Google-specific client code
+  + Database schema already supports multiple sources
+  + GUI framework scales easily
+
+COMPLEXITY NOTES:
+  - YP scraping: Moderate (HTML parsing, pagination)
+  - Google API: Lower (structured data, official support)
+  - Website enrichment: Moderate-High (multi-page, regex patterns, merging)
+  - Integration: Low-Moderate (follow existing patterns)
+
+RECOMMENDATIONS FOR GOOGLE SCRAPER:
+  1. Use Google Maps API (most reliable, ~$30-50/month)
+  2. Create scrape_google/ directory parallel to scrape_yp/
+  3. Follow yp_crawl.py pattern for orchestration
+  4. Leverage existing BackendFacade and database
+  5. Add google_discover page to GUI
+  6. Reuse website enrichment phase (site_scraper.py)
+  7. Plan for API cost budgeting in UI
+
+================================================================================
+END OF SUMMARY
+================================================================================

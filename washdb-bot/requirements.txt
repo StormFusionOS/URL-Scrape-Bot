@@ -1,8 +1,26 @@
-# Core dependencies for washdb-bot
-sqlalchemy>=2.0.0
-psycopg[binary]>=3.0.0
-requests>=2.31.0
+# ===== CORE DATABASE & ORM =====
+sqlalchemy>=2.0.0,<3.0.0
+psycopg[binary]>=3.0.0,<4.0.0
+
+# ===== WEB SCRAPING =====
+requests>=2.31.0,<3.0.0
 beautifulsoup4>=4.12.0
 lxml>=4.9.0
+playwright>=1.40.0
+playwright-stealth>=1.0.0
+
+# ===== UTILITIES =====
 python-dotenv>=1.0.0
 tldextract>=5.0.0
+
+# ===== SCHEDULING & BACKGROUND JOBS =====
+APScheduler>=3.10.0,<4.0.0
+
+# ===== GUI & DASHBOARD =====
+nicegui>=1.4.0
+flask>=2.3.0,<4.0.0
+flask-cors>=4.0.0
+
+# ===== PROCESS MANAGEMENT (cross-platform) =====
+# Used for cross-platform process management in GUI and scripts
+psutil>=5.9.0

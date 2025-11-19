@@ -171,6 +171,21 @@ def upsert_discovered(companies: list[dict]) -> tuple[int, int, int]:
                 phone = normalize_phone(company_data.get("phone"))
                 email = normalize_email(company_data.get("email"))
 
+                # Build parse_metadata JSON for traceability
+                parse_metadata = {}
+                if company_data.get("profile_url"):
+                    parse_metadata["profile_url"] = company_data["profile_url"]
+                if company_data.get("category_tags"):
+                    parse_metadata["category_tags"] = company_data["category_tags"]
+                if company_data.get("is_sponsored") is not None:
+                    parse_metadata["is_sponsored"] = company_data["is_sponsored"]
+                if company_data.get("filter_score") is not None:
+                    parse_metadata["filter_score"] = company_data["filter_score"]
+                if company_data.get("filter_reason"):
+                    parse_metadata["filter_reason"] = company_data["filter_reason"]
+                if company_data.get("source_page_url"):
+                    parse_metadata["source_page_url"] = company_data["source_page_url"]
+
                 # Check if company already exists by canonical website
                 stmt = select(Company).where(Company.website == canonical_website)
                 existing = session.execute(stmt).scalar_one_or_none()
@@ -223,6 +238,23 @@ def upsert_discovered(companies: list[dict]) -> tuple[int, int, int]:
                         existing.reviews_google = company_data["reviews_google"]
                         updated_fields.append("reviews_google")
 
+                    if company_data.get("rating_ha") is not None:
+                        existing.rating_ha = company_data["rating_ha"]
+                        updated_fields.append("rating_ha")
+
+                    if company_data.get("reviews_ha") is not None:
+                        existing.reviews_ha = company_data["reviews_ha"]
+                        updated_fields.append("reviews_ha")
+
+                    # Update parse_metadata (merge with existing if present)
+                    if parse_metadata:
+                        if existing.parse_metadata:
+                            # Merge: new metadata takes precedence
+                            existing.parse_metadata = {**existing.parse_metadata, **parse_metadata}
+                        else:
+                            existing.parse_metadata = parse_metadata
+                        updated_fields.append("parse_metadata")
+
                     # Always set active=True
                     existing.active = True
 
@@ -251,6 +283,9 @@ def upsert_discovered(companies: list[dict]) -> tuple[int, int, int]:
                         reviews_yp=company_data.get("reviews_yp"),
                         rating_google=company_data.get("rating_google"),
                         reviews_google=company_data.get("reviews_google"),
+                        rating_ha=company_data.get("rating_ha"),
+                        reviews_ha=company_data.get("reviews_ha"),
+                        parse_metadata=parse_metadata if parse_metadata else None,
                         active=True,
                     )
 

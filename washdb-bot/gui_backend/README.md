@@ -1,4 +1,16 @@
-# Washdb-Bot GUI Backend
+# ⚠️ DEPRECATED: Washdb-Bot GUI Backend
+
+> **This module is deprecated and no longer maintained.**
+>
+> The Flask-based backend has been replaced by the **NiceGUI** web interface located in `niceui/`.
+>
+> This folder is kept for reference only and is not included in the project packaging.
+>
+> **Use `python -m niceui.main` to start the active web interface instead.**
+
+---
+
+## Original Documentation (for reference)
 
 Backend API server for controlling and monitoring the washdb-bot scraper.
 

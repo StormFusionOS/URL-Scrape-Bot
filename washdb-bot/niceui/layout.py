@@ -56,17 +56,66 @@ class AppLayout:
             pass
         return "1.0.0"
 
+    def _toggle_drawer(self):
+        """Toggle the navigation drawer."""
+        if self.drawer:
+            self.drawer.toggle()
+
     def create_header(self):
         """Create application header."""
+        # Add Socket.IO client-side JavaScript for real-time updates
+        ui.add_head_html('''
+            <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+            <script>
+                // Initialize Socket.IO connection
+                const socket = io({
+                    path: '/socket.io/',
+                    transports: ['websocket', 'polling']
+                });
+
+                socket.on('connect', () => {
+                    console.log('Socket.IO connected:', socket.id);
+
+                    // Subscribe to SEO Intelligence events
+                    socket.emit('subscribe', {
+                        events: [
+                            'job_started',
+                            'job_completed',
+                            'job_failed',
+                            'new_error',
+                            'critical_error',
+                            'new_warning',
+                            'crawler_status_change'
+                        ]
+                    });
+                });
+
+                socket.on('disconnect', () => {
+                    console.log('Socket.IO disconnected');
+                });
+
+                socket.on('connection_established', (data) => {
+                    console.log('Connection established:', data);
+                });
+
+                socket.on('subscribed', (data) => {
+                    console.log('Subscribed to events:', data.events);
+                });
+
+                // Make socket available globally for pages to use
+                window.seoSocket = socket;
+            </script>
+        ''')
+
         with ui.header().classes('items-center').style(
             f'background-color: {COLORS["primary"]}; padding: 0.5rem 1rem;'
         ) as self.header_element:
 
             # Menu button for drawer
-            ui.button(icon='menu', on_click=lambda: self.drawer.toggle()).props('flat color=white')
+            ui.button(icon='menu', on_click=self._toggle_drawer).props('flat color=white')
 
             # App title
-            ui.label('Washdb-Bot Dashboard').classes('text-xl font-bold ml-2')
+            ui.label('StormFusion OS URL').classes('text-xl font-bold ml-2')
 
             # Environment badge
             ui.badge('DEV', color='accent').classes('ml-2')
@@ -87,25 +136,41 @@ class AppLayout:
 
     def create_drawer(self):
         """Create left navigation drawer."""
-        with ui.left_drawer(value=True, elevated=True).style(
-            f'background-color: {COLORS["dark"]};'
+        with ui.left_drawer(
+            value=False,  # Start closed to avoid overlay
+            elevated=True,
+            fixed=False,  # Not fixed position
+            bordered=True
+        ).style(
+            f'background-color: {COLORS["dark"]}; width: 250px;'
         ).classes('q-pa-md') as self.drawer:
 
             ui.label('Navigation').classes('text-lg font-bold mb-4')
 
-            # Navigation items
+            # Washbot navigation items
+            ui.label('WASHBOT').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
             nav_items = [
                 {'name': 'Dashboard', 'icon': 'dashboard', 'page': 'dashboard'},
                 {'name': 'Discover', 'icon': 'search', 'page': 'discover'},
-                {'name': 'Scrape', 'icon': 'data_usage', 'page': 'scrape'},
-                {'name': 'Single URL', 'icon': 'link', 'page': 'single_url'},
                 {'name': 'Database', 'icon': 'storage', 'page': 'database'},
-                {'name': 'Logs', 'icon': 'article', 'page': 'logs'},
+                {'name': 'Scheduler', 'icon': 'schedule', 'page': 'scheduler'},
                 {'name': 'Status', 'icon': 'timeline', 'page': 'status'},
                 {'name': 'Settings', 'icon': 'settings', 'page': 'settings'},
             ]
-
             for item in nav_items:
+                self._create_nav_item(item['name'], item['icon'], item['page'])
+
+            # SEO Intelligence navigation items
+            ui.separator().classes('my-2')
+            ui.label('SEO INTELLIGENCE').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
+            seo_items = [
+                {'name': 'SEO Database', 'icon': 'storage', 'page': 'seo_database'},
+                {'name': 'Run Scraper', 'icon': 'play_circle', 'page': 'seo_scraper'},
+                {'name': 'Scraped Data', 'icon': 'analytics', 'page': 'seo_data'},
+                {'name': 'DB Sync', 'icon': 'sync', 'page': 'washdb_sync'},
+                {'name': 'Competitors', 'icon': 'business', 'page': 'competitors'},
+            ]
+            for item in seo_items:
                 self._create_nav_item(item['name'], item['icon'], item['page'])
 
     def _create_nav_item(self, name: str, icon: str, page: str):
@@ -135,23 +200,37 @@ class AppLayout:
         """Create drawer content (called when refreshing)."""
         ui.label('Navigation').classes('text-lg font-bold mb-4')
 
+        # Washbot navigation items
+        ui.label('WASHBOT').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
         nav_items = [
             {'name': 'Dashboard', 'icon': 'dashboard', 'page': 'dashboard'},
             {'name': 'Discover', 'icon': 'search', 'page': 'discover'},
-            {'name': 'Scrape', 'icon': 'data_usage', 'page': 'scrape'},
-            {'name': 'Single URL', 'icon': 'link', 'page': 'single_url'},
             {'name': 'Database', 'icon': 'storage', 'page': 'database'},
+            {'name': 'Scheduler', 'icon': 'schedule', 'page': 'scheduler'},
             {'name': 'Logs', 'icon': 'article', 'page': 'logs'},
             {'name': 'Status', 'icon': 'timeline', 'page': 'status'},
             {'name': 'Settings', 'icon': 'settings', 'page': 'settings'},
         ]
-
         for item in nav_items:
+            self._create_nav_item(item['name'], item['icon'], item['page'])
+
+        # SEO Intelligence navigation items
+        ui.separator().classes('my-2')
+        ui.label('SEO INTELLIGENCE').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
+        seo_items = [
+            {'name': 'SEO Database', 'icon': 'storage', 'page': 'seo_database'},
+            {'name': 'Run Scraper', 'icon': 'play_circle', 'page': 'seo_scraper'},
+            {'name': 'Scraped Data', 'icon': 'analytics', 'page': 'seo_data'},
+            {'name': 'DB Sync', 'icon': 'sync', 'page': 'washdb_sync'},
+            {'name': 'Competitors', 'icon': 'business', 'page': 'competitors'},
+        ]
+        for item in seo_items:
             self._create_nav_item(item['name'], item['icon'], item['page'])
 
     def create_content_area(self):
         """Create main content area."""
-        self.content_area = ui.column().classes('w-full p-4')
+        # Add proper spacing to avoid overlap with drawer
+        self.content_area = ui.column().classes('w-full p-4').style('max-width: 100%;')
         return self.content_area
 
     def create_footer(self):
@@ -161,7 +240,7 @@ class AppLayout:
         ) as self.footer_element:
 
             # Version info
-            ui.label(f'Washdb-Bot v{self.version} | Powered by NiceGUI').classes('text-sm text-gray-400')
+            ui.label(f'Washdb-Bot v{self.version}').classes('text-sm text-gray-400')
 
             ui.space()
 
@@ -216,3 +295,35 @@ class AppLayout:
 
 # Global layout instance
 layout = AppLayout()
+
+# SEO Intelligence page layout helper
+from contextlib import contextmanager
+from typing import Optional
+
+@contextmanager
+def page_layout(
+    title: str,
+    subtitle: Optional[str] = None,
+    show_refresh: bool = True,
+    refresh_callback: Optional[callable] = None
+):
+    """
+    Create a standard page layout with header and content area
+    (Compatible with SEO Intelligence pages)
+    """
+    with ui.column().classes('w-full h-full gap-6 p-6'):
+        # Page header
+        with ui.row().classes('items-center justify-between w-full'):
+            with ui.column().classes('gap-1'):
+                ui.label(title).classes('text-3xl font-bold')
+                if subtitle:
+                    ui.label(subtitle).classes('text-sm text-gray-400')
+
+            if show_refresh:
+                refresh_btn = ui.button(icon='refresh', on_click=refresh_callback or (lambda: ui.notify('Refreshed!')))
+                refresh_btn.props('flat round')
+                refresh_btn.classes('hover:rotate-180 transition-transform duration-500')
+
+        # Content area
+        with ui.column().classes('w-full gap-4'):
+            yield

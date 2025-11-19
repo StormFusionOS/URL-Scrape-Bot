@@ -1,5 +1,37 @@
 #!/usr/bin/env python3
 """
+⚠️ DEPRECATED: Washdb-Bot NiceGUI Dashboard (Legacy)
+
+This is an old prototype of the NiceGUI interface.
+It has been replaced by the production NiceGUI interface in niceui/.
+
+Use instead:
+    python -m niceui.main
+
+This file is kept for reference only.
+"""
+
+# Exit immediately if run directly
+if __name__ == '__main__':
+    print("=" * 70)
+    print("⚠️  DEPRECATED: gui_backend/nicegui_app.py")
+    print("=" * 70)
+    print()
+    print("This is an old prototype. Use the production interface instead:")
+    print()
+    print("  cd /home/rivercityscrape/URL-Scrape-Bot/washdb-bot")
+    print("  source venv/bin/activate")
+    print("  python -m niceui.main")
+    print()
+    print("Or use: ./restart_dashboard.sh")
+    print()
+    print("=" * 70)
+    import sys
+    sys.exit(1)
+
+# Original code (disabled for reference)
+"""
+ORIGINAL DOCSTRING:
 Washdb-Bot NiceGUI Dashboard
 Modern web interface for controlling and monitoring the washdb-bot scraper.
 

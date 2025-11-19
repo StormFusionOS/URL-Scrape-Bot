@@ -11,12 +11,20 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 # Import actual scraper modules
-from scrape_yp.yp_crawl import crawl_all_states, CATEGORIES as DEFAULT_CATEGORIES, STATES as DEFAULT_STATES
+# NOTE: YP scraper now uses city-first approach via CLI subprocess (see niceui/pages/discover.py)
+# from scrape_yp.yp_crawl import crawl_all_states, CATEGORIES as DEFAULT_CATEGORIES, STATES as DEFAULT_STATES
 from scrape_site.site_scraper import scrape_website
 from db.save_discoveries import upsert_discovered, create_session
 from db.update_details import update_batch
 from db.models import Company, canonicalize_url, domain_from_url
 from runner.logging_setup import get_logger
+
+# Import Google scraper modules
+from scrape_google.google_crawl import GoogleCrawler
+from scrape_google.google_config import GoogleConfig
+from scrape_google.google_crawl_city_first import crawl_city_targets
+from scrape_google.generate_city_targets import load_categories, generate_targets
+import asyncio
 
 # SQLAlchemy imports for queries
 from sqlalchemy import select, func, or_, and_
@@ -38,16 +46,26 @@ class BackendFacade:
         categories: List[str],
         states: List[str],
         pages_per_pair: int,
-        cancel_flag: Optional[Callable[[], bool]] = None
+        cancel_flag: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable[[dict], None]] = None,
+        providers: List[str] = None,
+        use_enhanced_filter: bool = True,
+        min_score: float = 50.0,
+        include_sponsored: bool = False
     ) -> Dict[str, int]:
         """
-        Run YP discovery across category×state with pagination and dedup.
+        Run multi-provider discovery across category×state with pagination and dedup.
 
         Args:
-            categories: List of business categories to search
+            categories: List of business categories to search (optional, uses provider defaults)
             states: List of state codes to search
-            pages_per_pair: Number of pages to crawl per category-state pair
+            pages_per_pair: Search depth (number of result pages per category-state search)
             cancel_flag: Optional callable that returns True to cancel operation
+            progress_callback: Optional callable to receive progress updates
+            providers: List of provider codes to use (e.g., ["YP"]). Default: ["YP"]
+            use_enhanced_filter: Use enhanced YP filtering with category tags (default: False)
+            min_score: Minimum confidence score for enhanced filter (0-100, default: 50)
+            include_sponsored: Include sponsored/ad listings with enhanced filter (default: False)
 
         Returns:
             Dict with keys:
@@ -58,18 +76,32 @@ class BackendFacade:
             - pairs_done: Number of category-state pairs completed
             - pairs_total: Total number of pairs to process
         """
-        logger.info(
-            f"Starting discovery: {len(categories)} categories × {len(states)} states "
-            f"× {pages_per_pair} pages/each"
-        )
+        # Default to YP only for backward compatibility
+        if providers is None:
+            providers = ["YP"]
 
-        # Use defaults if not provided
+        # Determine which providers to use
+        use_yp = "YP" in providers
+
+        # Build category list from providers if not specified
         if not categories:
-            categories = DEFAULT_CATEGORIES[:3]  # Use first 3 for reasonable scope
+            categories = []
+            if use_yp:
+                categories.extend(DEFAULT_CATEGORIES[:3])  # Use first 3 for reasonable scope
+
+        # Use default states if not provided
         if not states:
             states = DEFAULT_STATES
 
-        total_pairs = len(categories) * len(states)
+        logger.info(
+            f"Starting multi-provider discovery: providers={providers}, "
+            f"{len(categories)} categories × {len(states)} states × {pages_per_pair} pages/each"
+        )
+
+        # Calculate total based on provider-specific categories
+        yp_categories = [c for c in categories if c in DEFAULT_CATEGORIES] if use_yp else []
+        total_pairs = len(yp_categories) * len(states)
+
         pairs_done = 0
         total_found = 0
         total_new = 0
@@ -77,28 +109,103 @@ class BackendFacade:
         total_errors = 0
 
         try:
-            # Iterate through all category-state combinations
-            for batch in crawl_all_states(
-                categories=categories,
-                states=states,
-                limit_per_state=pages_per_pair
-            ):
+            # Create page callback for YP crawling
+            # Store current category and state to use in page callback
+            current_context = {'category': '', 'state': ''}
+
+            def page_callback(page, total_pages, new_results, total_results):
+                """Send page-level progress updates to UI."""
+                if progress_callback:
+                    progress_callback({
+                        'type': 'page_complete',
+                        'page': page,
+                        'total_pages': total_pages,
+                        'new_results': new_results,
+                        'total_results': total_results,
+                        'category': current_context['category'],
+                        'state': current_context['state']
+                    })
+                # Return cancellation check
+                if cancel_flag and cancel_flag():
+                    return True
+                return False
+
+            # Create generators for each provider
+            generators = []
+
+            # NOTE: YP scraper now uses city-first approach via CLI subprocess
+            # The GUI calls cli_crawl_yp.py directly (see niceui/pages/discover.py)
+            # Old state-first code has been removed.
+            if use_yp and yp_categories:
+                logger.warning(
+                    "YP scraper is now city-first and uses CLI subprocess. "
+                    "Please use the Discovery page in the GUI to run YP scraping."
+                )
+                # Skip YP in this legacy backend facade method
+
+            # Chain generators together to process sequentially
+            import itertools
+            combined_generator = itertools.chain(*generators)
+
+            # Iterate through all category-state combinations from all providers
+            for batch in combined_generator:
                 # Check for cancellation
                 if cancel_flag and cancel_flag():
                     logger.warning("Discovery cancelled by user")
+                    if progress_callback:
+                        progress_callback({
+                            'type': 'cancelled',
+                            'pairs_done': pairs_done,
+                            'pairs_total': total_pairs
+                        })
                     break
 
                 pairs_done += 1
+
+                # Get category and state from batch metadata if available
+                category = batch.get("category", "")
+                state = batch.get("state", "")
+
+                # Update context for page callback
+                current_context['category'] = category
+                current_context['state'] = state
+
+                # Report progress: starting batch
+                if progress_callback:
+                    progress_callback({
+                        'type': 'batch_start',
+                        'pairs_done': pairs_done,
+                        'pairs_total': total_pairs,
+                        'category': category,
+                        'state': state
+                    })
 
                 # Check if batch has results
                 if batch.get("error"):
                     total_errors += 1
                     logger.warning(f"Error in batch {pairs_done}/{total_pairs}: {batch['error']}")
+                    if progress_callback:
+                        progress_callback({
+                            'type': 'batch_error',
+                            'pairs_done': pairs_done,
+                            'pairs_total': total_pairs,
+                            'category': category,
+                            'state': state,
+                            'error': batch['error']
+                        })
                     continue
 
                 results = batch.get("results", [])
                 if not results:
                     logger.info(f"No results in batch {pairs_done}/{total_pairs}")
+                    if progress_callback:
+                        progress_callback({
+                            'type': 'batch_empty',
+                            'pairs_done': pairs_done,
+                            'pairs_total': total_pairs,
+                            'category': category,
+                            'state': state
+                        })
                     continue
 
                 total_found += len(results)
@@ -114,9 +221,39 @@ class BackendFacade:
                         f"{len(results)} found, {inserted} new, {updated} updated"
                     )
 
+                    # Report progress: batch complete
+                    if progress_callback:
+                        should_stop = progress_callback({
+                            'type': 'batch_complete',
+                            'pairs_done': pairs_done,
+                            'pairs_total': total_pairs,
+                            'category': category,
+                            'state': state,
+                            'found': len(results),
+                            'new': inserted,
+                            'updated': updated,
+                            'total_found': total_found,
+                            'total_new': total_new,
+                            'total_updated': total_updated,
+                            'total_errors': total_errors
+                        })
+                        # Stop if progress callback requests it
+                        if should_stop:
+                            logger.warning("Discovery cancelled by progress callback")
+                            break
+
                 except Exception as e:
                     total_errors += 1
                     logger.error(f"Error saving batch {pairs_done}: {e}", exc_info=True)
+                    if progress_callback:
+                        progress_callback({
+                            'type': 'save_error',
+                            'pairs_done': pairs_done,
+                            'pairs_total': total_pairs,
+                            'category': category,
+                            'state': state,
+                            'error': str(e)
+                        })
                     continue
 
         except Exception as e:
@@ -134,6 +271,450 @@ class BackendFacade:
 
         logger.info(f"Discovery complete: {result}")
         return result
+
+    def discover_google(
+        self,
+        query: str,
+        location: str = None,
+        max_results: int = 20,
+        scrape_details: bool = True,
+        cancel_flag: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable[[dict], None]] = None
+    ) -> Dict[str, Any]:
+        """
+        Run Google Maps discovery and scraping.
+
+        Args:
+            query: Search query (e.g., "car wash")
+            location: Location (e.g., "Seattle, WA")
+            max_results: Maximum results to scrape
+            scrape_details: Whether to scrape detailed info for each business
+            cancel_flag: Optional callable that returns True to cancel operation
+            progress_callback: Optional callable to receive progress updates
+
+        Returns:
+            Dict with keys:
+            - success: Boolean indicating if operation completed successfully
+            - found: Total businesses found
+            - saved: Businesses saved to database
+            - duplicates: Duplicates skipped
+            - errors: Number of errors encountered
+            - results: List of scraped business data
+        """
+        logger.info(
+            f"Starting Google discovery: query='{query}', location='{location}', "
+            f"max_results={max_results}, scrape_details={scrape_details}"
+        )
+
+        # Create Google config (can be customized via environment variables)
+        config = GoogleConfig.from_env()
+
+        # Create crawler with progress tracking
+        crawler = GoogleCrawler(config=config, logger=None)
+
+        # Set up progress callback wrapper
+        def google_progress_callback(status: str, message: str, stats: Dict):
+            """Wrapper to adapt GoogleCrawler progress to GUI format."""
+            if cancel_flag and cancel_flag():
+                # Cancellation is handled by the async task
+                logger.warning("Google discovery cancelled by user")
+                return
+
+            if progress_callback:
+                progress_callback({
+                    'type': status,
+                    'message': message,
+                    'found': stats.get('businesses_found', 0),
+                    'saved': stats.get('businesses_saved', 0),
+                    'duplicates': stats.get('duplicates_skipped', 0),
+                    'errors': stats.get('errors', 0)
+                })
+
+        crawler.set_progress_callback(google_progress_callback)
+
+        # Run the async scraping operation
+        try:
+            # Create async task
+            result = asyncio.run(crawler.search_and_save(
+                query=query,
+                location=location,
+                max_results=max_results,
+                scrape_details=scrape_details
+            ))
+
+            logger.info(f"Google discovery complete: {result}")
+            return result
+
+        except Exception as e:
+            logger.error(f"Google discovery error: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+                "found": 0,
+                "saved": 0,
+                "duplicates": 0,
+                "errors": 1
+            }
+
+    def discover_google_city_first(
+        self,
+        state_ids: List[str],
+        max_targets: Optional[int] = None,
+        scrape_details: bool = True,
+        save_to_db: bool = True,
+        cancel_flag: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable[[dict], None]] = None
+    ) -> Dict[str, Any]:
+        """
+        Run Google Maps city-first discovery across all targets in specified states.
+
+        This method uses the city × category expansion approach to systematically
+        scrape Google Maps for businesses in each city-category combination.
+
+        Args:
+            state_ids: List of 2-letter state codes (e.g., ['RI', 'MA'])
+            max_targets: Maximum number of targets to process (None = all)
+            scrape_details: Whether to scrape detailed business info
+            save_to_db: Whether to save results to database
+            cancel_flag: Optional callable that returns True to cancel operation
+            progress_callback: Optional callable to receive progress updates
+
+        Returns:
+            Dict with keys:
+            - success: Boolean indicating if operation completed successfully
+            - targets_processed: Number of targets completed
+            - total_businesses: Total businesses found across all targets
+            - saved: Businesses saved to database
+            - duplicates: Duplicates skipped
+            - captchas: Number of CAPTCHAs detected
+            - errors: Number of errors encountered
+        """
+        logger.info(
+            f"Starting Google city-first discovery: states={state_ids}, "
+            f"max_targets={max_targets}, scrape_details={scrape_details}"
+        )
+
+        # Create database session
+        session = create_session()
+
+        try:
+            # Track overall stats
+            total_targets = 0
+            total_businesses = 0
+            total_saved = 0
+            total_duplicates = 0
+            total_captchas = 0
+            total_errors = 0
+
+            # Run async crawler
+            async def run_crawler():
+                nonlocal total_targets, total_businesses, total_saved, total_duplicates, total_captchas, total_errors
+
+                async for batch in crawl_city_targets(
+                    state_ids=state_ids,
+                    session=session,
+                    max_targets=max_targets,
+                    scrape_details=scrape_details,
+                    save_to_db=save_to_db,
+                    use_session_breaks=True,
+                    checkpoint_interval=10,
+                    recover_orphans=True
+                ):
+                    # Check for cancellation
+                    if cancel_flag and cancel_flag():
+                        logger.warning("Google city-first discovery cancelled by user")
+                        break
+
+                    # Extract batch data
+                    target = batch['target']
+                    results = batch['results']
+                    stats = batch['stats']
+
+                    # Update totals
+                    total_targets += 1
+                    total_businesses += stats['total_found']
+                    total_saved += stats['total_saved']
+                    total_duplicates += stats['duplicates_skipped']
+                    if stats.get('captcha_detected'):
+                        total_captchas += 1
+
+                    # Send progress update
+                    if progress_callback:
+                        progress_callback({
+                            'type': 'progress',
+                            'message': f"Completed: {target.city}, {target.state_id} - {target.category_label}",
+                            'target': f"{target.city} - {target.category_label}",
+                            'found': stats['total_found'],
+                            'saved': stats['total_saved'],
+                            'duplicates': stats['duplicates_skipped'],
+                            'captcha': stats.get('captcha_detected', False),
+                            'total_targets': total_targets,
+                            'total_businesses': total_businesses,
+                            'total_saved': total_saved,
+                            'total_duplicates': total_duplicates,
+                            'total_captchas': total_captchas
+                        })
+
+            # Run the crawler
+            asyncio.run(run_crawler())
+
+            # Final result
+            result = {
+                "success": True,
+                "targets_processed": total_targets,
+                "total_businesses": total_businesses,
+                "saved": total_saved,
+                "duplicates": total_duplicates,
+                "captchas": total_captchas,
+                "errors": total_errors
+            }
+
+            logger.info(f"Google city-first discovery complete: {result}")
+            return result
+
+        except Exception as e:
+            logger.error(f"Google city-first discovery error: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+                "targets_processed": 0,
+                "total_businesses": 0,
+                "saved": 0,
+                "duplicates": 0,
+                "captchas": 0,
+                "errors": 1
+            }
+        finally:
+            session.close()
+
+    def get_google_target_stats(self, state_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Get statistics about Google Maps city-first targets.
+
+        Args:
+            state_ids: Optional list of state codes to filter by
+
+        Returns:
+            Dict with target statistics by status and priority
+        """
+        from db.models import GoogleTarget
+
+        session = create_session()
+        try:
+            query = session.query(GoogleTarget)
+            if state_ids:
+                query = query.filter(GoogleTarget.state_id.in_(state_ids))
+
+            total = query.count()
+
+            # Get counts by status
+            by_status = {}
+            for status in ["PLANNED", "IN_PROGRESS", "DONE", "FAILED"]:
+                count = query.filter(GoogleTarget.status == status).count()
+                if count > 0:
+                    by_status[status] = count
+
+            # Get counts by priority
+            by_priority = {}
+            for priority in [1, 2, 3]:
+                count = query.filter(GoogleTarget.priority == priority).count()
+                if count > 0:
+                    by_priority[priority] = count
+
+            return {
+                "total": total,
+                "by_status": by_status,
+                "by_priority": by_priority,
+                "states": state_ids if state_ids else "all"
+            }
+        finally:
+            session.close()
+
+    def get_bing_target_stats(self, state_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Get statistics about Bing Local city-first targets.
+
+        Args:
+            state_ids: Optional list of state codes to filter by
+
+        Returns:
+            Dict with target statistics by status and priority
+        """
+        from db.models import BingTarget
+
+        session = create_session()
+        try:
+            query = session.query(BingTarget)
+            if state_ids:
+                query = query.filter(BingTarget.state_id.in_(state_ids))
+
+            total = query.count()
+
+            # Get counts by status
+            by_status = {}
+            for status in ["PLANNED", "IN_PROGRESS", "DONE", "FAILED"]:
+                count = query.filter(BingTarget.status == status).count()
+                if count > 0:
+                    by_status[status] = count
+
+            # Get counts by priority
+            by_priority = {}
+            for priority in [1, 2, 3]:
+                count = query.filter(BingTarget.priority == priority).count()
+                if count > 0:
+                    by_priority[priority] = count
+
+            return {
+                "total": total,
+                "by_status": by_status,
+                "by_priority": by_priority,
+                "states": state_ids if state_ids else "all"
+            }
+        finally:
+            session.close()
+
+    def get_discovery_source_statuses(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Get comprehensive status for all discovery sources.
+
+        Returns:
+            Dict with status for each source (YP, Google, Bing, Site):
+            {
+                'YP': {
+                    'is_running': bool,
+                    'active_count': int,
+                    'pending_count': int,
+                    'done_count': int,
+                    'failed_count': int,
+                    'last_run': {'timestamp': str, 'city': str, 'category': str} or None
+                },
+                'Google': {...},
+                'Bing': {...},
+                'Site': {...}
+            }
+        """
+        from db.models import YPTarget, GoogleTarget, BingTarget
+        from sqlalchemy import func, desc
+        from datetime import datetime
+
+        session = create_session()
+        statuses = {}
+
+        try:
+            # ===== YP (Yellow Pages) Status =====
+            yp_in_progress = session.query(func.count(YPTarget.id)).filter(
+                YPTarget.status == 'in_progress'
+            ).scalar() or 0
+
+            yp_planned = session.query(func.count(YPTarget.id)).filter(
+                YPTarget.status == 'planned'
+            ).scalar() or 0
+
+            yp_done = session.query(func.count(YPTarget.id)).filter(
+                YPTarget.status == 'done'
+            ).scalar() or 0
+
+            yp_failed = session.query(func.count(YPTarget.id)).filter(
+                YPTarget.status == 'failed'
+            ).scalar() or 0
+
+            # Get last completed YP target
+            yp_last = session.query(YPTarget).filter(
+                YPTarget.status == 'done',
+                YPTarget.finished_at.isnot(None)
+            ).order_by(desc(YPTarget.finished_at)).first()
+
+            statuses['YP'] = {
+                'is_running': yp_in_progress > 0,
+                'active_count': yp_in_progress,
+                'pending_count': yp_planned,
+                'done_count': yp_done,
+                'failed_count': yp_failed,
+                'last_run': {
+                    'timestamp': yp_last.finished_at.isoformat() if yp_last.finished_at else None,
+                    'city': yp_last.city,
+                    'category': yp_last.category_label
+                } if yp_last else None
+            }
+
+            # ===== Google Maps Status =====
+            google_in_progress = session.query(func.count(GoogleTarget.id)).filter(
+                func.upper(GoogleTarget.status) == 'IN_PROGRESS'
+            ).scalar() or 0
+
+            google_planned = session.query(func.count(GoogleTarget.id)).filter(
+                func.upper(GoogleTarget.status) == 'PLANNED'
+            ).scalar() or 0
+
+            google_done = session.query(func.count(GoogleTarget.id)).filter(
+                func.upper(GoogleTarget.status) == 'DONE'
+            ).scalar() or 0
+
+            google_failed = session.query(func.count(GoogleTarget.id)).filter(
+                func.upper(GoogleTarget.status) == 'FAILED'
+            ).scalar() or 0
+
+            # Get last completed Google target
+            google_last = session.query(GoogleTarget).filter(
+                func.upper(GoogleTarget.status) == 'DONE',
+                GoogleTarget.finished_at.isnot(None)
+            ).order_by(desc(GoogleTarget.finished_at)).first()
+
+            statuses['Google'] = {
+                'is_running': google_in_progress > 0,
+                'active_count': google_in_progress,
+                'pending_count': google_planned,
+                'done_count': google_done,
+                'failed_count': google_failed,
+                'last_run': {
+                    'timestamp': google_last.finished_at.isoformat() if google_last.finished_at else None,
+                    'city': google_last.city,
+                    'category': google_last.category_label,
+                    'results_saved': google_last.results_saved or 0
+                } if google_last else None
+            }
+
+            # ===== Bing Local Status =====
+            bing_in_progress = session.query(func.count(BingTarget.id)).filter(
+                func.upper(BingTarget.status) == 'IN_PROGRESS'
+            ).scalar() or 0
+
+            bing_planned = session.query(func.count(BingTarget.id)).filter(
+                func.upper(BingTarget.status) == 'PLANNED'
+            ).scalar() or 0
+
+            bing_done = session.query(func.count(BingTarget.id)).filter(
+                func.upper(BingTarget.status) == 'DONE'
+            ).scalar() or 0
+
+            bing_failed = session.query(func.count(BingTarget.id)).filter(
+                func.upper(BingTarget.status) == 'FAILED'
+            ).scalar() or 0
+
+            # Get last completed Bing target
+            bing_last = session.query(BingTarget).filter(
+                func.upper(BingTarget.status) == 'DONE',
+                BingTarget.finished_at.isnot(None)
+            ).order_by(desc(BingTarget.finished_at)).first()
+
+            statuses['Bing'] = {
+                'is_running': bing_in_progress > 0,
+                'active_count': bing_in_progress,
+                'pending_count': bing_planned,
+                'done_count': bing_done,
+                'failed_count': bing_failed,
+                'last_run': {
+                    'timestamp': bing_last.finished_at.isoformat() if bing_last.finished_at else None,
+                    'city': bing_last.city,
+                    'category': bing_last.category_label,
+                    'results_saved': bing_last.results_saved or 0
+                } if bing_last else None
+            }
+
+            return statuses
+
+        finally:
+            session.close()
 
     def scrape_batch(
         self,
@@ -762,6 +1343,365 @@ class BackendFacade:
         """Get application logs."""
         # For now, return empty list - logs are handled by ui.log binding
         return []
+
+    # ========================================================================
+    # SCHEDULER METHODS
+    # ========================================================================
+
+    def get_scheduled_jobs(self) -> List[Dict[str, Any]]:
+        """Get all scheduled jobs."""
+        from db.models import ScheduledJob
+
+        try:
+            session = create_session()
+            stmt = select(ScheduledJob).order_by(ScheduledJob.created_at.desc())
+            jobs = session.scalars(stmt).all()
+
+            result = []
+            for job in jobs:
+                result.append({
+                    'id': job.id,
+                    'name': job.name,
+                    'description': job.description,
+                    'job_type': job.job_type,
+                    'schedule_cron': job.schedule_cron,
+                    'config': json.loads(job.config) if job.config else {},
+                    'enabled': job.enabled,
+                    'priority': job.priority,
+                    'timeout_minutes': job.timeout_minutes,
+                    'max_retries': job.max_retries,
+                    'last_run': job.last_run.isoformat() if job.last_run else None,
+                    'last_status': job.last_status,
+                    'next_run': job.next_run.isoformat() if job.next_run else None,
+                    'total_runs': job.total_runs,
+                    'success_runs': job.success_runs,
+                    'failed_runs': job.failed_runs,
+                    'created_at': job.created_at.isoformat() if job.created_at else None,
+                    'created_by': job.created_by,
+                    'updated_at': job.updated_at.isoformat() if job.updated_at else None,
+                })
+
+            session.close()
+            return result
+
+        except Exception as e:
+            logger.error(f"Error fetching scheduled jobs: {e}")
+            return []
+
+    def create_scheduled_job(self, job_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a new scheduled job."""
+        from db.models import ScheduledJob
+
+        try:
+            session = create_session()
+
+            # Create job instance
+            job = ScheduledJob(
+                name=job_data['name'],
+                description=job_data.get('description'),
+                job_type=job_data['job_type'],
+                schedule_cron=job_data['schedule_cron'],
+                config=json.dumps(job_data.get('config', {})),
+                enabled=job_data.get('enabled', True),
+                priority=job_data.get('priority', 2),
+                timeout_minutes=job_data.get('timeout_minutes', 60),
+                max_retries=job_data.get('max_retries', 3),
+                created_by=job_data.get('created_by', 'dashboard')
+            )
+
+            session.add(job)
+            session.commit()
+
+            job_id = job.id
+            session.close()
+
+            logger.info(f"Created scheduled job: {job.name} (ID: {job_id})")
+
+            return {
+                'success': True,
+                'job_id': job_id,
+                'message': f'Job "{job_data["name"]}" created successfully'
+            }
+
+        except Exception as e:
+            logger.error(f"Error creating scheduled job: {e}")
+            return {
+                'success': False,
+                'message': f'Error creating job: {str(e)}'
+            }
+
+    def update_scheduled_job(self, job_id: int, job_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Update an existing scheduled job."""
+        from db.models import ScheduledJob
+
+        try:
+            session = create_session()
+            job = session.get(ScheduledJob, job_id)
+
+            if not job:
+                session.close()
+                return {
+                    'success': False,
+                    'message': f'Job with ID {job_id} not found'
+                }
+
+            # Update fields
+            if 'name' in job_data:
+                job.name = job_data['name']
+            if 'description' in job_data:
+                job.description = job_data['description']
+            if 'job_type' in job_data:
+                job.job_type = job_data['job_type']
+            if 'schedule_cron' in job_data:
+                job.schedule_cron = job_data['schedule_cron']
+            if 'config' in job_data:
+                job.config = json.dumps(job_data['config'])
+            if 'enabled' in job_data:
+                job.enabled = job_data['enabled']
+            if 'priority' in job_data:
+                job.priority = job_data['priority']
+            if 'timeout_minutes' in job_data:
+                job.timeout_minutes = job_data['timeout_minutes']
+            if 'max_retries' in job_data:
+                job.max_retries = job_data['max_retries']
+
+            session.commit()
+            session.close()
+
+            logger.info(f"Updated scheduled job ID: {job_id}")
+
+            return {
+                'success': True,
+                'message': f'Job updated successfully'
+            }
+
+        except Exception as e:
+            logger.error(f"Error updating scheduled job: {e}")
+            return {
+                'success': False,
+                'message': f'Error updating job: {str(e)}'
+            }
+
+    def delete_scheduled_job(self, job_id: int) -> Dict[str, Any]:
+        """Delete a scheduled job."""
+        from db.models import ScheduledJob
+
+        try:
+            session = create_session()
+            job = session.get(ScheduledJob, job_id)
+
+            if not job:
+                session.close()
+                return {
+                    'success': False,
+                    'message': f'Job with ID {job_id} not found'
+                }
+
+            job_name = job.name
+            session.delete(job)
+            session.commit()
+            session.close()
+
+            logger.info(f"Deleted scheduled job: {job_name} (ID: {job_id})")
+
+            return {
+                'success': True,
+                'message': f'Job "{job_name}" deleted successfully'
+            }
+
+        except Exception as e:
+            logger.error(f"Error deleting scheduled job: {e}")
+            return {
+                'success': False,
+                'message': f'Error deleting job: {str(e)}'
+            }
+
+    def toggle_scheduled_job(self, job_id: int, enabled: bool) -> Dict[str, Any]:
+        """Enable or disable a scheduled job."""
+        from db.models import ScheduledJob
+
+        try:
+            session = create_session()
+            job = session.get(ScheduledJob, job_id)
+
+            if not job:
+                session.close()
+                return {
+                    'success': False,
+                    'message': f'Job with ID {job_id} not found'
+                }
+
+            job.enabled = enabled
+            session.commit()
+            session.close()
+
+            status = 'enabled' if enabled else 'disabled'
+            logger.info(f"Job {job_id} {status}")
+
+            return {
+                'success': True,
+                'message': f'Job {status} successfully'
+            }
+
+        except Exception as e:
+            logger.error(f"Error toggling scheduled job: {e}")
+            return {
+                'success': False,
+                'message': f'Error: {str(e)}'
+            }
+
+    def get_job_execution_logs(self, job_id: Optional[int] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get job execution logs."""
+        from db.models import JobExecutionLog
+
+        try:
+            session = create_session()
+
+            if job_id:
+                stmt = select(JobExecutionLog).where(
+                    JobExecutionLog.job_id == job_id
+                ).order_by(JobExecutionLog.started_at.desc()).limit(limit)
+            else:
+                stmt = select(JobExecutionLog).order_by(
+                    JobExecutionLog.started_at.desc()
+                ).limit(limit)
+
+            logs = session.scalars(stmt).all()
+
+            result = []
+            for log in logs:
+                result.append({
+                    'id': log.id,
+                    'job_id': log.job_id,
+                    'started_at': log.started_at.isoformat() if log.started_at else None,
+                    'completed_at': log.completed_at.isoformat() if log.completed_at else None,
+                    'duration_seconds': log.duration_seconds,
+                    'status': log.status,
+                    'items_found': log.items_found,
+                    'items_new': log.items_new,
+                    'items_updated': log.items_updated,
+                    'items_skipped': log.items_skipped,
+                    'errors_count': log.errors_count,
+                    'output_log': log.output_log,
+                    'error_log': log.error_log,
+                    'triggered_by': log.triggered_by,
+                })
+
+            session.close()
+            return result
+
+        except Exception as e:
+            logger.error(f"Error fetching job execution logs: {e}")
+            return []
+
+    def get_scheduler_stats(self) -> Dict[str, Any]:
+        """Get scheduler statistics."""
+        from db.models import ScheduledJob, JobExecutionLog
+        from sqlalchemy import func as sql_func
+
+        try:
+            session = create_session()
+
+            # Total jobs
+            total_jobs = session.query(sql_func.count(ScheduledJob.id)).scalar() or 0
+
+            # Active jobs
+            active_jobs = session.query(sql_func.count(ScheduledJob.id)).where(
+                ScheduledJob.enabled == True
+            ).scalar() or 0
+
+            # Failed jobs in last 24h
+            yesterday = datetime.now() - timedelta(days=1)
+            failed_24h = session.query(sql_func.count(JobExecutionLog.id)).where(
+                and_(
+                    JobExecutionLog.status == 'failed',
+                    JobExecutionLog.started_at >= yesterday
+                )
+            ).scalar() or 0
+
+            session.close()
+
+            return {
+                'total_jobs': total_jobs,
+                'active_jobs': active_jobs,
+                'running_jobs': 0,  # Would need scheduler service integration
+                'failed_24h': failed_24h
+            }
+
+        except Exception as e:
+            logger.error(f"Error fetching scheduler stats: {e}")
+            return {
+                'total_jobs': 0,
+                'active_jobs': 0,
+                'running_jobs': 0,
+                'failed_24h': 0
+            }
+
+    def clear_database(self) -> Dict[str, Any]:
+        """
+        Clear all companies from the database (for testing purposes).
+
+        Returns:
+            Dict with keys:
+            - success: Boolean indicating if operation completed successfully
+            - deleted_count: Number of companies deleted
+            - message: Status message
+        """
+        logger.warning("Clearing all companies from database")
+
+        try:
+            session = create_session()
+
+            # Count companies before deletion
+            count_stmt = select(func.count(Company.id))
+            deleted_count = session.execute(count_stmt).scalar() or 0
+
+            # Delete all companies
+            from sqlalchemy import delete
+            delete_stmt = delete(Company)
+            session.execute(delete_stmt)
+            session.commit()
+            session.close()
+
+            logger.info(f"Cleared {deleted_count} companies from database")
+
+            return {
+                'success': True,
+                'deleted_count': deleted_count,
+                'message': f'Successfully deleted {deleted_count} companies from database'
+            }
+
+        except Exception as e:
+            logger.error(f"Error clearing database: {e}", exc_info=True)
+            return {
+                'success': False,
+                'deleted_count': 0,
+                'message': f'Error clearing database: {str(e)}'
+            }
+
+    def count_yp_targets_by_status(self, status: str) -> int:
+        """
+        Count YP targets by status.
+
+        Args:
+            status: Target status to count (e.g., 'planned', 'scraping', 'done')
+
+        Returns:
+            Count of targets with the specified status
+        """
+        try:
+            from sqlalchemy import text
+            session = create_session()
+
+            query = text("SELECT COUNT(*) FROM yp_targets WHERE status = :status")
+            count = session.execute(query, {"status": status}).scalar() or 0
+
+            session.close()
+            return count
+
+        except Exception as e:
+            logger.error(f"Error counting YP targets by status '{status}': {e}", exc_info=True)
+            return 0
 
 
 # Global backend instance

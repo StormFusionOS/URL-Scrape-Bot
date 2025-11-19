@@ -96,6 +96,25 @@ class CLIStreamer:
                 self.process.kill()
                 await self.process.wait()
 
+    def kill_immediately(self):
+        """Kill the process immediately (synchronous, force kill)."""
+        if self.process and self.running:
+            try:
+                self.process.kill()
+                self.running = False
+                self.exit_code = -9
+                return True
+            except Exception as e:
+                print(f"Error killing process: {e}")
+                return False
+        return False
+
+    def get_pid(self) -> Optional[int]:
+        """Get the process ID if running."""
+        if self.process:
+            return self.process.pid
+        return None
+
     def is_stalled(self, threshold_seconds: int = 30) -> bool:
         """Check if output has stalled."""
         if not self.running or not self.last_output_time:

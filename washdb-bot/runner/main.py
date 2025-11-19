@@ -16,7 +16,9 @@ from pathlib import Path
 
 from db import upsert_discovered, update_batch
 from runner.logging_setup import get_logger
-from scrape_yp import crawl_all_states, CATEGORIES, STATES
+# NOTE: YP scraper now uses city-first approach via CLI (cli_crawl_yp.py)
+# Old state-first imports have been removed. Use the CLI directly instead.
+# from scrape_yp import crawl_all_states, CATEGORIES, STATES
 
 
 # Initialize logger
@@ -78,10 +80,36 @@ Examples:
         help=f"Comma-separated state codes (default: all {len(STATES)} states)",
     )
     discovery_group.add_argument(
-        "--pages-per-state",
+        "--pages-per-pair",
         type=int,
         default=3,
-        help="Maximum pages to crawl per state-category combination (default: 3)",
+        help="Search depth: number of result pages per category-state combination (default: 3, max: 50)",
+    )
+    discovery_group.add_argument(
+        "--use-enhanced-filter",
+        action="store_true",
+        help="(DEPRECATED - now ON by default) Use enhanced YP filtering",
+    )
+    discovery_group.add_argument(
+        "--disable-enhanced-filter",
+        action="store_true",
+        help="Disable enhanced filtering (use old behavior without tag filtering)",
+    )
+    discovery_group.add_argument(
+        "--min-score",
+        type=float,
+        default=50.0,
+        help="Minimum confidence score for accepting listings (0-100, default: 50)",
+    )
+    discovery_group.add_argument(
+        "--include-sponsored",
+        action="store_true",
+        help="Include sponsored/ad listings (default: exclude)",
+    )
+    discovery_group.add_argument(
+        "--categories-file",
+        type=str,
+        help="Path to category allowlist file (default: data/yp_category_allowlist.txt)",
     )
 
     # Scraping options
@@ -118,8 +146,41 @@ def run_discovery(args):
         Tuple of (total_discovered, total_inserted, total_updated)
     """
     logger.info("=" * 70)
-    logger.info("DISCOVERY MODE: Crawling Yellow Pages")
+    if args.use_enhanced_filter:
+        logger.info("DISCOVERY MODE: Crawling Yellow Pages (Enhanced Filtering)")
+    else:
+        logger.info("DISCOVERY MODE: Crawling Yellow Pages")
     logger.info("=" * 70)
+
+    # Initialize enhanced filter (ENABLED BY DEFAULT)
+    yp_filter = None
+    use_enhanced_filter = True  # Default: ON
+
+    # Allow user to explicitly disable if they want old behavior
+    if hasattr(args, 'disable_enhanced_filter') and args.disable_enhanced_filter:
+        use_enhanced_filter = False
+        logger.info("Enhanced filter explicitly disabled by user (--disable-enhanced-filter)")
+
+    if use_enhanced_filter:
+        try:
+            from scrape_yp.yp_filter import YPFilter
+            from scrape_yp.yp_crawl import crawl_category_location_filtered
+
+            # Load filter with custom files if provided
+            filter_kwargs = {}
+            if hasattr(args, 'categories_file') and args.categories_file:
+                filter_kwargs['allowlist_file'] = args.categories_file
+
+            yp_filter = YPFilter(**filter_kwargs)
+            logger.info(f"✓ Enhanced filter enabled (min_score={args.min_score}, sponsored={args.include_sponsored})")
+
+        except ImportError as e:
+            logger.error(f"Enhanced filter not available: {e}")
+            logger.info("Falling back to basic crawl")
+            use_enhanced_filter = False
+
+    # Update args to reflect actual state
+    args.use_enhanced_filter = use_enhanced_filter
 
     # Parse categories
     if args.categories:
@@ -137,7 +198,7 @@ def run_discovery(args):
         states = STATES
         logger.info(f"Using all {len(states)} states")
 
-    logger.info(f"Pages per state-category: {args.pages_per_state}")
+    logger.info(f"Search depth (pages per category-state): {args.pages_per_pair}")
     logger.info("")
 
     # Prepare CSV output
@@ -157,12 +218,25 @@ def run_discovery(args):
             ["timestamp", "category", "state", "name", "website", "domain", "phone"]
         )
 
-        # Crawl all state-category combinations
-        for batch in crawl_all_states(
-            categories=categories,
-            states=states,
-            limit_per_state=args.pages_per_state,
-        ):
+        # Crawl all state-category combinations (use enhanced if enabled)
+        if args.use_enhanced_filter:
+            from scrape_yp.yp_crawl import crawl_all_states_filtered
+            crawl_generator = crawl_all_states_filtered(
+                categories=categories,
+                states=states,
+                limit_per_state=args.pages_per_pair,
+                min_score=args.min_score,
+                include_sponsored=args.include_sponsored,
+                yp_filter=yp_filter,
+            )
+        else:
+            crawl_generator = crawl_all_states(
+                categories=categories,
+                states=states,
+                limit_per_state=args.pages_per_pair,
+            )
+
+        for batch in crawl_generator:
             category = batch["category"]
             state = batch["state"]
             results = batch["results"]

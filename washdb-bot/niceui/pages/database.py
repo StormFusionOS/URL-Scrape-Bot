@@ -23,7 +23,22 @@ database_state = DatabaseState()
 
 
 async def load_companies(search_text=""):
-    """Load companies from database."""
+    """
+    Load companies from database and update AG Grid display.
+
+    Runs database query in I/O-bound thread to avoid blocking UI.
+    Updates grid data, row count label, and notifies user of results.
+
+    Args:
+        search_text (str): Optional search filter for name/domain/website.
+                          Empty string loads all companies (up to 250k limit).
+
+    Side Effects:
+        - Updates database_state.companies
+        - Updates AG Grid rowData
+        - Updates row count label
+        - Shows notification to user
+    """
     if database_state.loading:
         return
 
@@ -35,7 +50,7 @@ async def load_companies(search_text=""):
         companies = await run.io_bound(
             backend.fetch_companies,
             search_text if search_text else None,
-            5000
+            250000
         )
 
         database_state.companies = companies
@@ -66,7 +81,12 @@ async def reload_data():
 
 
 async def export_selected():
-    """Export selected rows to CSV."""
+    """
+    Export selected rows to CSV.
+
+    Creates a CSV file with selected companies and triggers browser download.
+    Filename format: companies_export_YYYYMMDD_HHMMSS.csv
+    """
     if not database_state.grid:
         ui.notify('Grid not initialized', type='warning')
         return
@@ -115,6 +135,64 @@ async def export_selected():
         # Trigger download
         ui.download(temp_file.name, filename)
         ui.notify(f'Exported {len(selected)} rows to {filename}', type='positive', timeout=3000)
+
+    except Exception as e:
+        ui.notify(f'Export error: {str(e)}', type='negative')
+
+
+async def export_all():
+    """
+    Export all visible companies to CSV (one-click export).
+
+    Exports all companies currently loaded in database_state (respects search filter).
+    Filename format: companies_all_YYYYMMDD_HHMMSS.csv
+    """
+    if not database_state.companies:
+        ui.notify('No data to export. Please load data first.', type='warning')
+        return
+
+    try:
+        ui.notify(f'Exporting {len(database_state.companies)} companies...', type='info')
+
+        # Create temporary CSV file
+        temp_file = tempfile.NamedTemporaryFile(
+            mode='w',
+            delete=False,
+            suffix='.csv',
+            newline='',
+            encoding='utf-8'
+        )
+
+        # Write CSV
+        fieldnames = ['Name', 'Website', 'Domain', 'Phone', 'Email', 'Services', 'Service Area', 'Address', 'Source', 'Created At', 'Last Updated']
+        writer = csv.DictWriter(temp_file, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for company in database_state.companies:
+            writer.writerow({
+                'Name': company.get('name', ''),
+                'Website': company.get('website', ''),
+                'Domain': company.get('domain', ''),
+                'Phone': company.get('phone', ''),
+                'Email': company.get('email', ''),
+                'Services': company.get('services', ''),
+                'Service Area': company.get('service_area', ''),
+                'Address': company.get('address', ''),
+                'Source': company.get('source', ''),
+                'Created At': company.get('created_at', ''),
+                'Last Updated': company.get('last_updated', '')
+            })
+
+        temp_file.close()
+
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        search_suffix = f'_filtered' if database_state.search_text else '_all'
+        filename = f'companies{search_suffix}_{timestamp}.csv'
+
+        # Trigger download
+        ui.download(temp_file.name, filename)
+        ui.notify(f'✓ Exported {len(database_state.companies)} companies to {filename}', type='positive', timeout=3000)
 
     except Exception as e:
         ui.notify(f'Export error: {str(e)}', type='negative')
@@ -181,6 +259,118 @@ async def rescrape_selected():
     )
 
 
+async def resume_site_crawl():
+    """
+    Resume site crawl for selected company.
+
+    Uses resumable crawler to continue from last saved state.
+    """
+    selected = await database_state.grid.get_selected_rows()
+
+    if not selected:
+        ui.notify('Please select a company to resume crawl', type='warning')
+        return
+
+    if len(selected) > 1:
+        ui.notify('Please select only one company', type='warning')
+        return
+
+    company = selected[0]
+    domain = company.get('domain')
+    website = company.get('website')
+
+    if not domain or not website:
+        ui.notify('Selected company has no domain/website', type='warning')
+        return
+
+    ui.notify(f'Resuming site crawl for {domain}...', type='info')
+
+    try:
+        # Run in I/O bound thread to avoid blocking UI
+        from scrape_site.resumable_crawler import crawl_site_resumable
+        from db.save_discoveries import create_session
+
+        session = create_session()
+        result = await run.io_bound(crawl_site_resumable, session, domain, website)
+
+        # Show result
+        phase = result.get('phase', 'unknown')
+        pages = result.get('pages_crawled', 0)
+        targets = result.get('targets_found', 0)
+
+        if result.get('completed'):
+            ui.notify(
+                f'✓ Crawl {phase} for {domain}: {pages} pages, {targets} targets',
+                type='positive',
+                timeout=5000
+            )
+        else:
+            ui.notify(
+                f'⏸ Crawl paused for {domain}: {pages} pages so far',
+                type='info',
+                timeout=5000
+            )
+
+    except Exception as e:
+        ui.notify(f'Error resuming crawl: {str(e)}', type='negative', timeout=5000)
+
+
+def show_clear_database_dialog():
+    """Show confirmation dialog for clearing database."""
+    with ui.dialog() as dialog, ui.card():
+        ui.label('Clear Database?').classes('text-2xl font-bold mb-4')
+        ui.label(
+            'This will DELETE ALL companies from the database. This action cannot be undone!'
+        ).classes('text-red-400 mb-4')
+
+        async def confirm_clear():
+            """Confirm and clear database."""
+            dialog.close()
+            await clear_database()
+
+        with ui.row().classes('gap-2'):
+            ui.button(
+                'Cancel',
+                color='secondary',
+                on_click=lambda: dialog.close()
+            ).props('outline')
+
+            ui.button(
+                'Delete All Companies',
+                color='negative',
+                on_click=confirm_clear
+            )
+
+    dialog.open()
+
+
+async def clear_database():
+    """Clear all companies from the database."""
+    ui.notify('Clearing database...', type='info')
+
+    try:
+        # Run in I/O bound thread
+        result = await run.io_bound(backend.clear_database)
+
+        if result.get('success'):
+            ui.notify(
+                f'Database cleared: {result.get("deleted_count")} companies deleted',
+                type='positive',
+                timeout=5000
+            )
+            # Reload the grid
+            await load_companies()
+        else:
+            ui.notify(
+                f'Error clearing database: {result.get("message")}',
+                type='negative',
+                timeout=5000
+            )
+
+    except Exception as e:
+        ui.notify(f'Error: {str(e)}', type='negative')
+
+
 def database_page():
     """Render database page."""
     ui.label('Database Browser').classes('text-3xl font-bold mb-4')
@@ -216,12 +406,27 @@ def database_page():
                 on_click=lambda: reload_data()
             ).props('outline')
 
-            # Export button
+            # Export buttons
+            ui.button(
+                'Export All',
+                icon='download',
+                color='positive',
+                on_click=lambda: export_all()
+            ).props('outline').tooltip('Export all visible companies (respects search filter)')
+
             ui.button(
                 'Export Selected',
                 icon='download',
-                color='positive',
+                color='secondary',
                 on_click=lambda: export_selected()
+            ).props('outline').tooltip('Export only selected rows')
+
+            # Clear database button (for testing)
+            ui.button(
+                'Clear Database',
+                icon='delete_forever',
+                color='negative',
+                on_click=show_clear_database_dialog
             ).props('outline')
 
     # Row actions toolbar
@@ -240,6 +445,12 @@ def database_page():
                 icon='content_copy',
                 on_click=lambda: copy_email()
             ).props('outline size=sm')
+
+            ui.button(
+                'Resume Site Crawl',
+                icon='play_arrow',
+                on_click=lambda: resume_site_crawl()
+            ).props('outline size=sm color=positive').tooltip('Resume/start site crawl for selected domain')
 
             ui.button(
                 'Rescrape Selected',
@@ -386,21 +597,23 @@ def database_page():
 
             ui.label('💡 Tips:').classes('font-semibold mb-2')
             with ui.column().classes('gap-1'):
-                ui.label('• The grid loads up to 5000 rows by default').classes('text-sm text-gray-400')
+                ui.label('• The grid loads up to 250,000 rows by default').classes('text-sm text-gray-400')
                 ui.label('• Use search to narrow down results before exporting').classes('text-sm text-gray-400')
                 ui.label('• Select all rows with Ctrl+A / Cmd+A in the grid').classes('text-sm text-gray-400')
                 ui.label('• Export creates a timestamped CSV file').classes('text-sm text-gray-400')
 
-    # Load initial data
-    load_companies()
+    # Load initial data on page creation
+    async def initial_load():
+        await load_companies()
+    ui.timer(0.1, initial_load, once=True)
 
     # Listen for scrape complete events to auto-refresh
-    def check_refresh():
+    async def check_refresh():
         """Check if scrape completed and refresh if needed."""
         if app.storage.general.get('scrape_complete'):
             # Clear the flag
             del app.storage.general['scrape_complete']
             # Reload data
-            load_companies(database_state.search_text)
+            await load_companies(database_state.search_text)
 
     ui.timer(2.0, check_refresh)  # Check every 2 seconds

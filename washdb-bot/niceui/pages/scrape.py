@@ -7,6 +7,8 @@ from ..backend_facade import backend
 from datetime import datetime
 from collections import deque
 import asyncio
+import subprocess
+import signal
 
 
 # Global state for scraping
@@ -221,10 +223,27 @@ async def run_scrape(
 
 
 def stop_scrape():
-    """Stop the running scrape."""
+    """Stop the running scrape and kill all external worker processes."""
+    from niceui.utils.process_manager import find_and_kill_processes_by_name
+
+    # Cancel GUI-initiated scrape job
     if scrape_state.running:
         scrape_state.cancel()
-        ui.notify('Cancelling scrape...', type='warning')
+        ui.notify('Cancelling GUI scrape job...', type='warning')
+
+    # Kill all external worker processes (run_state_workers.py, worker_pool, state_worker_*)
+    try:
+        patterns = ['run_state_workers', 'worker_pool', 'state_worker_']
+        killed_count = find_and_kill_processes_by_name(patterns)
+
+        if killed_count > 0:
+            ui.notify(f'Stopped {killed_count} worker processes', type='positive')
+        else:
+            ui.notify('No worker processes found running', type='info')
+
+    except Exception as e:
+        ui.notify(f'Error stopping workers: {str(e)}', type='negative')
+        print(f"Error in stop_scrape: {e}")
 
 
 def scrape_page():
