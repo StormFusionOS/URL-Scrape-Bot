@@ -1,0 +1,24 @@
+[Unit]
+Description=Washbot Integrated Dashboard
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=rivercityscrape
+Group=rivercityscrape
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+Environment="PATH=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="VIRTUAL_ENV=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv"
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python -m niceui.main
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/dashboard.log
+StandardError=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/dashboard-error.log
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
