@@ -20,7 +20,12 @@ class LiveLogViewer:
             max_lines: Maximum lines to keep in memory
             auto_scroll: Automatically scroll to bottom on new lines
         """
-        self.log_file = log_file
+        # Convert to absolute path for reliability
+        log_path = Path(log_file)
+        if not log_path.is_absolute():
+            log_path = Path.cwd() / log_path
+        self.log_file = str(log_path)
+
         self.max_lines = max_lines
         self.auto_scroll = auto_scroll
         self.log_element = None
@@ -29,6 +34,7 @@ class LiveLogViewer:
         self.file_position = 0
         self.is_tailing = False
         self.line_count = 0
+        self.error_message = None
 
     def create(self) -> 'LiveLogViewer':
         """Create the UI elements for the log viewer."""
@@ -37,6 +43,16 @@ class LiveLogViewer:
             with ui.row().classes('w-full items-center mb-2'):
                 ui.label('Live Output').classes('text-xl font-bold')
                 ui.space()
+
+                # File status indicator
+                log_path = Path(self.log_file)
+                if log_path.exists():
+                    status_text = f'📄 {log_path.name}'
+                    status_class = 'text-green-400'
+                else:
+                    status_text = f'⚠️ {log_path.name} (not found)'
+                    status_class = 'text-yellow-400'
+                self.file_status_label = ui.label(status_text).classes(f'text-xs {status_class}')
 
                 # Line count badge
                 self.line_count_label = ui.label(f'{self.line_count} lines').classes(
@@ -49,6 +65,12 @@ class LiveLogViewer:
                     value=self.auto_scroll,
                     on_change=lambda e: setattr(self, 'auto_scroll', e.value)
                 ).classes('text-sm')
+
+                # Refresh button
+                ui.button(
+                    icon='refresh',
+                    on_click=lambda: self.load_last_n_lines(100)
+                ).props('flat dense').tooltip('Reload last 100 lines')
 
                 # Clear button
                 ui.button(
@@ -70,16 +92,18 @@ class LiveLogViewer:
 
         self.is_tailing = True
 
-        # Seek to end of file initially (only show new content)
-        log_path = Path(self.log_file)
-        if log_path.exists():
-            with open(log_path, 'r') as f:
-                f.seek(0, 2)  # Seek to end
-                self.file_position = f.tell()
+        # Only seek to end if file_position not already set
+        # (e.g., by load_last_n_lines)
+        if self.file_position == 0:
+            log_path = Path(self.log_file)
+            if log_path.exists():
+                with open(log_path, 'r') as f:
+                    f.seek(0, 2)  # Seek to end
+                    self.file_position = f.tell()
 
-        # Create timer to poll for new lines
+        # Create timer to poll for new lines (faster polling for better responsiveness)
         if not self.timer:
-            self.timer = ui.timer(0.5, self._tail_file)
+            self.timer = ui.timer(0.25, self._tail_file)  # Poll every 250ms
         else:
             self.timer.active = True
 
@@ -95,8 +119,22 @@ class LiveLogViewer:
             return
 
         log_path = Path(self.log_file)
-        if not log_path.exists():
-            return
+
+        # Update file status indicator
+        if hasattr(self, 'file_status_label'):
+            if log_path.exists():
+                # Check if file has grown
+                current_size = log_path.stat().st_size
+                if current_size != self.file_position:
+                    self.file_status_label.set_text(f'📄 {log_path.name} (active)')
+                    self.file_status_label.classes(remove='text-yellow-400', add='text-green-400')
+                else:
+                    self.file_status_label.set_text(f'📄 {log_path.name} (idle)')
+                    self.file_status_label.classes(remove='text-green-400 text-red-400', add='text-gray-400')
+            else:
+                self.file_status_label.set_text(f'⚠️ {log_path.name} (not found)')
+                self.file_status_label.classes(remove='text-green-400', add='text-yellow-400')
+                return
 
         try:
             with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -116,7 +154,11 @@ class LiveLogViewer:
                         self._add_line(line)
 
         except Exception as e:
-            print(f"Error tailing log {self.log_file}: {e}")
+            error_msg = f"Error tailing log {log_path.name}: {e}"
+            print(error_msg)
+            if hasattr(self, 'file_status_label'):
+                self.file_status_label.set_text(f'❌ {log_path.name} (error)')
+                self.file_status_label.classes(remove='text-green-400 text-yellow-400', add='text-red-400')
 
     def _add_line(self, line: str):
         """Add a line to the log display with color coding."""
@@ -190,7 +232,22 @@ class LiveLogViewer:
     def load_last_n_lines(self, n: int = 100):
         """Load the last N lines from the log file."""
         log_path = Path(self.log_file)
+
+        # Update file status
+        if hasattr(self, 'file_status_label'):
+            if log_path.exists():
+                self.file_status_label.set_text(f'📄 {log_path.name}')
+                self.file_status_label.classes(remove='text-yellow-400 text-red-400', add='text-green-400')
+            else:
+                self.file_status_label.set_text(f'⚠️ {log_path.name} (not found)')
+                self.file_status_label.classes(remove='text-green-400', add='text-yellow-400')
+                return
+
         if not log_path.exists():
+            if self.log_element:
+                self.clear()
+                with self.log_element:
+                    ui.label(f'⚠️ Log file not found: {log_path}').classes('text-yellow-400')
             return
 
         try:
@@ -212,7 +269,15 @@ class LiveLogViewer:
                 self.file_position = f.tell()
 
         except Exception as e:
-            print(f"Error loading log {self.log_file}: {e}")
+            error_msg = f"Error loading log {log_path.name}: {e}"
+            print(error_msg)
+            if hasattr(self, 'file_status_label'):
+                self.file_status_label.set_text(f'❌ {log_path.name} (error)')
+                self.file_status_label.classes(remove='text-green-400 text-yellow-400', add='text-red-400')
+            if self.log_element:
+                self.clear()
+                with self.log_element:
+                    ui.label(f'❌ Error: {e}').classes('text-red-400')
 
     def set_log_file(self, log_file: str):
         """Change the log file being tailed."""

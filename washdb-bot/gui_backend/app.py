@@ -1,5 +1,39 @@
 #!/usr/bin/env python3
 """
+⚠️ DEPRECATED: Washdb-Bot GUI Backend
+
+This Flask-based backend is deprecated and no longer maintained.
+It has been replaced by the NiceGUI web interface in niceui/.
+
+Use instead:
+    python -m niceui.main
+
+This file is kept for reference only.
+"""
+
+# Exit immediately if run directly
+if __name__ == '__main__':
+    print("=" * 70)
+    print("⚠️  DEPRECATED: gui_backend/app.py")
+    print("=" * 70)
+    print()
+    print("This Flask-based backend has been replaced by NiceGUI.")
+    print()
+    print("To start the active web interface, run:")
+    print()
+    print("  cd /home/rivercityscrape/URL-Scrape-Bot/washdb-bot")
+    print("  source venv/bin/activate")
+    print("  python -m niceui.main")
+    print()
+    print("Or use: ./restart_dashboard.sh")
+    print()
+    print("=" * 70)
+    import sys
+    sys.exit(1)
+
+# Original code (disabled for reference)
+"""
+ORIGINAL DOCSTRING:
 Washdb-Bot GUI Backend
 Flask application for controlling and monitoring the washdb-bot scraper.
 

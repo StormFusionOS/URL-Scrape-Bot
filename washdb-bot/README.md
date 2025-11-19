@@ -17,9 +17,12 @@ washdb-bot/
 ├── db/                 # Database models and connection management
 ├── scrape_yp/          # Yellow Pages scraper module
 ├── scrape_site/        # Individual website scraper module
-├── gui/                # GUI interface (Tkinter or web-based)
+├── scrape_google/      # Google Business scraper module
+├── niceui/             # NiceGUI web interface (ACTIVE)
+├── scheduler/          # Job scheduling system
 ├── runner/             # Bootstrap and runner scripts
 ├── tests/              # Unit and integration tests
+├── gui_backend/        # ⚠️ DEPRECATED - Legacy Flask backend (kept for reference)
 ├── data/               # Downloaded/cached data
 ├── logs/               # Application logs
 ├── .env.example        # Environment variables template
@@ -27,6 +30,10 @@ washdb-bot/
 ├── pyproject.toml      # Project configuration
 └── README.md           # This file
 ```
+
+### Deprecated Components
+
+- **gui_backend/**: Legacy Flask-based backend. This has been replaced by the `niceui/` module which provides a unified web interface. The folder is kept for reference but is no longer maintained or packaged.
 
 ## Prerequisites
 

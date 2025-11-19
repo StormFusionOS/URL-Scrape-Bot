@@ -87,6 +87,10 @@ def worker_main(
         delay_min = config.get("min_delay_seconds", 10.0)
         delay_max = config.get("max_delay_seconds", 20.0)
 
+        # Exponential backoff for idle polling
+        idle_sleep_time = 60  # Start with 60 seconds
+        max_idle_sleep = 300  # Max 5 minutes
+
         worker_logger.info("Starting main processing loop...")
 
         while not shutdown_event.is_set():
@@ -95,9 +99,15 @@ def worker_main(
                 target_id = acquire_target_for_worker(state_ids, worker_logger)
 
                 if not target_id:
-                    worker_logger.info("No pending targets found. Sleeping 30s...")
-                    time.sleep(30)
+                    worker_logger.info(f"No pending targets found. Sleeping {idle_sleep_time}s...")
+                    time.sleep(idle_sleep_time)
+
+                    # Exponential backoff: increase sleep time when idle
+                    idle_sleep_time = min(idle_sleep_time * 1.5, max_idle_sleep)
                     continue
+
+                # Reset idle sleep time when we find work
+                idle_sleep_time = 60
 
                 # Create a new database session for this target
                 session = create_session()

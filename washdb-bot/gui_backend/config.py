@@ -15,7 +15,23 @@ load_dotenv(env_path)
 
 
 class Config:
-    """GUI Backend configuration."""
+    """
+    Base configuration for Flask GUI backend.
+
+    All settings can be overridden via environment variables in .env file.
+
+    Key Configuration:
+        - GUI_PORT: Flask backend port (default: 5001)
+        - NICEGUI_PORT: NiceGUI dashboard port (default: 8080)
+        - CORS_ORIGINS: Allowed CORS origins for API calls
+        - DATABASE_URL: PostgreSQL connection string
+        - LOG_DIR: Log file directory (default: logs/)
+
+    Port Strategy:
+        - Port 5000: Reserved for Nathan SEO Bot dashboard
+        - Port 5001: Flask backend (this service)
+        - Port 8080: NiceGUI dashboard (primary UI)
+    """
 
     # Flask settings
     ENV = os.getenv('FLASK_ENV', 'development')
@@ -37,7 +53,11 @@ class Config:
     API_VERSION = '1.0.0'
 
     # CORS settings
-    CORS_ORIGINS = os.getenv('CORS_ORIGINS', 'http://localhost:5001').split(',')
+    # Default allows local NiceGUI (port 8080) and Flask backend (port 5001) to communicate
+    CORS_ORIGINS = os.getenv(
+        'CORS_ORIGINS',
+        'http://127.0.0.1:8080,http://localhost:8080,http://127.0.0.1:5001,http://localhost:5001'
+    ).split(',')
 
     # Logging
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
@@ -52,7 +72,20 @@ class Config:
 
     @classmethod
     def validate(cls):
-        """Validate configuration."""
+        """
+        Validate configuration and ensure required resources exist.
+
+        Checks:
+            - Log directory exists (creates if missing)
+            - DATABASE_URL is set
+            - Port 5001 is used (not 5000 which conflicts with Nathan SEO Bot)
+
+        Raises:
+            ValueError: If any validation checks fail
+
+        Returns:
+            bool: True if all validations pass
+        """
         errors = []
 
         # Ensure log directory exists

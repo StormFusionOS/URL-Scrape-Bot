@@ -623,8 +623,8 @@ async def export_last_run():
         await asyncio.sleep(5)
         try:
             os.unlink(temp_file.name)
-        except:
-            pass
+        except (OSError, FileNotFoundError) as e:
+            logging.debug(f"Failed to cleanup temp file {temp_file.name}: {e}")
 
     except Exception as e:
         ui.notify(f'Export failed: {e}', type='negative')

@@ -40,13 +40,16 @@ def recover_orphaned_targets(
     state_ids: Optional[list[str]] = None
 ) -> dict:
     """
-    Recover targets that have been stuck in 'in_progress' status.
+    Recover targets that have been stuck in 'IN_PROGRESS' status.
 
     A target is considered orphaned if:
-    - Status is 'in_progress'
-    - last_attempt_ts is older than timeout_minutes
+    - Status is 'IN_PROGRESS'
+    - heartbeat_at is older than timeout_minutes (or NULL)
 
-    These targets are reset to 'planned' status so they can be retried.
+    This heartbeat-based approach ensures we only recover targets from
+    crashed/killed workers, not actively running ones.
+
+    These targets are reset to 'PLANNED' status so they can be retried.
 
     Args:
         session: SQLAlchemy session
@@ -56,17 +59,19 @@ def recover_orphaned_targets(
     Returns:
         Dict with keys:
         - recovered: Number of targets recovered
-        - targets: List of recovered target dicts (id, city, state, category)
+        - targets: List of recovered target dicts (id, city, state, category, claimed_by, heartbeat_at)
     """
-    logger.info(f"Searching for orphaned targets (timeout={timeout_minutes} minutes)...")
+    logger.info(f"Searching for orphaned targets (heartbeat timeout={timeout_minutes} minutes)...")
 
     # Calculate threshold timestamp
     threshold = datetime.utcnow() - timedelta(minutes=timeout_minutes)
 
-    # Build query
+    # Build query - use heartbeat_at for orphan detection
     query = session.query(YPTarget).filter(
-        YPTarget.status == 'in_progress',
-        YPTarget.last_attempt_ts < threshold
+        YPTarget.status == 'IN_PROGRESS'
+    ).filter(
+        # Orphaned if: heartbeat is NULL OR heartbeat is stale
+        (YPTarget.heartbeat_at == None) | (YPTarget.heartbeat_at < threshold)
     )
 
     if state_ids:
@@ -81,12 +86,21 @@ def recover_orphaned_targets(
 
     logger.warning(f"Found {len(orphaned)} orphaned targets")
 
-    # Reset targets to 'planned'
+    # Reset targets to 'PLANNED'
     recovered_targets = []
     for target in orphaned:
         old_note = target.note or ""
-        target.status = 'planned'
-        target.note = f"auto_recovered_from_orphan_{target.attempts}_attempts | {old_note}"
+        old_status = target.status
+
+        # Track recovery details
+        recovery_info = f"worker={target.claimed_by or 'unknown'}, heartbeat={target.heartbeat_at or 'never'}"
+
+        target.status = 'PLANNED'
+        target.note = f"auto_recovered_from_{old_status}_attempts={target.attempts}_page={target.page_current}/{target.page_target}_{recovery_info} | {old_note}"
+
+        # Clear worker claim (will be re-claimed by new worker)
+        target.claimed_by = None
+        target.claimed_at = None
 
         recovered_targets.append({
             'id': target.id,
@@ -94,12 +108,16 @@ def recover_orphaned_targets(
             'state': target.state_id,
             'category': target.category_label,
             'attempts': target.attempts,
-            'last_attempt': target.last_attempt_ts.isoformat() if target.last_attempt_ts else None,
+            'page_current': target.page_current,
+            'page_target': target.page_target,
+            'claimed_by': target.claimed_by,
+            'heartbeat_at': target.heartbeat_at.isoformat() if target.heartbeat_at else None,
         })
 
         logger.info(
             f"  Recovered: {target.city}, {target.state_id} - {target.category_label} "
-            f"(attempts={target.attempts}, last_attempt={target.last_attempt_ts})"
+            f"(attempts={target.attempts}, page={target.page_current}/{target.page_target}, "
+            f"claimed_by={target.claimed_by}, heartbeat={target.heartbeat_at})"
         )
 
     session.commit()
@@ -138,11 +156,12 @@ def get_overall_progress(session, state_ids: Optional[list[str]] = None) -> dict
 
     # Count by status
     total = query.count()
-    planned = query.filter(YPTarget.status == 'planned').count()
-    in_progress = query.filter(YPTarget.status == 'in_progress').count()
-    done = query.filter(YPTarget.status == 'done').count()
-    failed = query.filter(YPTarget.status == 'failed').count()
-    parked = query.filter(YPTarget.status == 'parked').count()
+    planned = query.filter(YPTarget.status == 'PLANNED').count()
+    in_progress = query.filter(YPTarget.status == 'IN_PROGRESS').count()
+    done = query.filter(YPTarget.status == 'DONE').count()
+    failed = query.filter(YPTarget.status == 'FAILED').count()
+    stuck = query.filter(YPTarget.status == 'STUCK').count()
+    parked = query.filter(YPTarget.status == 'PARKED').count()
 
     # Calculate progress percentage
     progress_pct = (done / total * 100) if total > 0 else 0
@@ -153,6 +172,7 @@ def get_overall_progress(session, state_ids: Optional[list[str]] = None) -> dict
         'in_progress': in_progress,
         'done': done,
         'failed': failed,
+        'stuck': stuck,
         'parked': parked,
         'progress_pct': progress_pct,
     }
@@ -242,7 +262,7 @@ def load_progress_checkpoint(checkpoint_file: str) -> Optional[dict]:
 
 def reset_failed_targets(session, state_ids: Optional[list[str]] = None, max_attempts: Optional[int] = None) -> dict:
     """
-    Reset failed targets to 'planned' status for retry.
+    Reset failed targets to 'PLANNED' status for retry.
 
     Args:
         session: SQLAlchemy session
@@ -254,10 +274,10 @@ def reset_failed_targets(session, state_ids: Optional[list[str]] = None, max_att
         - reset: Number of targets reset
         - targets: List of reset target dicts
     """
-    logger.info("Resetting failed targets to 'planned' status...")
+    logger.info("Resetting failed targets to 'PLANNED' status...")
 
     # Build query
-    query = session.query(YPTarget).filter(YPTarget.status == 'failed')
+    query = session.query(YPTarget).filter(YPTarget.status == 'FAILED')
 
     if state_ids:
         query = query.filter(YPTarget.state_id.in_(state_ids))
@@ -278,8 +298,10 @@ def reset_failed_targets(session, state_ids: Optional[list[str]] = None, max_att
     reset_targets = []
     for target in failed_targets:
         old_note = target.note or ""
-        target.status = 'planned'
-        target.note = f"reset_from_failed_{target.attempts}_attempts | {old_note}"
+        target.status = 'PLANNED'
+        target.note = f"reset_from_FAILED_{target.attempts}_attempts | {old_note}"
+        target.claimed_by = None  # Clear worker claim
+        target.claimed_at = None
 
         reset_targets.append({
             'id': target.id,

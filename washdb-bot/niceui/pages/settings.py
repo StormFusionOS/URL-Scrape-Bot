@@ -2,97 +2,14 @@
 Settings page - configure application settings with persistence.
 """
 
-import os
-import platform
-import subprocess
 from pathlib import Path
 from nicegui import ui
 from ..config_manager import config_manager
-
-
-def open_directory(path: str):
-    """Open directory in OS file explorer (platform-aware)."""
-    path_obj = Path(path)
-
-    # Create directory if it doesn't exist
-    path_obj.mkdir(parents=True, exist_ok=True)
-
-    system = platform.system()
-
-    try:
-        if system == 'Windows':
-            os.startfile(path_obj)
-        elif system == 'Darwin':  # macOS
-            subprocess.run(['open', str(path_obj)])
-        else:  # Linux and others
-            subprocess.run(['xdg-open', str(path_obj)])
-
-        ui.notify(f'Opened {path}', type='positive', timeout=2000)
-    except Exception as e:
-        ui.notify(f'Failed to open directory: {str(e)}', type='negative')
-
-
-def apply_theme_settings():
-    """Apply theme settings without restart."""
-    mode = config_manager.get('theme', 'mode', 'dark')
-    primary_color = config_manager.get('theme', 'primary_color', '#8b5cf6')
-    accent_color = config_manager.get('theme', 'accent_color', '#a78bfa')
-
-    # Update dark mode
-    if mode == 'dark':
-        ui.dark_mode().enable()
-    elif mode == 'light':
-        ui.dark_mode().disable()
-    else:  # auto
-        ui.dark_mode().auto()
-
-    # Update colors
-    ui.colors(primary=primary_color)
-
-    ui.notify('Theme applied successfully', type='positive', timeout=2000)
-
-
-def save_theme_settings(mode_select, primary_color_input, accent_color_input):
-    """Save theme settings."""
-    theme_config = {
-        'mode': mode_select.value,
-        'primary_color': primary_color_input.value,
-        'accent_color': accent_color_input.value,
-    }
-
-    if config_manager.update_section('theme', theme_config):
-        apply_theme_settings()
-        ui.notify('Theme settings saved!', type='positive')
-    else:
-        ui.notify('Failed to save theme settings', type='negative')
-
-
-def save_path_settings(log_dir_input, export_dir_input):
-    """Save path settings."""
-    path_config = {
-        'log_dir': log_dir_input.value,
-        'export_dir': export_dir_input.value,
-    }
-
-    if config_manager.update_section('paths', path_config):
-        ui.notify('Path settings saved!', type='positive')
-    else:
-        ui.notify('Failed to save path settings', type='negative')
-
-
-def save_defaults_settings(crawl_delay, pages_per_pair, stale_days, default_limit):
-    """Save default settings."""
-    defaults_config = {
-        'crawl_delay': float(crawl_delay.value),
-        'pages_per_pair': int(pages_per_pair.value),
-        'stale_days': int(stale_days.value),
-        'default_limit': int(default_limit.value),
-    }
-
-    if config_manager.update_section('defaults', defaults_config):
-        ui.notify('Default settings saved!', type='positive')
-    else:
-        ui.notify('Failed to save default settings', type='negative')
+from ..widgets.keyword_editor import create_keyword_editor
+from ..widgets.filter_preview import create_filter_preview
+from ..widgets.keyword_stats import create_keyword_stats
+from ..widgets.category_editor import create_category_editor
+from ..utils.keyword_manager import keyword_manager
 
 
 def save_database_settings(host, port, database, username, password):
@@ -190,6 +107,156 @@ def reset_to_defaults():
         ui.notify('Failed to reset settings', type='negative')
 
 
+def build_keyword_management_section():
+    """Build the keyword management dashboard section."""
+    with ui.card().classes('w-full mb-4'):
+        # Header
+        with ui.row().classes('w-full items-center justify-between mb-4'):
+            with ui.column().classes('gap-1'):
+                ui.label('Keyword Management').classes('text-2xl font-bold')
+                ui.label('Control filtering keywords for all discovery sources').classes('text-sm text-gray-400')
+
+            # Reload all button
+            ui.button(
+                'Reload All',
+                icon='refresh',
+                on_click=lambda: reload_all_keywords()
+            ).props('flat').tooltip('Reload all keyword files from disk')
+
+        # Statistics summary
+        files_by_source = keyword_manager.get_all_files_by_source()
+        total_keywords = sum(f['count'] for source_files in files_by_source.values() for f in source_files)
+
+        with ui.row().classes('w-full gap-4 mb-6'):
+            with ui.card().classes('flex-1 bg-blue-900/20'):
+                ui.label('Total Keywords').classes('text-sm text-gray-400')
+                ui.label(str(total_keywords)).classes('text-3xl font-bold text-blue-400')
+
+            with ui.card().classes('flex-1 bg-green-900/20'):
+                ui.label('Shared Files').classes('text-sm text-gray-400')
+                ui.label(str(len(files_by_source['shared']))).classes('text-3xl font-bold text-green-400')
+
+            with ui.card().classes('flex-1 bg-purple-900/20'):
+                ui.label('Source-Specific').classes('text-sm text-gray-400')
+                ui.label(str(len(files_by_source['yp']))).classes('text-3xl font-bold text-purple-400')
+
+        # Filter Preview Tool
+        with ui.expansion('🧪 Filter Preview & Testing', icon='science').classes('w-full mb-4'):
+            create_filter_preview()
+
+        # Statistics Dashboard
+        with ui.expansion('📊 Statistics & Analytics', icon='analytics').classes('w-full mb-4'):
+            create_keyword_stats(keyword_manager)
+
+        # Tabbed interface for each source
+        with ui.tabs().classes('w-full') as tabs:
+            shared_tab = ui.tab('Shared', icon='public')
+            google_tab = ui.tab('Google', icon='map')
+            yp_tab = ui.tab('Yellow Pages', icon='menu_book')
+            bing_tab = ui.tab('Bing', icon='search')
+
+        with ui.tab_panels(tabs, value=shared_tab).classes('w-full'):
+            # SHARED KEYWORDS TAB
+            with ui.tab_panel(shared_tab):
+                ui.label('Shared Keywords').classes('text-xl font-bold mb-4')
+                ui.label('These keywords are used by all discovery sources for filtering.').classes(
+                    'text-sm text-gray-400 mb-6'
+                )
+
+                with ui.row().classes('w-full gap-4'):
+                    # Anti-Keywords column
+                    with ui.column().classes('flex-1'):
+                        create_keyword_editor(
+                            file_id='shared_anti_keywords',
+                            title='Anti-Keywords',
+                            description='Filter out unwanted businesses (equipment, training, franchises, etc.)',
+                            color='red'
+                        )
+
+                    # Positive Hints column
+                    with ui.column().classes('flex-1'):
+                        create_keyword_editor(
+                            file_id='shared_positive_hints',
+                            title='Positive Hints',
+                            description='Boost confidence for target businesses (pressure washing, soft wash, etc.)',
+                            color='green'
+                        )
+
+            # GOOGLE TAB
+            with ui.tab_panel(google_tab):
+                ui.label('Google Maps Discovery').classes('text-xl font-bold mb-4')
+                ui.label('Control what categories Google Maps searches for').classes(
+                    'text-sm text-gray-400 mb-6'
+                )
+
+                # Category editor
+                create_category_editor()
+
+                # Info about shared keywords
+                ui.label('Keywords & Domains').classes('text-lg font-semibold mt-6 mb-3')
+                with ui.card().classes('w-full bg-blue-900/10'):
+                    ui.label('ℹ Info').classes('text-sm font-semibold mb-2')
+                    ui.label(
+                        'Google Maps also uses the shared anti-keywords and positive hints from the Shared tab. '
+                        'Blocked domains (Amazon, eBay, etc.) are configured in scrape_google/google_filter.py.'
+                    ).classes('text-sm text-gray-400')
+
+            # YELLOW PAGES TAB
+            with ui.tab_panel(yp_tab):
+                ui.label('Yellow Pages Discovery').classes('text-xl font-bold mb-4')
+                ui.label('YP uses categories and keywords for precise filtering.').classes(
+                    'text-sm text-gray-400 mb-6'
+                )
+
+                # Category management
+                with ui.row().classes('w-full gap-4 mb-6'):
+                    with ui.column().classes('flex-1'):
+                        create_keyword_editor(
+                            file_id='yp_category_allowlist',
+                            title='Category Allowlist',
+                            description='YP categories to INCLUDE in results',
+                            color='green'
+                        )
+
+                    with ui.column().classes('flex-1'):
+                        create_keyword_editor(
+                            file_id='yp_category_blocklist',
+                            title='Category Blocklist',
+                            description='YP categories to EXCLUDE from results',
+                            color='red'
+                        )
+
+                # YP-specific anti-keywords
+                ui.label('YP-Specific Keywords').classes('text-lg font-bold mt-6 mb-4')
+
+                create_keyword_editor(
+                    file_id='yp_anti_keywords',
+                    title='YP Anti-Keywords',
+                    description='Additional anti-keywords specific to Yellow Pages (currently unused in code)',
+                    color='orange'
+                )
+
+            # BING TAB
+            with ui.tab_panel(bing_tab):
+                ui.label('Bing Local Discovery').classes('text-xl font-bold mb-4')
+                ui.label('Bing uses shared keywords only.').classes(
+                    'text-sm text-gray-400 mb-6'
+                )
+
+                with ui.card().classes('w-full bg-blue-900/10'):
+                    ui.label('ℹ Info').classes('text-lg font-bold mb-2')
+                    ui.label(
+                        'Bing Local discovery inherits all filtering logic from Google Maps, '
+                        'using the shared anti-keywords and positive hints above.'
+                    ).classes('text-sm text-gray-400')
+
+
+def reload_all_keywords():
+    """Reload all keyword files from disk."""
+    keyword_manager.reload_all()
+    ui.notify('All keyword files reloaded!', type='positive')
+
+
 def settings_page():
     """Render settings page."""
     ui.label('Settings').classes('text-3xl font-bold mb-4')
@@ -197,108 +264,6 @@ def settings_page():
     ui.label(
         'Configure application settings. Changes are persisted to data/config.json.'
     ).classes('text-gray-400 mb-6')
-
-    # THEME SETTINGS
-    with ui.card().classes('w-full mb-4'):
-        ui.label('Theme Settings').classes('text-2xl font-bold mb-4')
-
-        ui.label('Appearance').classes('font-semibold mb-2')
-
-        # Theme mode selector
-        with ui.row().classes('w-full items-center gap-4 mb-4'):
-            ui.label('Theme Mode:').classes('min-w-32')
-            mode_select = ui.select(
-                ['dark', 'light', 'auto'],
-                value=config_manager.get('theme', 'mode', 'dark'),
-                label='Mode'
-            ).classes('w-48')
-
-        ui.label(
-            'Auto mode switches between light/dark based on system preferences'
-        ).classes('text-sm text-gray-400 mb-4')
-
-        # Color pickers
-        ui.label('Colors').classes('font-semibold mb-2 mt-4')
-
-        with ui.row().classes('w-full items-center gap-4 mb-4'):
-            ui.label('Primary Color:').classes('min-w-32')
-            primary_color_input = ui.input(
-                'Primary Color',
-                value=config_manager.get('theme', 'primary_color', '#8b5cf6')
-            ).classes('w-48')
-            ui.color_input(on_change=lambda e: setattr(primary_color_input, 'value', e.value)).bind_value(primary_color_input)
-
-        with ui.row().classes('w-full items-center gap-4 mb-4'):
-            ui.label('Accent Color:').classes('min-w-32')
-            accent_color_input = ui.input(
-                'Accent Color',
-                value=config_manager.get('theme', 'accent_color', '#a78bfa')
-            ).classes('w-48')
-            ui.color_input(on_change=lambda e: setattr(accent_color_input, 'value', e.value)).bind_value(accent_color_input)
-
-        ui.label(
-            'Default purple theme: Primary #8b5cf6, Accent #a78bfa'
-        ).classes('text-sm text-gray-400 mb-4')
-
-        # Save button
-        with ui.row().classes('gap-2'):
-            ui.button(
-                'Apply Theme',
-                icon='palette',
-                color='primary',
-                on_click=lambda: save_theme_settings(mode_select, primary_color_input, accent_color_input)
-            )
-
-            ui.button(
-                'Apply Now (Live)',
-                icon='bolt',
-                color='positive',
-                on_click=lambda: apply_theme_settings()
-            ).props('outline').tooltip('Apply current settings without saving')
-
-    # PATH SETTINGS
-    with ui.card().classes('w-full mb-4'):
-        ui.label('Path Settings').classes('text-2xl font-bold mb-4')
-
-        # Log directory
-        with ui.row().classes('w-full items-center gap-4 mb-4'):
-            ui.label('Log Directory:').classes('min-w-32')
-            log_dir_input = ui.input(
-                'Log Directory',
-                value=config_manager.get('paths', 'log_dir', 'logs')
-            ).classes('flex-1')
-
-            ui.button(
-                'Open in OS',
-                icon='folder_open',
-                on_click=lambda: open_directory(log_dir_input.value)
-            ).props('outline')
-
-        # Export directory
-        with ui.row().classes('w-full items-center gap-4 mb-4'):
-            ui.label('Export Directory:').classes('min-w-32')
-            export_dir_input = ui.input(
-                'Export Directory',
-                value=config_manager.get('paths', 'export_dir', 'exports')
-            ).classes('flex-1')
-
-            ui.button(
-                'Open in OS',
-                icon='folder_open',
-                on_click=lambda: open_directory(export_dir_input.value)
-            ).props('outline')
-
-        ui.label(
-            f'Platform: {platform.system()} - Directories will be created if they don\'t exist'
-        ).classes('text-sm text-gray-400 mb-4')
-
-        # Save button
-        ui.button(
-            'Save Paths',
-            icon='save',
-            color='primary',
-            on_click=lambda: save_path_settings(log_dir_input, export_dir_input)
-        )
 
     # DATABASE SETTINGS
     with ui.card().classes('w-full mb-4'):
@@ -373,84 +338,8 @@ def settings_page():
                 on_click=lambda: save_database_settings(db_host, db_port, db_name, db_username, db_password)
             )
 
-    # DEFAULT VALUES
-    with ui.card().classes('w-full mb-4'):
-        ui.label('Default Values').classes('text-2xl font-bold mb-4')
-
-        ui.label(
-            'These values are used as defaults in discovery and scraping operations.'
-        ).classes('text-sm text-gray-400 mb-4')
-
-        # Crawl delay
-        with ui.row().classes('w-full items-center gap-4 mb-4'):
-            ui.label('Crawl Delay (seconds):').classes('min-w-48')
-            crawl_delay = ui.number(
-                'Crawl Delay',
-                value=config_manager.get('defaults', 'crawl_delay', 1.0),
-                min=0.1,
-                max=10.0,
-                step=0.1,
-                format='%.1f'
-            ).classes('w-48')
-
-        ui.label('Delay between requests to avoid overwhelming servers').classes(
-            'text-xs text-gray-500 ml-48 mb-4'
-        )
-
-        # Pages per pair
-        with ui.row().classes('w-full items-center gap-4 mb-4'):
-            ui.label('Pages per Pair:').classes('min-w-48')
-            pages_per_pair = ui.number(
-                'Pages per Pair',
-                value=config_manager.get('defaults', 'pages_per_pair', 1),
-                min=1,
-                max=50,
-                format='%.0f'
-            ).classes('w-48')
-
-        ui.label('Search depth: number of result pages to crawl per category/state search').classes(
-            'text-xs text-gray-500 ml-48 mb-4'
-        )
-
-        # Stale days
-        with ui.row().classes('w-full items-center gap-4 mb-4'):
-            ui.label('Stale Days:').classes('min-w-48')
-            stale_days = ui.number(
-                'Stale Days',
-                value=config_manager.get('defaults', 'stale_days', 30),
-                min=1,
-                max=365,
-                format='%.0f'
-            ).classes('w-48')
-
-        ui.label('Companies not updated in this many days are considered stale').classes(
-            'text-xs text-gray-500 ml-48 mb-4'
-        )
-
-        # Default limit
-        with ui.row().classes('w-full items-center gap-4 mb-4'):
-            ui.label('Default Limit:').classes('min-w-48')
-            default_limit = ui.number(
-                'Default Limit',
-                value=config_manager.get('defaults', 'default_limit', 100),
-                min=1,
-                max=10000,
-                format='%.0f'
-            ).classes('w-48')
-
-        ui.label('Default number of records to process in batch operations').classes(
-            'text-xs text-gray-500 ml-48 mb-4'
-        )
-
-        # Save button
-        ui.button(
-            'Save Defaults',
-            icon='save',
-            color='primary',
-            on_click=lambda: save_defaults_settings(
-                crawl_delay, pages_per_pair, stale_days, default_limit
-            )
-        )
+    # KEYWORD MANAGEMENT
+    build_keyword_management_section()
 
     # DANGER ZONE
     with ui.card().classes('w-full').style('border: 1px solid rgba(239, 68, 68, 0.5)'):

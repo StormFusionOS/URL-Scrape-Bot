@@ -225,6 +225,133 @@ def create_donut_chart_custom(name: str, value: float, color: str = None):
     return ui.echart(options).classes('w-full h-64')
 
 
+def build_discovery_status_cards(status_container):
+    """Build discovery source status cards (called by timer for auto-refresh)."""
+    status_container.clear()
+
+    with status_container:
+        # Get fresh discovery source statuses
+        source_statuses = backend.get_discovery_source_statuses()
+
+        # Discovery Source Statuses - Main section
+        with ui.row().classes('w-full gap-4 mb-4'):
+            # YP (Yellow Pages)
+            yp_status = source_statuses.get('YP', {})
+            with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
+                with ui.row().classes('items-center gap-2 mb-2'):
+                    # Red/Green indicator
+                    if yp_status.get('is_running', False):
+                        ui.icon('fiber_manual_record', size='sm').classes('text-green-400')
+                    elif yp_status.get('pending_count', 0) > 0:
+                        ui.icon('fiber_manual_record', size='sm').classes('text-yellow-400')
+                    else:
+                        ui.icon('fiber_manual_record', size='sm').classes('text-red-400')
+                    ui.label('YP (Yellow Pages)').classes('text-sm text-gray-200 font-bold')
+
+                if yp_status.get('is_running', False):
+                    ui.badge('RUNNING', color='positive').classes('mb-1')
+                elif yp_status.get('pending_count', 0) > 0:
+                    ui.badge('READY', color='warning').classes('mb-1')
+                else:
+                    ui.badge('IDLE', color='grey').classes('mb-1')
+
+                ui.label(f"{yp_status.get('active_count', 0)} active, {yp_status.get('pending_count', 0)} pending").classes('text-xs text-gray-300')
+
+            # Google Maps
+            google_status = source_statuses.get('Google', {})
+            with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
+                with ui.row().classes('items-center gap-2 mb-2'):
+                    if google_status.get('is_running', False):
+                        ui.icon('fiber_manual_record', size='sm').classes('text-green-400')
+                    elif google_status.get('pending_count', 0) > 0:
+                        ui.icon('fiber_manual_record', size='sm').classes('text-yellow-400')
+                    else:
+                        ui.icon('fiber_manual_record', size='sm').classes('text-red-400')
+                    ui.label('Google Maps').classes('text-sm text-gray-200 font-bold')
+
+                if google_status.get('is_running', False):
+                    ui.badge('RUNNING', color='positive').classes('mb-1')
+                elif google_status.get('pending_count', 0) > 0:
+                    ui.badge('READY', color='warning').classes('mb-1')
+                else:
+                    ui.badge('IDLE', color='grey').classes('mb-1')
+
+                ui.label(f"{google_status.get('active_count', 0)} active, {google_status.get('pending_count', 0)} pending").classes('text-xs text-gray-300')
+
+            # Bing Local
+            bing_status = source_statuses.get('Bing', {})
+            with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
+                with ui.row().classes('items-center gap-2 mb-2'):
+                    if bing_status.get('is_running', False):
+                        ui.icon('fiber_manual_record', size='sm').classes('text-green-400')
+                    elif bing_status.get('pending_count', 0) > 0:
+                        ui.icon('fiber_manual_record', size='sm').classes('text-yellow-400')
+                    else:
+                        ui.icon('fiber_manual_record', size='sm').classes('text-red-400')
+                    ui.label('Bing Local').classes('text-sm text-gray-200 font-bold')
+
+                if bing_status.get('is_running', False):
+                    ui.badge('RUNNING', color='positive').classes('mb-1')
+                elif bing_status.get('pending_count', 0) > 0:
+                    ui.badge('READY', color='warning').classes('mb-1')
+                else:
+                    ui.badge('IDLE', color='grey').classes('mb-1')
+
+                ui.label(f"{bing_status.get('active_count', 0)} active, {bing_status.get('pending_count', 0)} pending").classes('text-xs text-gray-300')
+
+        # Last Run & System Info Row
+        with ui.row().classes('w-full gap-4'):
+            # Last Run Per Source
+            with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
+                ui.label('Last Run (by Source)').classes('text-sm text-gray-200 mb-2 font-bold')
+
+                from datetime import datetime, timezone
+                def format_relative_time(iso_timestamp):
+                    if not iso_timestamp:
+                        return 'Never'
+                    dt = datetime.fromisoformat(iso_timestamp.replace('Z', '+00:00'))
+                    now = datetime.now(timezone.utc)
+                    delta = now - dt.replace(tzinfo=timezone.utc)
+
+                    if delta.days > 0:
+                        return f"{delta.days}d ago"
+                    elif delta.seconds >= 3600:
+                        return f"{delta.seconds // 3600}h ago"
+                    elif delta.seconds >= 60:
+                        return f"{delta.seconds // 60}m ago"
+                    else:
+                        return "Just now"
+
+                for source_name in ['YP', 'Google', 'Bing']:
+                    status = source_statuses.get(source_name, {})
+                    last_run = status.get('last_run')
+                    if last_run and last_run.get('timestamp'):
+                        time_str = format_relative_time(last_run['timestamp'])
+                        results = last_run.get('results_saved', 0)
+                        ui.label(f"{source_name}: {time_str} ({results} found)").classes('text-xs text-white')
+                    else:
+                        ui.label(f"{source_name}: Never run").classes('text-xs text-gray-400')
+
+            # Database Status
+            with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
+                ui.label('Database').classes('text-sm text-gray-200 mb-2')
+                db_status = backend.check_database_connection()
+                if db_status['connected']:
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('check_circle', size='md', color='positive')
+                        ui.label('Connected').classes('text-lg font-semibold text-green-300')
+                else:
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('error', size='md', color='negative')
+                        ui.label('Error').classes('text-lg font-semibold text-red-300')
+
+            # Total Processed
+            with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
+                ui.label('Total Companies').classes('text-sm text-gray-200 mb-2')
+                kpis = backend.kpis()
+                ui.label(str(kpis['total_companies'])).classes('text-2xl font-bold text-white')
+
+
 def dashboard_page():
     """Render dashboard page with tabs."""
     ui.label('Dashboard').classes('text-3xl font-bold mb-4')
@@ -246,51 +373,14 @@ def dashboard_page():
             with ui.card().classes('w-full mb-6').style('background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border: none;'):
                 ui.label('🖥️ System Status').classes('text-2xl font-bold mb-4 text-white')
 
-                # Import discovery state to show real-time info
-                from .discover import discovery_state
+                # Create container for auto-refreshing status cards
+                status_container = ui.column().classes('w-full')
 
-                with ui.row().classes('w-full gap-4'):
-                    # Active Discovery Status
-                    with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
-                        ui.label('Discovery Status').classes('text-sm text-gray-200 mb-2')
-                        # Check if discovery is running OR if there are active/pending YP targets
-                        active_targets = backend.count_yp_targets_by_status('in_progress')
-                        pending_targets = backend.count_yp_targets_by_status('planned')
+                # Initial population
+                build_discovery_status_cards(status_container)
 
-                        if discovery_state.running or active_targets > 0 or pending_targets > 0:
-                            with ui.row().classes('items-center gap-2'):
-                                ui.spinner(size='sm', color='positive')
-                                status_text = 'RUNNING' if discovery_state.running or active_targets > 0 else f'ACTIVE ({pending_targets} queued)'
-                                ui.label(status_text).classes('text-2xl font-bold text-green-300')
-                        else:
-                            ui.badge('IDLE', color='grey').classes('text-xl p-3')
-
-                    # Last Run Time
-                    with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
-                        ui.label('Last Run').classes('text-sm text-gray-200 mb-2')
-                        if discovery_state.last_run_summary:
-                            timestamp = discovery_state.last_run_summary['timestamp'][:19]
-                            ui.label(timestamp).classes('text-lg font-semibold text-white')
-                        else:
-                            ui.label('No runs yet').classes('text-lg text-gray-300 italic')
-
-                    # Database Status
-                    with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
-                        ui.label('Database').classes('text-sm text-gray-200 mb-2')
-                        db_status = backend.check_database_connection()
-                        if db_status['connected']:
-                            with ui.row().classes('items-center gap-2'):
-                                ui.icon('check_circle', size='md', color='positive')
-                                ui.label('Connected').classes('text-lg font-semibold text-green-300')
-                        else:
-                            with ui.row().classes('items-center gap-2'):
-                                ui.icon('error', size='md', color='negative')
-                                ui.label('Error').classes('text-lg font-semibold text-red-300')
-
-                    # Total Processed
-                    with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
-                        ui.label('Total Companies').classes('text-sm text-gray-200 mb-2')
-                        ui.label(str(kpis['total_companies'])).classes('text-2xl font-bold text-white')
+                # Auto-refresh every 10 seconds
+                ui.timer(10.0, lambda: build_discovery_status_cards(status_container))
 
             # KPI Cards
             with ui.row().classes('w-full gap-4 mb-6'):

@@ -13,7 +13,6 @@ from pathlib import Path
 # Import actual scraper modules
 # NOTE: YP scraper now uses city-first approach via CLI subprocess (see niceui/pages/discover.py)
 # from scrape_yp.yp_crawl import crawl_all_states, CATEGORIES as DEFAULT_CATEGORIES, STATES as DEFAULT_STATES
-# from scrape_ha.ha_crawl import crawl_all_states as ha_crawl_all, CATEGORIES_HA
 from scrape_site.site_scraper import scrape_website
 from db.save_discoveries import upsert_discovered, create_session
 from db.update_details import update_batch
@@ -23,6 +22,8 @@ from runner.logging_setup import get_logger
 # Import Google scraper modules
 from scrape_google.google_crawl import GoogleCrawler
 from scrape_google.google_config import GoogleConfig
+from scrape_google.google_crawl_city_first import crawl_city_targets
+from scrape_google.generate_city_targets import load_categories, generate_targets
 import asyncio
 
 # SQLAlchemy imports for queries
@@ -61,7 +62,7 @@ class BackendFacade:
             pages_per_pair: Search depth (number of result pages per category-state search)
             cancel_flag: Optional callable that returns True to cancel operation
             progress_callback: Optional callable to receive progress updates
-            providers: List of provider codes to use (e.g., ["YP", "HA"]). Default: ["YP"]
+            providers: List of provider codes to use (e.g., ["YP"]). Default: ["YP"]
             use_enhanced_filter: Use enhanced YP filtering with category tags (default: False)
             min_score: Minimum confidence score for enhanced filter (0-100, default: 50)
             include_sponsored: Include sponsored/ad listings with enhanced filter (default: False)
@@ -81,15 +82,12 @@ class BackendFacade:
 
         # Determine which providers to use
         use_yp = "YP" in providers
-        use_ha = "HA" in providers
 
         # Build category list from providers if not specified
         if not categories:
             categories = []
             if use_yp:
                 categories.extend(DEFAULT_CATEGORIES[:3])  # Use first 3 for reasonable scope
-            if use_ha:
-                categories.extend(CATEGORIES_HA)
 
         # Use default states if not provided
         if not states:
@@ -102,8 +100,7 @@ class BackendFacade:
 
         # Calculate total based on provider-specific categories
         yp_categories = [c for c in categories if c in DEFAULT_CATEGORIES] if use_yp else []
-        ha_categories = [c for c in categories if c in CATEGORIES_HA] if use_ha else []
-        total_pairs = (len(yp_categories) * len(states)) + (len(ha_categories) * len(states))
+        total_pairs = len(yp_categories) * len(states)
 
         pairs_done = 0
         total_found = 0
@@ -145,13 +142,6 @@ class BackendFacade:
                     "Please use the Discovery page in the GUI to run YP scraping."
                 )
                 # Skip YP in this legacy backend facade method
-            if use_ha and ha_categories:
-                logger.info(f"Adding HA crawler: {len(ha_categories)} categories")
-                generators.append(ha_crawl_all(
-                    categories=ha_categories,
-                    states=states,
-                    limit_per_state=pages_per_pair
-                ))
 
             # Chain generators together to process sequentially
             import itertools
@@ -365,6 +355,366 @@ class BackendFacade:
                 "duplicates": 0,
                 "errors": 1
             }
+
+    def discover_google_city_first(
+        self,
+        state_ids: List[str],
+        max_targets: Optional[int] = None,
+        scrape_details: bool = True,
+        save_to_db: bool = True,
+        cancel_flag: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable[[dict], None]] = None
+    ) -> Dict[str, Any]:
+        """
+        Run Google Maps city-first discovery across all targets in specified states.
+
+        This method uses the city × category expansion approach to systematically
+        scrape Google Maps for businesses in each city-category combination.
+
+        Args:
+            state_ids: List of 2-letter state codes (e.g., ['RI', 'MA'])
+            max_targets: Maximum number of targets to process (None = all)
+            scrape_details: Whether to scrape detailed business info
+            save_to_db: Whether to save results to database
+            cancel_flag: Optional callable that returns True to cancel operation
+            progress_callback: Optional callable to receive progress updates
+
+        Returns:
+            Dict with keys:
+            - success: Boolean indicating if operation completed successfully
+            - targets_processed: Number of targets completed
+            - total_businesses: Total businesses found across all targets
+            - saved: Businesses saved to database
+            - duplicates: Duplicates skipped
+            - captchas: Number of CAPTCHAs detected
+            - errors: Number of errors encountered
+        """
+        logger.info(
+            f"Starting Google city-first discovery: states={state_ids}, "
+            f"max_targets={max_targets}, scrape_details={scrape_details}"
+        )
+
+        # Create database session
+        session = create_session()
+
+        try:
+            # Track overall stats
+            total_targets = 0
+            total_businesses = 0
+            total_saved = 0
+            total_duplicates = 0
+            total_captchas = 0
+            total_errors = 0
+
+            # Run async crawler
+            async def run_crawler():
+                nonlocal total_targets, total_businesses, total_saved, total_duplicates, total_captchas, total_errors
+
+                async for batch in crawl_city_targets(
+                    state_ids=state_ids,
+                    session=session,
+                    max_targets=max_targets,
+                    scrape_details=scrape_details,
+                    save_to_db=save_to_db,
+                    use_session_breaks=True,
+                    checkpoint_interval=10,
+                    recover_orphans=True
+                ):
+                    # Check for cancellation
+                    if cancel_flag and cancel_flag():
+                        logger.warning("Google city-first discovery cancelled by user")
+                        break
+
+                    # Extract batch data
+                    target = batch['target']
+                    results = batch['results']
+                    stats = batch['stats']
+
+                    # Update totals
+                    total_targets += 1
+                    total_businesses += stats['total_found']
+                    total_saved += stats['total_saved']
+                    total_duplicates += stats['duplicates_skipped']
+                    if stats.get('captcha_detected'):
+                        total_captchas += 1
+
+                    # Send progress update
+                    if progress_callback:
+                        progress_callback({
+                            'type': 'progress',
+                            'message': f"Completed: {target.city}, {target.state_id} - {target.category_label}",
+                            'target': f"{target.city} - {target.category_label}",
+                            'found': stats['total_found'],
+                            'saved': stats['total_saved'],
+                            'duplicates': stats['duplicates_skipped'],
+                            'captcha': stats.get('captcha_detected', False),
+                            'total_targets': total_targets,
+                            'total_businesses': total_businesses,
+                            'total_saved': total_saved,
+                            'total_duplicates': total_duplicates,
+                            'total_captchas': total_captchas
+                        })
+
+            # Run the crawler
+            asyncio.run(run_crawler())
+
+            # Final result
+            result = {
+                "success": True,
+                "targets_processed": total_targets,
+                "total_businesses": total_businesses,
+                "saved": total_saved,
+                "duplicates": total_duplicates,
+                "captchas": total_captchas,
+                "errors": total_errors
+            }
+
+            logger.info(f"Google city-first discovery complete: {result}")
+            return result
+
+        except Exception as e:
+            logger.error(f"Google city-first discovery error: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+                "targets_processed": 0,
+                "total_businesses": 0,
+                "saved": 0,
+                "duplicates": 0,
+                "captchas": 0,
+                "errors": 1
+            }
+        finally:
+            session.close()
+
+    def get_google_target_stats(self, state_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Get statistics about Google Maps city-first targets.
+
+        Args:
+            state_ids: Optional list of state codes to filter by
+
+        Returns:
+            Dict with target statistics by status and priority
+        """
+        from db.models import GoogleTarget
+
+        session = create_session()
+        try:
+            query = session.query(GoogleTarget)
+            if state_ids:
+                query = query.filter(GoogleTarget.state_id.in_(state_ids))
+
+            total = query.count()
+
+            # Get counts by status
+            by_status = {}
+            for status in ["PLANNED", "IN_PROGRESS", "DONE", "FAILED"]:
+                count = query.filter(GoogleTarget.status == status).count()
+                if count > 0:
+                    by_status[status] = count
+
+            # Get counts by priority
+            by_priority = {}
+            for priority in [1, 2, 3]:
+                count = query.filter(GoogleTarget.priority == priority).count()
+                if count > 0:
+                    by_priority[priority] = count
+
+            return {
+                "total": total,
+                "by_status": by_status,
+                "by_priority": by_priority,
+                "states": state_ids if state_ids else "all"
+            }
+        finally:
+            session.close()
+
+    def get_bing_target_stats(self, state_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Get statistics about Bing Local city-first targets.
+
+        Args:
+            state_ids: Optional list of state codes to filter by
+
+        Returns:
+            Dict with target statistics by status and priority
+        """
+        from db.models import BingTarget
+
+        session = create_session()
+        try:
+            query = session.query(BingTarget)
+            if state_ids:
+                query = query.filter(BingTarget.state_id.in_(state_ids))
+
+            total = query.count()
+
+            # Get counts by status
+            by_status = {}
+            for status in ["PLANNED", "IN_PROGRESS", "DONE", "FAILED"]:
+                count = query.filter(BingTarget.status == status).count()
+                if count > 0:
+                    by_status[status] = count
+
+            # Get counts by priority
+            by_priority = {}
+            for priority in [1, 2, 3]:
+                count = query.filter(BingTarget.priority == priority).count()
+                if count > 0:
+                    by_priority[priority] = count
+
+            return {
+                "total": total,
+                "by_status": by_status,
+                "by_priority": by_priority,
+                "states": state_ids if state_ids else "all"
+            }
+        finally:
+            session.close()
+
+    def get_discovery_source_statuses(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Get comprehensive status for all discovery sources.
+
+        Returns:
+            Dict with status for each source (YP, Google, Bing, Site):
+            {
+                'YP': {
+                    'is_running': bool,
+                    'active_count': int,
+                    'pending_count': int,
+                    'done_count': int,
+                    'failed_count': int,
+                    'last_run': {'timestamp': str, 'city': str, 'category': str} or None
+                },
+                'Google': {...},
+                'Bing': {...},
+                'Site': {...}
+            }
+        """
+        from db.models import YPTarget, GoogleTarget, BingTarget
+        from sqlalchemy import func, desc
+        from datetime import datetime
+
+        session = create_session()
+        statuses = {}
+
+        try:
+            # ===== YP (Yellow Pages) Status =====
+            yp_in_progress = session.query(func.count(YPTarget.id)).filter(
+                YPTarget.status == 'in_progress'
+            ).scalar() or 0
+
+            yp_planned = session.query(func.count(YPTarget.id)).filter(
+                YPTarget.status == 'planned'
+            ).scalar() or 0
+
+            yp_done = session.query(func.count(YPTarget.id)).filter(
+                YPTarget.status == 'done'
+            ).scalar() or 0
+
+            yp_failed = session.query(func.count(YPTarget.id)).filter(
+                YPTarget.status == 'failed'
+            ).scalar() or 0
+
+            # Get last completed YP target
+            yp_last = session.query(YPTarget).filter(
+                YPTarget.status == 'done',
+                YPTarget.finished_at.isnot(None)
+            ).order_by(desc(YPTarget.finished_at)).first()
+
+            statuses['YP'] = {
+                'is_running': yp_in_progress > 0,
+                'active_count': yp_in_progress,
+                'pending_count': yp_planned,
+                'done_count': yp_done,
+                'failed_count': yp_failed,
+                'last_run': {
+                    'timestamp': yp_last.finished_at.isoformat() if yp_last.finished_at else None,
+                    'city': yp_last.city,
+                    'category': yp_last.category_label
+                } if yp_last else None
+            }
+
+            # ===== Google Maps Status =====
+            google_in_progress = session.query(func.count(GoogleTarget.id)).filter(
+                func.upper(GoogleTarget.status) == 'IN_PROGRESS'
+            ).scalar() or 0
+
+            google_planned = session.query(func.count(GoogleTarget.id)).filter(
+                func.upper(GoogleTarget.status) == 'PLANNED'
+            ).scalar() or 0
+
+            google_done = session.query(func.count(GoogleTarget.id)).filter(
+                func.upper(GoogleTarget.status) == 'DONE'
+            ).scalar() or 0
+
+            google_failed = session.query(func.count(GoogleTarget.id)).filter(
+                func.upper(GoogleTarget.status) == 'FAILED'
+            ).scalar() or 0
+
+            # Get last completed Google target
+            google_last = session.query(GoogleTarget).filter(
+                func.upper(GoogleTarget.status) == 'DONE',
+                GoogleTarget.finished_at.isnot(None)
+            ).order_by(desc(GoogleTarget.finished_at)).first()
+
+            statuses['Google'] = {
+                'is_running': google_in_progress > 0,
+                'active_count': google_in_progress,
+                'pending_count': google_planned,
+                'done_count': google_done,
+                'failed_count': google_failed,
+                'last_run': {
+                    'timestamp': google_last.finished_at.isoformat() if google_last.finished_at else None,
+                    'city': google_last.city,
+                    'category': google_last.category_label,
+                    'results_saved': google_last.results_saved or 0
+                } if google_last else None
+            }
+
+            # ===== Bing Local Status =====
+            bing_in_progress = session.query(func.count(BingTarget.id)).filter(
+                func.upper(BingTarget.status) == 'IN_PROGRESS'
+            ).scalar() or 0
+
+            bing_planned = session.query(func.count(BingTarget.id)).filter(
+                func.upper(BingTarget.status) == 'PLANNED'
+            ).scalar() or 0
+
+            bing_done = session.query(func.count(BingTarget.id)).filter(
+                func.upper(BingTarget.status) == 'DONE'
+            ).scalar() or 0
+
+            bing_failed = session.query(func.count(BingTarget.id)).filter(
+                func.upper(BingTarget.status) == 'FAILED'
+            ).scalar() or 0
+
+            # Get last completed Bing target
+            bing_last = session.query(BingTarget).filter(
+                func.upper(BingTarget.status) == 'DONE',
+                BingTarget.finished_at.isnot(None)
+            ).order_by(desc(BingTarget.finished_at)).first()
+
+            statuses['Bing'] = {
+                'is_running': bing_in_progress > 0,
+                'active_count': bing_in_progress,
+                'pending_count': bing_planned,
+                'done_count': bing_done,
+                'failed_count': bing_failed,
+                'last_run': {
+                    'timestamp': bing_last.finished_at.isoformat() if bing_last.finished_at else None,
+                    'city': bing_last.city,
+                    'category': bing_last.category_label,
+                    'results_saved': bing_last.results_saved or 0
+                } if bing_last else None
+            }
+
+            return statuses
+
+        finally:
+            session.close()
 
     def scrape_batch(
         self,

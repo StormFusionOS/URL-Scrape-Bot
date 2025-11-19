@@ -340,12 +340,13 @@ def extract_services_offered(listing) -> List[str]:
     return unique_services
 
 
-def parse_single_listing_enhanced(listing) -> Dict:
+def parse_single_listing_enhanced(listing, source_page_url: Optional[str] = None) -> Dict:
     """
     Parse a single business listing with enhanced field extraction.
 
     Args:
         listing: BeautifulSoup element for a business listing
+        source_page_url: URL of the page where this listing was found (for traceability)
 
     Returns:
         Dict with business information including:
@@ -353,21 +354,22 @@ def parse_single_listing_enhanced(listing) -> Dict:
         - phone: Phone number
         - address: Business address
         - website: Website URL
-        - profile_url: YP profile page URL
+        - profile_url: YP profile page URL (/mip or /bpp)
         - category_tags: List of category tags
         - rating_yp: YP rating (float)
         - reviews_yp: Number of reviews (int)
         - is_sponsored: Boolean indicating if ad/sponsored
-        - business_hours: Business hours string (NEW)
-        - description: Business description (NEW)
-        - services: List of services offered (NEW)
+        - business_hours: Business hours string
+        - description: Business description
+        - services: List of services offered
+        - source_page_url: URL where listing was found (for traceability)
     """
     result = {
         "name": None,
         "phone": None,
         "address": None,
-        "normalized_address": None,  # NEW
-        "email": None,  # NEW
+        "normalized_address": None,
+        "email": None,
         "website": None,
         "profile_url": None,
         "category_tags": [],
@@ -377,6 +379,7 @@ def parse_single_listing_enhanced(listing) -> Dict:
         "business_hours": None,
         "description": None,
         "services": [],
+        "source_page_url": source_page_url,  # NEW: for traceability
     }
 
     # Extract business name
@@ -512,12 +515,13 @@ def parse_single_listing_enhanced(listing) -> Dict:
     return result
 
 
-def parse_yp_results_enhanced(html: str) -> List[Dict]:
+def parse_yp_results_enhanced(html: str, source_page_url: Optional[str] = None) -> List[Dict]:
     """
     Parse Yellow Pages search results with enhanced extraction.
 
     Args:
         html: HTML content from Yellow Pages search page
+        source_page_url: URL of the page being parsed (for traceability)
 
     Returns:
         List of dicts with enhanced business information
@@ -539,7 +543,7 @@ def parse_yp_results_enhanced(html: str) -> List[Dict]:
 
     for listing in listings:
         try:
-            result = parse_single_listing_enhanced(listing)
+            result = parse_single_listing_enhanced(listing, source_page_url=source_page_url)
             # Only include if has a name
             if result and result.get("name"):
                 results.append(result)

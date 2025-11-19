@@ -7,6 +7,10 @@ Run with: python -m niceui.main
 import os
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv(Path(__file__).parent.parent / '.env')
 
 # Add parent directory to path to import modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -19,18 +23,36 @@ from niceui import pages
 
 
 def register_pages():
-    """Register all pages with the router."""
+    """
+    Register all dashboard pages with the router.
+
+    Pages:
+        - dashboard: Main overview with KPIs and stats
+        - discover: YP crawler controls and telemetry
+        - database: Company data browser with CSV export
+        - scheduler: Scheduled job configuration
+        - status: System status, health checks, and application logs (combined)
+        - settings: Configuration management
+    """
     router.register('dashboard', pages.dashboard_page)
     router.register('discover', pages.discover_page)
     router.register('database', pages.database_page)
     router.register('scheduler', pages.scheduler_page)
-    router.register('logs', pages.logs_page)
     router.register('status', pages.status_page)
     router.register('settings', pages.settings_page)
 
 
 def create_app():
-    """Create and configure the NiceGUI application."""
+    """
+    Create and configure the NiceGUI application.
+
+    Setup steps:
+        1. Register static files directory
+        2. Apply dark theme
+        3. Register all page routes
+        4. Setup main layout (navbar + content area)
+        5. Load default dashboard page
+    """
     # Add static files directory
     static_dir = Path(__file__).parent / 'static'
     app.add_static_files('/static', str(static_dir))
@@ -50,22 +72,32 @@ def create_app():
 
 
 def run():
-    """Run the application."""
+    """
+    Run the NiceGUI dashboard application.
+
+    Reads port and host from environment variables (NICEGUI_PORT, GUI_HOST).
+    Default: http://127.0.0.1:8080
+    """
     # Create the app
     create_app()
+
+    # Get configuration from environment
+    port = int(os.getenv('NICEGUI_PORT', '8080'))
+    host = os.getenv('GUI_HOST', '127.0.0.1')
 
     # Print startup info
     print("=" * 70)
     print("Starting Washdb-Bot NiceGUI Dashboard")
     print("=" * 70)
-    print("URL: http://127.0.0.1:8080")
+    print(f"URL: http://{host}:{port}")
+    print(f"Log Directory: {Path(__file__).parent.parent / 'logs'}")
     print("=" * 70)
 
     # Run with uvicorn-like settings
     ui.run(
         title='Washdb-Bot Dashboard',
-        port=8080,
-        host='127.0.0.1',
+        port=port,
+        host=host,
         reload=False,
         show=False,
         dark=True,

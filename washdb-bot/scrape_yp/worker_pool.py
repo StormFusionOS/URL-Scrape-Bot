@@ -59,27 +59,86 @@ def create_worker_session() -> Session:
     return SessionLocal()
 
 
-def acquire_next_target(session: Session, state_ids: List[str]) -> Optional[YPTarget]:
+def calculate_cooldown_delay(attempt: int, base_delay: float = 30.0, max_delay: float = 300.0) -> float:
     """
-    Acquire next target from database with row-level locking.
+    Calculate exponential backoff delay with jitter.
+
+    Uses exponential backoff: delay = base * (2 ^ attempt) + jitter
+    Caps at max_delay to prevent infinite waits.
+
+    Args:
+        attempt: Current attempt number (0-indexed)
+        base_delay: Base delay in seconds (default: 30s)
+        max_delay: Maximum delay in seconds (default: 300s = 5min)
+
+    Returns:
+        Delay in seconds with random jitter
+    """
+    # Exponential backoff: base * 2^attempt
+    delay = base_delay * (2 ** attempt)
+
+    # Cap at max_delay
+    delay = min(delay, max_delay)
+
+    # Add jitter (±25%)
+    jitter = delay * 0.25 * (random.random() * 2 - 1)
+    final_delay = delay + jitter
+
+    # Ensure non-negative
+    return max(0, final_delay)
+
+
+def acquire_next_target(session: Session, state_ids: List[str], worker_id: str, max_per_state: int = 5) -> Optional[YPTarget]:
+    """
+    Acquire next target from database with row-level locking and per-state concurrency limits.
 
     Uses PostgreSQL SELECT FOR UPDATE SKIP LOCKED to prevent
     multiple workers from getting the same target.
 
+    Enforces per-state concurrency limit to avoid overwhelming a single state.
+
+    Sets claimed_by, claimed_at, and heartbeat_at for crash recovery.
+
     Args:
         session: Database session
         state_ids: List of state codes to filter by
+        worker_id: Unique worker identifier (e.g., 'worker_0_pid_12345')
+        max_per_state: Maximum concurrent targets per state (default: 5)
 
     Returns:
         YPTarget object or None if no targets available
     """
     try:
-        # Build query with locking
+        # Check per-state concurrency limits
+        # Count IN_PROGRESS targets for each state
+        from sqlalchemy import func
+        state_counts = (
+            session.query(YPTarget.state_id, func.count(YPTarget.id))
+            .filter(
+                YPTarget.state_id.in_(state_ids),
+                YPTarget.status == "IN_PROGRESS"
+            )
+            .group_by(YPTarget.state_id)
+            .all()
+        )
+
+        # Build set of states at capacity
+        states_at_capacity = {state_id for state_id, count in state_counts if count >= max_per_state}
+
+        # Filter available states
+        available_states = [s for s in state_ids if s not in states_at_capacity]
+
+        if not available_states:
+            if logger:
+                logger.debug(f"All states at capacity (max {max_per_state} concurrent per state)")
+            return None
+
+        # Build query with locking and state capacity filtering
         query = (
             session.query(YPTarget)
             .filter(
-                YPTarget.state_id.in_(state_ids),
-                YPTarget.status == "planned"
+                YPTarget.state_id.in_(available_states),
+                YPTarget.status == "PLANNED"
             )
             .order_by(YPTarget.priority.asc(), YPTarget.id.asc())
             .with_for_update(skip_locked=True)  # PostgreSQL row-level lock
@@ -89,18 +148,27 @@ def acquire_next_target(session: Session, state_ids: List[str]) -> Optional[YPTa
         target = query.first()
 
         if target:
-            # Mark as in progress
-            target.status = "in_progress"
-            target.last_attempt_ts = datetime.utcnow()
+            now = datetime.now()
+
+            # Mark as in progress with worker claim
+            target.status = "IN_PROGRESS"
+            target.last_attempt_ts = now
             target.attempts += 1
+            target.claimed_by = worker_id
+            target.claimed_at = now
+            target.heartbeat_at = now  # Initial heartbeat
+            target.page_target = target.max_pages  # Set target page count
+
             session.commit()
 
-            logger.debug(f"Acquired target {target.id}: {target.city}, {target.state_id} - {target.category_label}")
+            if logger:
+                logger.debug(f"Acquired target {target.id}: {target.city}, {target.state_id} - {target.category_label} (claimed by {worker_id})")
 
         return target
 
     except Exception as e:
-        logger.error(f"Error acquiring target: {e}")
+        if logger:
+            logger.error(f"Error acquiring target: {e}")
         session.rollback()
         return None
 
@@ -118,8 +186,11 @@ def worker_main(worker_id: int, proxy_file: str, state_ids: List[str], stop_even
     # Setup logging
     logger = setup_worker_logging(worker_id)
 
+    # Create unique worker identifier with PID
+    worker_identifier = f"worker_{worker_id}_pid_{os.getpid()}"
+
     logger.info("=" * 60)
-    logger.info(f"Worker {worker_id} starting...")
+    logger.info(f"Worker {worker_id} starting (ID: {worker_identifier})...")
     logger.info("=" * 60)
 
     # Load proxy pool
@@ -151,6 +222,11 @@ def worker_main(worker_id: int, proxy_file: str, state_ids: List[str], stop_even
     # Create database session
     session = create_worker_session()
 
+    # Create WAL for this worker
+    from scrape_yp.yp_wal import WorkerWAL
+    wal = WorkerWAL(worker_identifier, log_dir="logs")
+    logger.info(f"WAL log: {wal.log_file}")
+
     # Initialize browser
     browser = None
     browser_context = None
@@ -161,7 +237,7 @@ def worker_main(worker_id: int, proxy_file: str, state_ids: List[str], stop_even
         # Main worker loop
         while not stop_event.is_set():
             # Acquire next target
-            target = acquire_next_target(session, state_ids)
+            target = acquire_next_target(session, state_ids, worker_identifier)
 
             if not target:
                 logger.info("No targets available, waiting...")
@@ -181,8 +257,8 @@ def worker_main(worker_id: int, proxy_file: str, state_ids: List[str], stop_even
                         if browser_context:
                             browser_context.close()
                         browser.close()
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Worker {worker_id}: Browser close failed during restart: {e}", exc_info=True)
 
                 # Launch new browser with proxy
                 try:
@@ -225,22 +301,57 @@ def worker_main(worker_id: int, proxy_file: str, state_ids: List[str], stop_even
 
             # Crawl target
             try:
-                # Pass browser context to crawl function
+                # Pass browser context, WAL, stop_event, and proxy info to crawl function
                 results, stats = crawl_single_target_with_context(
                     target=target,
                     browser_context=browser_context,
                     session=session,
                     min_score=WorkerConfig.MIN_CONFIDENCE_SCORE,
-                    include_sponsored=WorkerConfig.INCLUDE_SPONSORED
+                    include_sponsored=WorkerConfig.INCLUDE_SPONSORED,
+                    wal=wal,
+                    stop_event=stop_event,
+                    proxy=current_proxy,
+                    proxy_pool=proxy_pool
                 )
 
-                # Report success
+                # RESILIENCE: Check for blocking/CAPTCHA
+                if stats.get('blocked') or stats.get('captcha_detected'):
+                    block_reason = stats.get('block_reason', 'Unknown')
+                    logger.warning(f"🚫 Target {target.id} blocked/CAPTCHA: {block_reason}")
+
+                    # Calculate cool-down delay with exponential backoff
+                    cooldown = calculate_cooldown_delay(target.attempts, base_delay=30.0, max_delay=300.0)
+                    logger.warning(f"  Cooling down for {cooldown:.1f}s before proxy rotation...")
+
+                    # Mark target with cooling-down note
+                    target.status = "PLANNED"  # Return to queue
+                    target.note = f"cooling_down_after_block_attempt={target.attempts}_reason={block_reason[:100]}"
+                    target.last_error = f"Blocked: {block_reason}"
+                    session.commit()
+
+                    # Cool-down delay
+                    time.sleep(cooldown)
+
+                    # Rotate proxy (force browser restart)
+                    logger.info(f"  Rotating proxy after block/CAPTCHA...")
+                    current_proxy = proxy_pool.get_proxy(strategy=WorkerConfig.PROXY_SELECTION_STRATEGY)
+                    if not current_proxy:
+                        logger.error("No healthy proxies available after rotation!")
+                        break
+
+                    # Force browser restart with new proxy
+                    targets_processed_this_browser = WorkerConfig.MAX_TARGETS_PER_BROWSER
+                    continue  # Skip to next target
+
+                # Report success if no blocking
                 proxy_pool.report_success(current_proxy)
                 targets_processed_this_browser += 1
 
                 # Mark target as done
-                target.status = "done"
+                target.status = "DONE"
                 target.note = f"Completed: {stats.get('accepted', 0)} results"
+                target.finished_at = datetime.utcnow()
+                target.heartbeat_at = datetime.utcnow()  # Final heartbeat
                 session.commit()
 
                 logger.info(f"✓ Target {target.id} complete: {stats.get('accepted', 0)} results accepted")
@@ -251,11 +362,13 @@ def worker_main(worker_id: int, proxy_file: str, state_ids: List[str], stop_even
 
                 # Mark target as failed or retry
                 if target.attempts >= WorkerConfig.MAX_TARGET_RETRY_ATTEMPTS:
-                    target.status = "failed"
+                    target.status = "FAILED"
                     target.note = f"Failed after {target.attempts} attempts: timeout"
+                    target.last_error = str(e)[:500]
                     logger.error(f"✗ Target {target.id} failed (max retries)")
                 else:
-                    target.status = "planned"  # Retry later
+                    target.status = "PLANNED"  # Retry later
+                    target.last_error = str(e)[:500]
                     logger.warning(f"Target {target.id} will be retried (attempt {target.attempts})")
 
                 session.commit()
@@ -276,11 +389,13 @@ def worker_main(worker_id: int, proxy_file: str, state_ids: List[str], stop_even
 
                 # Mark target for retry
                 if target.attempts >= WorkerConfig.MAX_TARGET_RETRY_ATTEMPTS:
-                    target.status = "failed"
+                    target.status = "FAILED"
                     target.note = f"Failed after {target.attempts} attempts: {str(e)[:200]}"
+                    target.last_error = str(e)[:500]
                     logger.error(f"✗ Target {target.id} failed (max retries)")
                 else:
-                    target.status = "planned"
+                    target.status = "PLANNED"
+                    target.last_error = str(e)[:500]
                     logger.warning(f"Target {target.id} will be retried")
 
                 session.commit()
@@ -309,16 +424,21 @@ def worker_main(worker_id: int, proxy_file: str, state_ids: List[str], stop_even
                 if browser_context:
                     browser_context.close()
                 browser.close()
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Worker {worker_id}: Browser close failed during shutdown: {e}", exc_info=True)
 
         if playwright_instance:
             try:
                 playwright_instance.stop()
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Worker {worker_id}: Playwright stop failed during shutdown: {e}", exc_info=True)
 
         session.close()
+
+        # Close WAL
+        if wal:
+            wal.close()
+            logger.info(f"WAL closed: {wal.log_file}")
 
         # Print proxy stats
         stats = proxy_pool.get_stats()
@@ -327,12 +447,20 @@ def worker_main(worker_id: int, proxy_file: str, state_ids: List[str], stop_even
         logger.info(f"Worker {worker_id} stopped")
 
 
-def crawl_single_target_with_context(target, browser_context, session, min_score, include_sponsored):
+def crawl_single_target_with_context(target, browser_context, session, min_score, include_sponsored, wal=None, stop_event=None, proxy=None, proxy_pool=None):
     """
-    Crawl a single target using existing browser context.
+    Crawl a single target using existing browser context with per-page checkpoints.
 
     This is a wrapper around the existing crawl_single_target function
     but uses a pre-existing browser context instead of launching a new browser.
+
+    Implements crash recovery and resilience:
+    - Updates page_current after each page
+    - Saves listings atomically with page checkpoint
+    - Logs to WAL for operator visibility
+    - Checks stop_event before each page
+    - Detects CAPTCHA/blocking and signals proxy rotation
+    - Returns block/CAPTCHA detection status
 
     Args:
         target: YPTarget object
@@ -340,28 +468,50 @@ def crawl_single_target_with_context(target, browser_context, session, min_score
         session: Database session
         min_score: Minimum confidence score
         include_sponsored: Include sponsored listings
+        wal: WorkerWAL instance for logging (optional)
+        stop_event: Event to check for graceful stop (optional)
+        proxy: Current ProxyInfo being used (optional, for block detection)
+        proxy_pool: ProxyPool instance (optional, for reporting failures)
 
     Returns:
-        Tuple of (results, stats)
+        Tuple of (results, stats) where stats includes 'blocked' and 'captcha_detected' keys
     """
     from scrape_yp.yp_parser_enhanced import parse_yp_results_enhanced
     from scrape_yp.yp_filter import filter_yp_listings
     from db.save_discoveries import upsert_discovered
+    from scrape_yp.yp_monitor import detect_captcha, detect_blocking
 
     results_all = []
     stats = {
         "pages_crawled": 0,
         "raw_results": 0,
         "accepted": 0,
-        "rejected": 0
+        "rejected": 0,
+        "blocked": False,
+        "captcha_detected": False,
+        "block_reason": None
     }
+
+    # Log target start to WAL
+    if wal:
+        wal.log_target_start(
+            target.id, target.city, target.state_id,
+            target.category_label, target.max_pages
+        )
 
     try:
         # Create a new page in the context
         page = browser_context.new_page()
 
-        # Crawl up to max_pages
-        for page_num in range(1, target.max_pages + 1):
+        # Resume from page_current + 1 (or start from 1 if page_current == 0)
+        start_page = max(1, target.page_current + 1)
+
+        # Crawl from start_page to max_pages
+        for page_num in range(start_page, target.max_pages + 1):
+            # Check for graceful stop before each page
+            if stop_event and stop_event.is_set():
+                logger.info(f"  Stop requested, exiting after page {page_num - 1}")
+                break
             # Construct URL (primary_url already contains full URL)
             if page_num == 1:
                 url = target.primary_url
@@ -374,12 +524,42 @@ def crawl_single_target_with_context(target, browser_context, session, min_score
             try:
                 response = page.goto(url, timeout=WorkerConfig.BROWSER_TIMEOUT_MS, wait_until='domcontentloaded')
 
+                status_code = response.status if response else None
+
                 if not response or response.status != 200:
                     logger.warning(f"  Page {page_num} returned status {response.status if response else 'None'}")
                     break
 
                 # Get HTML
                 html = page.content()
+
+                # RESILIENCE: Detect CAPTCHA/blocking
+                is_captcha, captcha_type = detect_captcha(html)
+                is_blocked, block_reason = detect_blocking(html, status_code)
+
+                if is_captcha:
+                    logger.warning(f"  CAPTCHA detected on page {page_num}: {captcha_type}")
+                    stats['captcha_detected'] = True
+                    stats['block_reason'] = f"CAPTCHA: {captcha_type}"
+
+                    # Report to proxy pool
+                    if proxy and proxy_pool:
+                        proxy_pool.report_failure(proxy, "captcha")
+
+                    # Break out - will trigger proxy rotation in worker loop
+                    break
+
+                if is_blocked:
+                    logger.warning(f"  Blocking detected on page {page_num}: {block_reason}")
+                    stats['blocked'] = True
+                    stats['block_reason'] = block_reason
+
+                    # Report to proxy pool
+                    if proxy and proxy_pool:
+                        proxy_pool.report_failure(proxy, "blocked")
+
+                    # Break out - will trigger proxy rotation in worker loop
+                    break
 
                 # Parse results
                 parsed_results = parse_yp_results_enhanced(html)
@@ -408,6 +588,39 @@ def crawl_single_target_with_context(target, browser_context, session, min_score
                 stats["accepted"] += len(accepted)
                 stats["rejected"] += filter_stats.get('rejected', 0)
 
+                # ATOMIC CHECKPOINT: Update page progress and save accepted listings together
+                # This ensures we can resume from exactly where we left off
+                try:
+                    # Save accepted listings from this page
+                    if accepted:
+                        inserted, skipped, updated = upsert_discovered(accepted)
+                        logger.debug(f"  Page {page_num}: {inserted} inserted, {updated} updated, {skipped} skipped")
+
+                    # Update page checkpoint (atomic with listing saves)
+                    target.page_current = page_num
+                    target.heartbeat_at = datetime.utcnow()  # Heartbeat on each page
+
+                    # Calculate next page URL
+                    if page_num < target.max_pages:
+                        target.next_page_url = f"{target.primary_url}?page={page_num + 1}"
+                    else:
+                        target.next_page_url = None
+
+                    session.commit()
+
+                    # Log to WAL for visibility
+                    if wal:
+                        wal.log_page_complete(
+                            target.id, page_num, len(accepted),
+                            target.city, target.state_id, target.category_label,
+                            raw_count=len(parsed_results)
+                        )
+
+                except Exception as e:
+                    logger.error(f"  Failed to save page {page_num} checkpoint: {e}")
+                    session.rollback()
+                    raise
+
                 # Early exit if no new results
                 if len(new_results) == 0 and page_num > 1:
                     logger.info(f"  No new results on page {page_num}, stopping pagination")
@@ -415,24 +628,27 @@ def crawl_single_target_with_context(target, browser_context, session, min_score
 
             except PlaywrightTimeoutError:
                 logger.warning(f"  Page {page_num} timed out")
+                # Log error to WAL
+                if wal:
+                    wal.log_target_error(target.id, "Timeout", page_number=page_num)
                 raise  # Re-raise to be handled by worker
 
             except Exception as e:
                 logger.error(f"  Error fetching page {page_num}: {e}")
+                # Log error to WAL
+                if wal:
+                    wal.log_target_error(target.id, str(e), page_number=page_num)
                 break
 
         # Close page
         page.close()
 
-        # Save results to database
-        if results_all:
-            logger.info(f"Upserting {len(results_all)} companies...")
-            inserted, skipped, updated = upsert_discovered(results_all)
-            logger.info(f"Upsert complete: {inserted} inserted, {updated} updated, {skipped} skipped")
+        # Note: Results are saved per-page atomically with checkpoints
+        # No need to save again here - this prevents duplicates on resume
 
-            stats["inserted"] = inserted
-            stats["updated"] = updated
-            stats["skipped"] = skipped
+        # Log target completion to WAL
+        if wal:
+            wal.log_target_complete(target.id, stats['pages_crawled'], stats['accepted'])
 
         # Log summary
         logger.info(f"Target complete: {target.city}, {target.state_id} - {target.category_label} | pages={stats['pages_crawled']}, parsed={stats['raw_results']}, accepted={stats['accepted']} ({stats['accepted']/stats['raw_results']*100 if stats['raw_results'] > 0 else 0:.1f}%)")
@@ -441,6 +657,9 @@ def crawl_single_target_with_context(target, browser_context, session, min_score
 
     except Exception as e:
         logger.error(f"Error in crawl_single_target_with_context: {e}")
+        # Log error to WAL
+        if wal:
+            wal.log_target_error(target.id, str(e))
         raise
 
 

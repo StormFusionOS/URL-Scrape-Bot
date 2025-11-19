@@ -21,13 +21,19 @@ classifiers = [
 ]
 
 dependencies = [
-    "sqlalchemy>=2.0.0",
-    "psycopg[binary]>=3.0.0",
-    "requests>=2.31.0",
+    "sqlalchemy>=2.0.0,<3.0.0",
+    "psycopg[binary]>=3.0.0,<4.0.0",
+    "requests>=2.31.0,<3.0.0",
     "beautifulsoup4>=4.12.0",
     "lxml>=4.9.0",
+    "playwright>=1.40.0",
+    "playwright-stealth>=1.0.0",
     "python-dotenv>=1.0.0",
     "tldextract>=5.0.0",
+    "APScheduler>=3.10.0,<4.0.0",
+    "nicegui>=1.4.0",
+    "flask>=2.3.0,<4.0.0",
+    "flask-cors>=4.0.0",
 ]
 
 [project.optional-dependencies]
@@ -39,7 +45,7 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["db", "scrape_yp", "scrape_site", "gui", "runner", "tests"]
+packages = ["db", "scrape_yp", "scrape_site", "scrape_google", "scheduler", "runner", "niceui", "tests"]
 
 [tool.black]
 line-length = 100

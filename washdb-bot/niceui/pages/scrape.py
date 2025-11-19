@@ -224,6 +224,8 @@ async def run_scrape(
 
 def stop_scrape():
     """Stop the running scrape and kill all external worker processes."""
+    from niceui.utils.process_manager import find_and_kill_processes_by_name
+
     # Cancel GUI-initiated scrape job
     if scrape_state.running:
         scrape_state.cancel()
@@ -231,35 +233,11 @@ def stop_scrape():
 
     # Kill all external worker processes (run_state_workers.py, worker_pool, state_worker_*)
     try:
-        # Find all worker processes
-        result = subprocess.run(
-            ["ps", "aux"],
-            capture_output=True,
-            text=True,
-            check=True
-        )
+        patterns = ['run_state_workers', 'worker_pool', 'state_worker_']
+        killed_count = find_and_kill_processes_by_name(patterns)
 
-        pids_to_kill = []
-        for line in result.stdout.split('\n'):
-            if any(pattern in line for pattern in ['run_state_workers', 'worker_pool', 'state_worker_']):
-                if 'grep' not in line:  # Exclude grep itself
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        try:
-                            pid = int(parts[1])
-                            pids_to_kill.append(pid)
-                        except (ValueError, IndexError):
-                            continue
-
-        if pids_to_kill:
-            # Kill all worker processes
-            for pid in pids_to_kill:
-                try:
-                    subprocess.run(['kill', '-9', str(pid)], check=False)
-                except Exception as e:
-                    print(f"Error killing PID {pid}: {e}")
-
-            ui.notify(f'Stopped {len(pids_to_kill)} worker processes', type='positive')
+        if killed_count > 0:
+            ui.notify(f'Stopped {killed_count} worker processes', type='positive')
         else:
             ui.notify('No worker processes found running', type='info')
 

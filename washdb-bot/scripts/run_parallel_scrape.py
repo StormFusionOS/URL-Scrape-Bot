@@ -122,12 +122,15 @@ def stop_existing_scrapers():
 
         if found:
             print(f"Found {len(found)} existing scraper(s), stopping...")
-            for pid in found:
-                try:
-                    subprocess.run(['kill', '-9', pid], timeout=5)
-                    print(f"  ✓ Stopped PID {pid}")
-                except:
-                    print(f"  ✗ Failed to stop PID {pid}")
+            # Import process manager for cross-platform process termination
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent.parent))
+            from niceui.utils.process_manager import find_and_kill_processes_by_name
+
+            # Kill all matching processes
+            patterns = ['run_state_workers', 'worker_pool', 'state_worker_']
+            killed_count = find_and_kill_processes_by_name(patterns)
+            print(f"  ✓ Stopped {killed_count} processes")
         else:
             print("✓ No existing scrapers found")
 

@@ -7,6 +7,8 @@ Models:
 - JobExecutionLog: Logs execution history of scheduled jobs
 - CityRegistry: US cities dataset for city-first scraping
 - YPTarget: Target list for Yellow Pages city-first crawling
+- GoogleTarget: Target list for Google Maps city-first crawling
+- BingTarget: Target list for Bing Local Search city-first crawling
 """
 
 from datetime import datetime
@@ -19,12 +21,15 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.types import JSON, TypeDecorator
 
 
 class Base(DeclarativeBase):
@@ -47,11 +52,13 @@ class Company(Base):
         services: Description of services offered
         service_area: Geographic service area
         address: Physical address
-        source: Data source (e.g., 'YP', 'HA', 'Manual')
+        source: Data source (e.g., 'YP', 'Google', 'Bing', 'Manual')
         rating_yp: Yellow Pages rating
         rating_google: Google rating
+        rating_bing: Bing Local Search rating
         reviews_google: Number of Google reviews
         reviews_yp: Number of Yellow Pages reviews
+        reviews_bing: Number of Bing reviews
         rating_ha: HomeAdvisor rating
         reviews_ha: Number of HomeAdvisor reviews
         active: Whether the company is active
@@ -74,8 +81,8 @@ class Company(Base):
     )
 
     # Contact Information
-    phone: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    email: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    phone: Mapped[Optional[str]] = mapped_column(Text, nullable=True, index=True, comment="Indexed for deduplication")
+    email: Mapped[Optional[str]] = mapped_column(Text, nullable=True, index=True)
 
     # Business Details
     services: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -88,12 +95,19 @@ class Company(Base):
     )
     rating_yp: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     rating_google: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    rating_bing: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     reviews_google: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     reviews_yp: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    reviews_bing: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
-    # HomeAdvisor ratings (added for HA integration)
-    rating_ha: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    reviews_ha: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Parse Metadata (for traceability and explainability)
+    # Use JSON with PostgreSQL variant for cross-database compatibility (SQLite tests + PostgreSQL production)
+    parse_metadata: Mapped[Optional[dict]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"),
+        nullable=True,
+        comment="JSON with parsing/filtering signals: profile_url, category_tags, is_sponsored, filter_score, filter_reason, source_page_url"
+    )
 
     # Status and Timestamps
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -107,73 +121,6 @@ class Company(Base):
     def __repr__(self) -> str:
         """String representation of Company."""
         return f"<Company(id={self.id}, name='{self.name}', domain='{self.domain}')>"
-
-
-class HAStaging(Base):
-    """
-    HomeAdvisor staging table for pipeline workflow.
-
-    Stores businesses discovered from HomeAdvisor (Phase 1) before URL finding (Phase 2).
-    This table acts as a queue for the url_finder_worker to process.
-
-    Attributes:
-        id: Primary key
-        name: Business name
-        address: Full address (city, state, zip extracted from this)
-        phone: Contact phone number
-        profile_url: HomeAdvisor profile URL (unique identifier)
-        rating_ha: HomeAdvisor rating
-        reviews_ha: Number of HomeAdvisor reviews
-        created_at: When business was discovered
-        processed: Whether URL finding has been completed
-        retry_count: Number of URL finding attempts
-        next_retry_at: When to retry URL finding (exponential backoff)
-        last_error: Error message from last URL finding attempt
-    """
-
-    __tablename__ = "ha_staging"
-
-    # Primary Key
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-
-    # Business Information
-    name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    phone: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    profile_url: Mapped[str] = mapped_column(
-        Text, unique=True, index=True, nullable=False,
-        comment="HomeAdvisor profile URL (unique identifier)"
-    )
-
-    # Ratings
-    rating_ha: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    reviews_ha: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-
-    # Pipeline Status
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now(), nullable=False,
-        comment="When business was discovered"
-    )
-    processed: Mapped[bool] = mapped_column(
-        Boolean, default=False, nullable=False, index=True,
-        comment="Whether URL finding has been completed"
-    )
-    retry_count: Mapped[int] = mapped_column(
-        Integer, default=0, nullable=False,
-        comment="Number of URL finding attempts"
-    )
-    next_retry_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True, index=True,
-        comment="When to retry URL finding (exponential backoff)"
-    )
-    last_error: Mapped[Optional[str]] = mapped_column(
-        Text, nullable=True,
-        comment="Error message from last URL finding attempt"
-    )
-
-    def __repr__(self) -> str:
-        """String representation of HAStaging."""
-        return f"<HAStaging(id={self.id}, name='{self.name}', processed={self.processed}, retry_count={self.retry_count})>"
 
 
 class ScheduledJob(Base):
@@ -462,10 +409,19 @@ class YPTarget(Base):
         fallback_url: Search URL with geo_location_terms
         max_pages: Maximum pages to crawl (based on population tier)
         priority: Scraping priority (from city registry)
-        status: Current status (planned, in_progress, done, failed, parked)
+        status: Current status (PLANNED, IN_PROGRESS, DONE, FAILED, STUCK, PARKED)
         last_attempt_ts: Last attempt timestamp
         attempts: Number of scraping attempts
         note: Optional note (e.g., reason for failure)
+        claimed_by: Worker ID that claimed this target
+        claimed_at: When target was claimed by worker
+        heartbeat_at: Last worker heartbeat timestamp
+        page_current: Current page being crawled (0-based, 0=not started)
+        page_target: Target page count (same as max_pages)
+        last_listing_id: Last processed listing ID (for resume cursor)
+        next_page_url: URL of next page to crawl (for resume)
+        last_error: Last error message encountered
+        finished_at: When target was completed
         created_at: Record creation timestamp
         updated_at: Last update timestamp
     """
@@ -523,10 +479,10 @@ class YPTarget(Base):
         comment="Priority (1=high, 2=medium, 3=low)"
     )
 
-    # Status Tracking
+    # Status Tracking (Enhanced for crash recovery)
     status: Mapped[str] = mapped_column(
-        String(50), nullable=False, default='planned', index=True,
-        comment="planned, in_progress, done, failed, parked"
+        String(50), nullable=False, default='PLANNED', index=True,
+        comment="PLANNED, IN_PROGRESS, DONE, FAILED, STUCK, PARKED"
     )
     last_attempt_ts: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True, index=True
@@ -540,6 +496,50 @@ class YPTarget(Base):
         comment="Optional note (e.g., 'no results page 1', 'blocked')"
     )
 
+    # Worker Claim & Heartbeat (for crash recovery)
+    claimed_by: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True, index=True,
+        comment="Worker ID that claimed this target (e.g., 'worker_0_pid_12345')"
+    )
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+        comment="When target was claimed by worker"
+    )
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+        comment="Last worker heartbeat timestamp (for orphan detection)"
+    )
+
+    # Page-level Progress (for resume from exact page)
+    page_current: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Current page being crawled (0=not started, 1=first page, etc.)"
+    )
+    page_target: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1,
+        comment="Target page count (same as max_pages)"
+    )
+    last_listing_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True,
+        comment="Last processed listing ID (stable cursor for resume)"
+    )
+    next_page_url: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="URL of next page to crawl (for resume)"
+    )
+
+    # Error Tracking
+    last_error: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Last error message encountered"
+    )
+
+    # Completion Tracking
+    finished_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+        comment="When target was completed (status=DONE)"
+    )
+
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
@@ -550,7 +550,331 @@ class YPTarget(Base):
 
     def __repr__(self) -> str:
         """String representation of YPTarget."""
-        return f"<YPTarget(id={self.id}, city='{self.city}', state='{self.state_id}', category='{self.category_label}', status='{self.status}')>"
+        return f"<YPTarget(id={self.id}, city='{self.city}', state='{self.state_id}', category='{self.category_label}', status='{self.status}', page={self.page_current}/{self.page_target})>"
+
+
+class GoogleTarget(Base):
+    """
+    Google Maps scraping target (city × category).
+
+    Each row represents a city-category combination to be scraped from Google Maps.
+    Generated from CityRegistry × allowed categories.
+
+    Attributes:
+        id: Primary key
+        provider: Source provider (always 'Google')
+        state_id: 2-letter state code
+        city: City name
+        city_slug: City-state slug (e.g., 'providence-ri')
+        lat: City latitude
+        lng: City longitude
+        category_label: Human-readable category name
+        category_keyword: Google search keyword
+        search_query: Full Google Maps search query
+        max_results: Maximum results to fetch (1-100)
+        priority: Scraping priority (1=high, 2=medium, 3=low)
+        status: Current status (PLANNED, IN_PROGRESS, DONE, FAILED, STUCK, PARKED)
+        last_attempt_ts: Last attempt timestamp
+        attempts: Number of scraping attempts
+        note: Optional note (e.g., reason for failure)
+        claimed_by: Worker ID that claimed this target
+        claimed_at: When target was claimed by worker
+        heartbeat_at: Last worker heartbeat timestamp
+        results_found: Number of businesses found
+        results_saved: Number of businesses saved to DB
+        duplicates_skipped: Number of duplicates skipped
+        last_error: Last error message encountered
+        captcha_detected: Whether CAPTCHA was encountered
+        finished_at: When target was completed
+        created_at: Record creation timestamp
+        updated_at: Last update timestamp
+    """
+
+    __tablename__ = "google_targets"
+
+    # Primary Key
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Provider & Location
+    provider: Mapped[str] = mapped_column(
+        String(10), nullable=False, default='Google', index=True
+    )
+    state_id: Mapped[str] = mapped_column(
+        String(2), nullable=False, index=True,
+        comment="2-letter state code"
+    )
+    city: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    city_slug: Mapped[str] = mapped_column(
+        String(255), nullable=False, index=True,
+        comment="City-state slug (e.g., 'providence-ri')"
+    )
+    lat: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment="City latitude"
+    )
+    lng: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment="City longitude"
+    )
+
+    # Category
+    category_label: Mapped[str] = mapped_column(
+        String(255), nullable=False, index=True,
+        comment="Human-readable category name (e.g., 'Window Cleaning')"
+    )
+    category_keyword: Mapped[str] = mapped_column(
+        String(255), nullable=False,
+        comment="Google search keyword (e.g., 'window cleaning')"
+    )
+
+    # Search Configuration
+    search_query: Mapped[str] = mapped_column(
+        Text, nullable=False,
+        comment="Full search query (e.g., 'car wash near Providence, RI')"
+    )
+    max_results: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=20,
+        comment="Maximum results to fetch (1-100)"
+    )
+    priority: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=2, index=True,
+        comment="Priority (1=high, 2=medium, 3=low)"
+    )
+
+    # Status Tracking
+    status: Mapped[str] = mapped_column(
+        String(50), nullable=False, default='PLANNED', index=True,
+        comment="PLANNED, IN_PROGRESS, DONE, FAILED, STUCK, PARKED"
+    )
+    last_attempt_ts: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Number of scraping attempts"
+    )
+    note: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Optional note (e.g., 'no results', 'blocked')"
+    )
+
+    # Worker Claim & Heartbeat (for crash recovery)
+    claimed_by: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True, index=True,
+        comment="Worker ID that claimed this target"
+    )
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+        comment="When target was claimed by worker"
+    )
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+        comment="Last worker heartbeat (for orphan detection)"
+    )
+
+    # Results Tracking
+    results_found: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Number of businesses found"
+    )
+    results_saved: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Number of businesses saved to DB"
+    )
+    duplicates_skipped: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Number of duplicates skipped"
+    )
+
+    # Error Tracking
+    last_error: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Last error message encountered"
+    )
+    captcha_detected: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False,
+        comment="Whether CAPTCHA was encountered"
+    )
+
+    # Completion Tracking
+    finished_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+        comment="When target was completed (status=DONE)"
+    )
+
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, onupdate=func.now(), nullable=True
+    )
+
+    def __repr__(self) -> str:
+        """String representation of GoogleTarget."""
+        return f"<GoogleTarget(id={self.id}, city='{self.city}', state='{self.state_id}', category='{self.category_label}', status='{self.status}', results={self.results_saved})>"
+
+
+class BingTarget(Base):
+    """
+    Bing Local Search scraping target (city × category).
+
+    Each row represents a city-category combination to be scraped from Bing Local Search.
+    Generated from CityRegistry × allowed categories.
+
+    Attributes:
+        id: Primary key
+        provider: Source provider (always 'Bing')
+        state_id: 2-letter state code
+        city: City name
+        city_slug: City-state slug (e.g., 'providence-ri')
+        lat: City latitude
+        lng: City longitude
+        category_label: Human-readable category name
+        category_keyword: Bing search keyword
+        search_query: Full Bing Local Search query
+        max_results: Maximum results to fetch (1-100)
+        priority: Scraping priority (1=high, 2=medium, 3=low)
+        status: Current status (PLANNED, IN_PROGRESS, DONE, FAILED, STUCK, PARKED)
+        last_attempt_ts: Last attempt timestamp
+        attempts: Number of scraping attempts
+        note: Optional note (e.g., reason for failure)
+        claimed_by: Worker ID that claimed this target
+        claimed_at: When target was claimed by worker
+        heartbeat_at: Last worker heartbeat timestamp
+        results_found: Number of businesses found
+        results_saved: Number of businesses saved to DB
+        duplicates_skipped: Number of duplicates skipped
+        last_error: Last error message encountered
+        captcha_detected: Whether CAPTCHA was encountered
+        finished_at: When target was completed
+        created_at: Record creation timestamp
+        updated_at: Last update timestamp
+    """
+
+    __tablename__ = "bing_targets"
+
+    # Primary Key
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Provider & Location
+    provider: Mapped[str] = mapped_column(
+        String(10), nullable=False, default='Bing', index=True
+    )
+    state_id: Mapped[str] = mapped_column(
+        String(2), nullable=False, index=True,
+        comment="2-letter state code"
+    )
+    city: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    city_slug: Mapped[str] = mapped_column(
+        String(255), nullable=False, index=True,
+        comment="City-state slug (e.g., 'providence-ri')"
+    )
+    lat: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment="City latitude"
+    )
+    lng: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment="City longitude"
+    )
+
+    # Category
+    category_label: Mapped[str] = mapped_column(
+        String(255), nullable=False, index=True,
+        comment="Human-readable category name (e.g., 'Window Cleaning')"
+    )
+    category_keyword: Mapped[str] = mapped_column(
+        String(255), nullable=False,
+        comment="Bing search keyword (e.g., 'window cleaning')"
+    )
+
+    # Search Configuration
+    search_query: Mapped[str] = mapped_column(
+        Text, nullable=False,
+        comment="Full search query (e.g., 'car wash near Providence, RI')"
+    )
+    max_results: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=20,
+        comment="Maximum results to fetch (1-100)"
+    )
+    priority: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=2, index=True,
+        comment="Priority (1=high, 2=medium, 3=low)"
+    )
+
+    # Status Tracking
+    status: Mapped[str] = mapped_column(
+        String(50), nullable=False, default='PLANNED', index=True,
+        comment="PLANNED, IN_PROGRESS, DONE, FAILED, STUCK, PARKED"
+    )
+    last_attempt_ts: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Number of scraping attempts"
+    )
+    note: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Optional note (e.g., 'no results', 'blocked')"
+    )
+
+    # Worker Claim & Heartbeat (for crash recovery)
+    claimed_by: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True, index=True,
+        comment="Worker ID that claimed this target"
+    )
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+        comment="When target was claimed by worker"
+    )
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+        comment="Last worker heartbeat (for orphan detection)"
+    )
+
+    # Results Tracking
+    results_found: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Number of businesses found"
+    )
+    results_saved: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Number of businesses saved to DB"
+    )
+    duplicates_skipped: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Number of duplicates skipped"
+    )
+
+    # Error Tracking
+    last_error: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Last error message encountered"
+    )
+    captcha_detected: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False,
+        comment="Whether CAPTCHA was encountered"
+    )
+
+    # Completion Tracking
+    finished_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+        comment="When target was completed (status=DONE)"
+    )
+
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, onupdate=func.now(), nullable=True
+    )
+
+    def __repr__(self) -> str:
+        """String representation of BingTarget."""
+        return f"<BingTarget(id={self.id}, city='{self.city}', state='{self.state_id}', category='{self.category_label}', status='{self.status}', results={self.results_saved})>"
 
 
 # Helper Functions
@@ -640,3 +964,96 @@ def domain_from_url(url: str) -> str:
     domain = f"{extracted.domain}.{extracted.suffix}"
 
     return domain.lower()
+
+
+class SiteCrawlState(Base):
+    """
+    Site crawler state for resumable crawling.
+
+    Tracks the crawl progress for individual domains, allowing the site scraper
+    to resume from where it left off if interrupted.
+
+    Phases:
+        - 'parsing_home': Currently parsing homepage
+        - 'crawling_internal': Crawling internal pages (contact, about, services)
+        - 'done': All target pages discovered and parsed
+        - 'failed': Crawl failed (too many errors, site unreachable, etc.)
+
+    State Management:
+        - After each page parse, save cursor (last_completed_url + pending_queue)
+        - Queue is bounded to MAX_QUEUE_SIZE (default: 50 URLs)
+        - On restart, rebuild queue from saved state and continue
+    """
+
+    __tablename__ = "site_crawl_state"
+
+    # Primary Key
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Domain being crawled
+    domain: Mapped[str] = mapped_column(
+        String(255), unique=True, index=True, nullable=False,
+        comment="Domain being crawled (e.g., 'example.com')"
+    )
+
+    # Crawl Phase
+    phase: Mapped[str] = mapped_column(
+        String(50), nullable=False, default='parsing_home',
+        comment="Current phase: parsing_home, crawling_internal, done, failed"
+    )
+
+    # Cursor State
+    last_completed_url: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Last URL successfully parsed (for resume)"
+    )
+
+    # Pending URL Queue (bounded, max 50 URLs)
+    pending_queue: Mapped[Optional[dict]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), nullable=True,
+        comment="JSON array of pending URLs to crawl (max 50)"
+    )
+
+    # Discovered Target URLs
+    discovered_targets: Mapped[Optional[dict]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), nullable=True,
+        comment="JSON with discovered URLs: {contact: [...], about: [...], services: [...]}"
+    )
+
+    # Statistics
+    pages_crawled: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Total pages crawled so far"
+    )
+    targets_found: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Total target pages found (contact/about/services)"
+    )
+    errors_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Number of errors encountered"
+    )
+
+    # Error Tracking
+    last_error: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Last error message (for debugging)"
+    )
+
+    # Timestamps
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False,
+        comment="When crawl started"
+    )
+    last_updated: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now(), nullable=False,
+        comment="Last cursor save timestamp"
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True,
+        comment="When crawl completed (done or failed)"
+    )
+
+    def __repr__(self) -> str:
+        """String representation of SiteCrawlState."""
+        return f"<SiteCrawlState(domain='{self.domain}', phase='{self.phase}', pages={self.pages_crawled})>"

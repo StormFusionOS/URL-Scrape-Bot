@@ -36,7 +36,7 @@ class YPFilter:
         self,
         allowlist_file: str = 'data/yp_category_allowlist.txt',
         blocklist_file: str = 'data/yp_category_blocklist.txt',
-        anti_keywords_file: str = 'data/yp_anti_keywords.txt',
+        anti_keywords_file: str = 'data/anti_keywords.txt',
         positive_hints_file: str = 'data/yp_positive_hints.txt'
     ):
         """
@@ -45,7 +45,7 @@ class YPFilter:
         Args:
             allowlist_file: Path to category allowlist
             blocklist_file: Path to category blocklist
-            anti_keywords_file: Path to anti-keywords
+            anti_keywords_file: Path to shared anti-keywords file
             positive_hints_file: Path to positive hint phrases
         """
         self.allowlist = self._load_set(allowlist_file)
@@ -261,9 +261,9 @@ class YPFilter:
             listing: Listing dict with keys: name, category_tags, description (optional)
 
         Returns:
-            Tuple of (should_include, reason, confidence_score)
+            Tuple of (should_include, reason_code, confidence_score)
             - should_include: Boolean
-            - reason: String explaining the decision
+            - reason_code: Concise code explaining the decision (e.g., "no_website", "mismatch_category")
             - confidence_score: Float (0-100) indicating confidence
         """
         name = listing.get('name', '')
@@ -285,18 +285,21 @@ class YPFilter:
             # Debug: log what category tags were found
             if category_tags:
                 logger.debug(f"Rejected '{name}': Found tags {category_tags} but none matched allowlist")
+                return False, "mismatch_category", 0.0
             else:
                 logger.debug(f"Rejected '{name}': No category tags extracted")
-            return False, "No allowed category tags", 0.0
+                return False, "no_category", 0.0
 
         # Rule 2: Must NOT have blocked tags
         if blocked_tags:
-            return False, f"Blocked category: {', '.join(blocked_tags)}", 0.0
+            # Return first blocked tag as part of code
+            return False, f"blocked_category:{blocked_tags[0][:20]}", 0.0
 
         # Rule 3: Check for anti-keywords in name
         has_anti, anti_matches = self._has_anti_keyword(name)
         if has_anti:
-            return False, f"Anti-keyword in name: {', '.join(anti_matches[:2])}", 0.0
+            # Return first anti-keyword match
+            return False, f"anti_keyword:{anti_matches[0][:20]}", 0.0
 
         # Rule 4: Special case for "Equipment & Services"
         if has_equipment:
@@ -308,19 +311,23 @@ class YPFilter:
             has_positive_hint, hint_matches = self._has_positive_hint(combined_text)
 
             if not has_other_positive and not has_positive_hint:
-                return False, "Equipment category without service indicators", 0.0
+                return False, "equipment_only", 0.0
 
         # Rule 5: Check for e-commerce URLs
         website = listing.get('website', '')
         if website:
             is_ecommerce, ecommerce_reason = self._is_ecommerce_url(website)
             if is_ecommerce:
-                return False, f"E-commerce site detected: {ecommerce_reason}", 0.0
+                return False, "ecommerce_url", 0.0
+
+        # Rule 6: Must have website
+        if not website:
+            return False, "no_website", 0.0
 
         # Calculate confidence score
         score = self._calculate_score(listing, allowed_tags, combined_text)
 
-        return True, f"Accepted: {len(allowed_tags)} allowed tags", score
+        return True, "accepted", score
 
     def _calculate_score(
         self,
@@ -418,7 +425,7 @@ class YPFilter:
             # Skip sponsored if requested
             if not include_sponsored and listing.get('is_sponsored', False):
                 stats['rejected'] += 1
-                reason = 'Sponsored/ad listing'
+                reason = 'sponsored'  # Concise code
                 stats['rejected_reasons'][reason] = stats['rejected_reasons'].get(reason, 0) + 1
                 continue
 
@@ -434,6 +441,9 @@ class YPFilter:
                 stats['accepted'] += 1
             else:
                 stats['rejected'] += 1
+                # Handle low score rejection
+                if should_include and score < min_score:
+                    reason = f"low_score:{int(score)}"
                 stats['rejected_reasons'][reason] = stats['rejected_reasons'].get(reason, 0) + 1
 
         # Calculate score statistics

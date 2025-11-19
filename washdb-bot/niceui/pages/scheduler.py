@@ -413,7 +413,8 @@ def _show_job_details(job_id: int):
                 if isinstance(config, str):
                     try:
                         config = json.loads(config)
-                    except:
+                    except (json.JSONDecodeError, ValueError) as e:
+                        logging.debug(f"Failed to parse job config JSON: {e}")
                         config = {}
 
                 if config:
@@ -463,7 +464,8 @@ def _show_edit_job_dialog(job_id: int):
     if isinstance(config, str):
         try:
             config = json.loads(config)
-        except:
+        except (json.JSONDecodeError, ValueError) as e:
+            logging.debug(f"Failed to parse job config JSON for editing: {e}")
             config = {}
 
     # Form state variables

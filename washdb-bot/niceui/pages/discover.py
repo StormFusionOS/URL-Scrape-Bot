@@ -123,35 +123,14 @@ class MultiWorkerState:
         # Second, find and kill ALL worker processes on the system
         # (including those started externally, not from GUI)
         try:
-            result = sp.run(
-                ["ps", "aux"],
-                capture_output=True,
-                text=True,
-                check=True
-            )
+            from niceui.utils.process_manager import find_and_kill_processes_by_name
 
-            pids_to_kill = []
-            for line in result.stdout.split('\n'):
-                # Match worker processes: run_state_workers, worker_pool, state_worker_
-                if any(pattern in line for pattern in ['run_state_workers', 'worker_pool', 'state_worker_']):
-                    if 'grep' not in line:  # Exclude grep itself
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            try:
-                                pid = int(parts[1])
-                                pids_to_kill.append(pid)
-                            except (ValueError, IndexError):
-                                continue
+            # Kill all worker processes using cross-platform process manager
+            patterns = ['run_state_workers', 'worker_pool', 'state_worker_']
+            killed_count = find_and_kill_processes_by_name(patterns)
 
-            # Kill all found PIDs
-            if pids_to_kill:
-                for pid in pids_to_kill:
-                    try:
-                        sp.run(['kill', '-9', str(pid)], check=False)
-                    except Exception as e:
-                        print(f"Error killing PID {pid}: {e}")
-
-                print(f"Killed {len(pids_to_kill)} worker processes")
+            if killed_count > 0:
+                print(f"Killed {killed_count} worker processes")
 
         except Exception as e:
             print(f"Error finding/killing external workers: {e}")
@@ -846,6 +825,174 @@ async def run_google_maps_discovery(
         progress_bar.value = 0
 
 
+async def run_google_maps_city_first_discovery(
+    state_ids,
+    max_targets,
+    scrape_details,
+    stats_card,
+    progress_bar,
+    run_button,
+    stop_button
+):
+    """Run Google Maps city-first discovery in background with progress updates."""
+    discovery_state.running = True
+    discovery_state.reset()
+    discovery_state.start_time = datetime.now()
+
+    # Register job in process manager
+    job_id = 'discovery_google_city_first'
+    process_manager.register(job_id, 'Google 5-Worker City-First System', log_file='logs/google_worker_1.log')
+
+    # Disable run button, enable stop button
+    run_button.disable()
+    stop_button.enable()
+
+    # Start tailing log file (monitor worker 1's log as primary)
+    if discovery_state.log_viewer:
+        discovery_state.log_viewer.set_log_file('logs/google_worker_1.log')
+        discovery_state.log_viewer.load_last_n_lines(50)
+        discovery_state.log_viewer.start_tailing()
+
+    # Add initial log messages
+    discovery_state.add_log('=' * 60, 'info')
+    discovery_state.add_log('GOOGLE MAPS 5-WORKER CITY-FIRST SYSTEM STARTED', 'success')
+    discovery_state.add_log('=' * 60, 'info')
+    discovery_state.add_log('Workers: 5 parallel workers with state partitioning', 'info')
+    discovery_state.add_log('Coverage: All 50 US states', 'info')
+    discovery_state.add_log(f'Scrape Details: {scrape_details}', 'info')
+    discovery_state.add_log('Log shown: Worker 1 (see logs/google_worker_*.log for others)', 'info')
+    discovery_state.add_log('-' * 60, 'info')
+
+    # Clear stats
+    stats_card.clear()
+    with stats_card:
+        ui.label('Running city-first discovery...').classes('text-lg font-bold')
+        stat_labels = {
+            'targets': ui.label('Targets: 0'),
+            'businesses': ui.label('Businesses: 0'),
+            'saved': ui.label('Saved: 0'),
+            'captchas': ui.label('CAPTCHAs: 0')
+        }
+
+    try:
+        ui.notify('Starting 5-worker Google Maps city-first scraper system...', type='info')
+
+        # Call the 5-worker start script instead of single process
+        cmd = [
+            'bash',
+            'scripts/google_workers/start_google_workers.sh'
+        ]
+
+        # Note: The 5-worker system automatically handles all 50 states with partitioning
+        # Individual worker parameters (max_targets, scrape_details) are handled by the script
+
+        # Create subprocess runner (uses worker 1's log as primary)
+        runner = SubprocessRunner(job_id, 'logs/google_worker_1.log')
+        discovery_state.subprocess_runner = runner
+
+        # Start the 5-worker system
+        pid = runner.start(cmd, cwd=os.getcwd())
+        ui.notify(f'5-worker system started (script PID: {pid})', type='positive')
+        ui.notify('Workers deployed: 5 workers processing all 50 states', type='info')
+
+        # Update process manager with script PID
+        # Note: Individual worker PIDs are tracked in logs/google_workers.pid
+        process_manager.update_pid(job_id, pid)
+
+        # Wait for subprocess to complete
+        while runner.is_running():
+            await asyncio.sleep(1.0)
+
+            # Update progress bar (rough estimate based on time)
+            elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
+            # City-first: ~30 seconds per target average
+            if max_targets:
+                estimated_done = min(int(elapsed / 30), max_targets)
+                progress_bar.value = estimated_done / max_targets
+            else:
+                # Indeterminate progress
+                progress_bar.value = 0.5
+
+            # Check for cancellation
+            if discovery_state.is_cancelled():
+                ui.notify('Stopping 5-worker system...', type='warning')
+                # Call stop script to gracefully stop all 5 workers
+                import subprocess
+                subprocess.run(['bash', 'scripts/google_workers/stop_google_workers.sh'],
+                             cwd=os.getcwd(), capture_output=True)
+                runner.kill()  # Also kill the start script
+                break
+
+        # Get final status
+        status = runner.get_status()
+        return_code = status['return_code']
+
+        if return_code == 0:
+            ui.notify('City-first scraper completed successfully!', type='positive')
+        elif return_code == -9:
+            ui.notify('City-first scraper was killed by user', type='warning')
+        else:
+            ui.notify(f'City-first scraper failed with code {return_code}', type='negative')
+
+        # Parse final results from log (simplified - just show completion)
+        result = {
+            "targets_processed": max_targets or "all",
+            "success": return_code == 0
+        }
+
+        # Calculate elapsed time
+        elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
+
+        # Log final results
+        discovery_state.add_log('-' * 60, 'info')
+        discovery_state.add_log('CITY-FIRST DISCOVERY COMPLETED SUCCESSFULLY!', 'success')
+        discovery_state.add_log(f'Duration: {elapsed:.1f}s', 'info')
+        discovery_state.add_log('=' * 60, 'info')
+
+        # Update final stats card
+        stats_card.clear()
+        with stats_card:
+            ui.label('City-First Discovery Complete!').classes('text-lg font-bold text-green-500')
+            ui.label(f'Elapsed: {elapsed:.1f}s').classes('text-sm text-gray-400')
+            ui.label('Check logs for detailed results').classes('text-sm text-gray-400')
+
+        # Progress bar to full
+        progress_bar.value = 1.0
+
+        # Show notification
+        if discovery_state.cancel_requested:
+            ui.notify('City-first discovery cancelled', type='warning')
+        else:
+            ui.notify('City-first discovery complete!', type='positive')
+
+    except Exception as e:
+        discovery_state.add_log('-' * 60, 'error')
+        discovery_state.add_log('CITY-FIRST DISCOVERY FAILED!', 'error')
+        discovery_state.add_log(f'Error: {str(e)}', 'error')
+        discovery_state.add_log('=' * 60, 'error')
+
+        stats_card.clear()
+        with stats_card:
+            ui.label('Discovery Failed').classes('text-lg font-bold text-red-500')
+            ui.label(f'Error: {str(e)}').classes('text-sm text-red-400')
+
+        ui.notify(f'City-first discovery failed: {str(e)}', type='negative')
+
+    finally:
+        # Stop tailing log file
+        if discovery_state.log_viewer:
+            discovery_state.log_viewer.stop_tailing()
+
+        # Mark job as completed in process manager
+        process_manager.mark_completed(job_id, success=not discovery_state.cancel_requested)
+
+        # Re-enable run button, disable stop button
+        discovery_state.running = False
+        run_button.enable()
+        stop_button.disable()
+        progress_bar.value = 0
+
+
 async def stop_discovery():
     """Stop the running discovery immediately."""
     if discovery_state.running:
@@ -1507,47 +1654,92 @@ def build_google_maps_ui(container):
         with ui.card().classes('w-full mb-4'):
             ui.label('Google Maps Configuration').classes('text-xl font-bold mb-4')
 
-            # Warning banner
-            with ui.card().classes('w-full bg-yellow-900 border-l-4 border-yellow-500 mb-4'):
-                ui.label('⚠ Important: Google Maps Scraping Notes').classes('text-lg font-bold text-yellow-200')
-                ui.label('• VERY SLOW: 45-90 seconds per business (conservative anti-detection delays)').classes('text-sm text-yellow-100')
-                ui.label('• May trigger CAPTCHA: If detected, wait 2-4 hours before retrying').classes('text-sm text-yellow-100')
-                ui.label('• Start small: Test with 1-2 businesses first').classes('text-sm text-yellow-100')
-                ui.label('• Use specific locations for best results (e.g., "Seattle, WA" not just "WA")').classes('text-sm text-yellow-100')
+            # City-First Crawl Controls
+            ui.label('States to Crawl').classes('font-semibold mb-2')
 
-            # Search configuration
-            ui.label('Search Query').classes('font-semibold mb-2')
-            query_input = ui.input(
-                label='What to search for',
-                placeholder='e.g., pressure washing, car wash, plumber',
-                value='pressure washing'
-            ).classes('w-full mb-4')
+            # All 50 US states
+            all_states = [
+                'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
+                'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
+                'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
+                'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
+                'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'
+            ]
 
-            ui.label('Location').classes('font-semibold mb-2')
-            location_input = ui.input(
-                label='Where to search',
-                placeholder='e.g., Seattle, WA or Chicago, IL',
-                value='Seattle, WA'
-            ).classes('w-full mb-4')
+            # Store checkbox states in a dict
+            state_checkboxes = {}
 
-            ui.label('Max Results').classes('font-semibold mb-2')
-            max_results_input = ui.number(
-                label='Maximum businesses to find',
-                value=10,
+            with ui.card().classes('w-full bg-gray-800 p-4 mb-4'):
+                with ui.row().classes('w-full items-center mb-2'):
+                    ui.label('Select States').classes('text-sm font-bold text-blue-200')
+                    ui.space()
+                    select_all_btn = ui.button('Select All', icon='check_box', color='positive').props('size=sm outline')
+                    deselect_all_btn = ui.button('Deselect All', icon='check_box_outline_blank', color='warning').props('size=sm outline')
+
+                # Create checkbox grid (10 columns for 50 states = 5 rows)
+                with ui.grid(columns=10).classes('w-full gap-2'):
+                    for state in all_states:
+                        state_checkboxes[state] = ui.checkbox(state, value=True).classes('text-xs')
+
+                # Select/Deselect All functionality
+                def select_all():
+                    for checkbox in state_checkboxes.values():
+                        checkbox.value = True
+
+                def deselect_all():
+                    for checkbox in state_checkboxes.values():
+                        checkbox.value = False
+
+                select_all_btn.on('click', select_all)
+                deselect_all_btn.on('click', deselect_all)
+
+            ui.label('✓ All 50 states selected by default - will process ALL available targets').classes('text-xs text-green-400 mb-4')
+
+            ui.label('Max Targets').classes('font-semibold mb-2')
+            max_targets_input = ui.number(
+                label='Maximum targets to process (leave empty for all)',
+                value=None,
                 min=1,
-                max=50,
+                max=10000,
                 step=1
             ).classes('w-64 mb-4')
-            ui.label('⚠ More results = longer time (10 businesses ≈ 7-15 minutes)').classes('text-xs text-yellow-400 mb-4')
+            ui.label('✓ Set to process ALL targets in all selected states').classes('text-xs text-green-400 mb-4')
 
             # Scrape details checkbox
             scrape_details_checkbox = ui.checkbox(
-                'Scrape full business details (phone, website, hours, etc.)',
+                'Scrape full business details',
                 value=True
             ).classes('mb-2')
             ui.label('Unchecking will only get basic info (faster but less data)').classes('text-xs text-gray-400')
 
-        # Stats and controls
+            # Target stats display
+            with ui.card().classes('w-full bg-gray-800 border-l-4 border-blue-500 mt-4'):
+                ui.label('Target Statistics').classes('text-md font-bold text-blue-200 mb-2')
+                stats_display = ui.column().classes('w-full')
+
+                def get_selected_states():
+                    """Helper function to get list of selected states from checkboxes."""
+                    return [state for state, checkbox in state_checkboxes.items() if checkbox.value]
+
+                def refresh_target_stats():
+                    """Refresh target statistics display."""
+                    from niceui.backend_facade import BackendFacade
+                    backend = BackendFacade()
+                    selected_states = get_selected_states()
+                    stats = backend.get_google_target_stats(selected_states)
+
+                    stats_display.clear()
+                    with stats_display:
+                        ui.label(f"Total targets: {stats['total']}").classes('text-sm text-gray-300')
+                        if stats['by_status']:
+                            for status, count in stats['by_status'].items():
+                                color = 'text-green-400' if status == 'DONE' else 'text-blue-400' if status == 'PLANNED' else 'text-yellow-400'
+                                ui.label(f"  {status}: {count}").classes(f'text-xs {color}')
+
+                ui.button('Refresh Stats', on_click=refresh_target_stats, icon='refresh').classes('mt-2')
+                refresh_target_stats()  # Initial load
+
+        # Stats and controls (same as before)
         with ui.card().classes('w-full mb-4'):
             ui.label('Discovery Status').classes('text-xl font-bold mb-4')
 
@@ -1564,7 +1756,7 @@ def build_google_maps_ui(container):
                 run_button = ui.button('START DISCOVERY', icon='play_arrow', color='positive')
                 stop_button = ui.button('STOP', icon='stop', color='negative')
 
-                # Set initial button states based on global discovery state
+                # Set initial button states
                 if discovery_state.running:
                     run_button.disable()
                     stop_button.enable()
@@ -1572,29 +1764,137 @@ def build_google_maps_ui(container):
                     run_button.enable()
                     stop_button.disable()
 
-        # Live output with real-time log tailing
-        log_viewer = LiveLogViewer('logs/google_scrape.log', max_lines=500, auto_scroll=True)
-        log_viewer.create()
+        # ====================================================================
+        # MULTI-WORKER STATUS DISPLAY (5 Workers)
+        # ====================================================================
 
-        # Store references (log_element set to None - add_log will skip)
-        discovery_state.log_viewer = log_viewer
-        discovery_state.log_element = None  # Disable old logging, use log viewer instead
+        # Google Worker State Assignments (matches start_google_workers.sh)
+        google_worker_states = {
+            0: ['AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA'],
+            1: ['HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD'],
+            2: ['MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ'],
+            3: ['NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC'],
+            4: ['SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY']
+        }
 
-        # Run button click handler
+        # Worker Status Grid
+        with ui.card().classes('w-full mb-4'):
+            ui.label('5-Worker System Status').classes('text-xl font-bold mb-4')
+
+            with ui.grid(columns=5).classes('w-full gap-3'):
+                google_worker_badges = {}
+                google_worker_labels = {}
+
+                for worker_id in range(5):
+                    states = google_worker_states[worker_id]
+
+                    with ui.card().classes('p-3 hover:shadow-lg transition-shadow bg-gray-800'):
+                        # Header
+                        with ui.row().classes('items-center justify-between w-full mb-2'):
+                            ui.label(f'Worker {worker_id + 1}').classes('font-bold text-sm text-blue-200')
+                            google_worker_badges[worker_id] = ui.badge('CHECKING', color='grey').classes('text-xs')
+
+                        # Assigned states
+                        ui.label(f"{', '.join(states[:3])}...").classes('text-xs text-gray-400 mb-2')
+
+                        # Stats placeholder
+                        google_worker_labels[worker_id] = ui.label('Ready').classes('text-xs text-gray-300')
+
+        # Live output with tabbed multi-worker log viewers
+        with ui.card().classes('w-full'):
+            ui.label('Live Worker Output').classes('text-xl font-bold mb-2')
+
+            # Tab selector for workers
+            with ui.tabs().classes('w-full') as google_tabs:
+                google_tab_all = ui.tab('All Workers')
+                google_worker_tabs = []
+                for i in range(5):
+                    google_worker_tabs.append(ui.tab(f'Worker {i + 1}'))
+
+            # Tab panels
+            with ui.tab_panels(google_tabs, value=google_tab_all).classes('w-full'):
+                # All workers merged view - shows Worker 1 as primary
+                with ui.tab_panel(google_tab_all):
+                    ui.label('📊 Aggregate view - showing Worker 1 log as primary').classes('text-xs text-gray-400 mb-2')
+                    log_viewer_all = LiveLogViewer('logs/google_worker_1.log', max_lines=400, auto_scroll=True)
+                    log_viewer_all.create()
+                    log_viewer_all.load_last_n_lines(100)
+                    log_viewer_all.start_tailing()
+
+                # Individual worker logs
+                google_log_viewers = []
+                for i in range(5):
+                    with ui.tab_panel(google_worker_tabs[i]):
+                        states = google_worker_states[i]
+                        ui.label(f"🌎 States: {', '.join(states)}").classes('text-xs text-gray-400 mb-2')
+                        log_viewer = LiveLogViewer(f'logs/google_worker_{i + 1}.log', max_lines=300, auto_scroll=True)
+                        log_viewer.create()
+                        log_viewer.load_last_n_lines(100)
+                        log_viewer.start_tailing()
+                        google_log_viewers.append(log_viewer)
+
+        # Check worker status on page load
+        def check_google_workers_status():
+            """Check if Google workers are running and update badges."""
+            import subprocess
+            try:
+                # Check for running worker processes via PID file
+                pid_file = 'logs/google_workers.pid'
+                if os.path.exists(pid_file):
+                    with open(pid_file, 'r') as f:
+                        pids = [int(line.strip()) for line in f if line.strip()]
+
+                    # Check if PIDs are running
+                    for worker_id, pid in enumerate(pids[:5]):
+                        try:
+                            result = subprocess.run(['ps', '-p', str(pid)], capture_output=True)
+                            if result.returncode == 0:
+                                # Worker is running
+                                if worker_id in google_worker_badges:
+                                    google_worker_badges[worker_id].set_text('RUNNING')
+                                    google_worker_badges[worker_id].props('color=positive')
+                                if worker_id in google_worker_labels:
+                                    google_worker_labels[worker_id].set_text('Processing targets...')
+                            else:
+                                # Worker stopped
+                                if worker_id in google_worker_badges:
+                                    google_worker_badges[worker_id].set_text('STOPPED')
+                                    google_worker_badges[worker_id].props('color=warning')
+                        except Exception:
+                            pass
+                else:
+                    # No PID file, workers not running
+                    for worker_id in range(5):
+                        if worker_id in google_worker_badges:
+                            google_worker_badges[worker_id].set_text('IDLE')
+                            google_worker_badges[worker_id].props('color=grey')
+            except Exception as e:
+                print(f"Error checking worker status: {e}")
+
+        # Initial status check
+        check_google_workers_status()
+
+        # Periodic status updates
+        ui.timer(5.0, check_google_workers_status)
+
+        # Store references
+        discovery_state.log_viewer = log_viewer_all
+        discovery_state.log_element = None
+
+        # Run button click handler - City-First Discovery
         async def start_discovery():
-            # Validate Google Maps inputs
-            if not query_input.value or not query_input.value.strip():
-                ui.notify('Please enter a search query', type='warning')
-                return
-            if not location_input.value or not location_input.value.strip():
-                ui.notify('Please enter a location', type='warning')
+            # Get selected states from checkboxes
+            selected_states = [state for state, checkbox in state_checkboxes.items() if checkbox.value]
+
+            # Validate city-first inputs
+            if not selected_states:
+                ui.notify('Please select at least one state', type='warning')
                 return
 
-            # Run Google Maps discovery
-            await run_google_maps_discovery(
-                query_input.value.strip(),
-                location_input.value.strip(),
-                int(max_results_input.value),
+            # Run city-first discovery
+            await run_google_maps_city_first_discovery(
+                selected_states,
+                int(max_targets_input.value) if max_targets_input.value else None,
                 scrape_details_checkbox.value,
                 stats_card,
                 progress_bar,
@@ -1607,38 +1907,165 @@ def build_google_maps_ui(container):
 
 
 def build_bing_ui(container):
-    """Build Bing discovery UI in the given container."""
+    """Build Bing Local Search 5-worker city-first discovery UI."""
     with container:
-        # Configuration card
+        ui.label('Bing Local Search - City-First Discovery (5-Worker System)').classes('text-2xl font-bold mb-4')
+
+        # Info banner
+        with ui.card().classes('w-full bg-blue-900 border-l-4 border-blue-500 mb-4'):
+            ui.label('🔍 Bing Local Search City-First Crawler').classes('text-lg font-bold text-blue-200')
+            ui.label('• 5 independent workers covering all 50 US states').classes('text-sm text-blue-100')
+            ui.label('• 15 custom categories (pressure washing, window cleaning, etc.)').classes('text-sm text-blue-100')
+            ui.label('• Cross-source enrichment: adds rating_bing to existing companies').classes('text-sm text-blue-100')
+            ui.label('• Conservative delays (45-90s) for stealth operation').classes('text-sm text-blue-100')
+
+        # Bing Worker State Assignments (matches start_bing_workers.sh)
+        bing_worker_states = {
+            0: ['AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA'],
+            1: ['HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD'],
+            2: ['MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ'],
+            3: ['NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC'],
+            4: ['SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY']
+        }
+
+        # Worker Status Grid
         with ui.card().classes('w-full mb-4'):
-            ui.label('Bing Discovery Configuration').classes('text-xl font-bold mb-4')
+            ui.label('5-Worker System Status').classes('text-xl font-bold mb-4')
+            with ui.grid(columns=5).classes('w-full gap-3'):
+                bing_worker_badges = {}
+                bing_worker_labels = {}
+                for worker_id in range(5):
+                    states = bing_worker_states[worker_id]
+                    with ui.card().classes('p-3 hover:shadow-lg transition-shadow bg-gray-800'):
+                        with ui.row().classes('items-center justify-between w-full mb-2'):
+                            ui.label(f'Worker {worker_id + 1}').classes('font-bold text-sm text-blue-200')
+                            bing_worker_badges[worker_id] = ui.badge('CHECKING', color='grey').classes('text-xs')
+                        ui.label(f"{', '.join(states[:3])}...").classes('text-xs text-gray-400 mb-2')
+                        bing_worker_labels[worker_id] = ui.label('Ready').classes('text-xs text-gray-300')
 
-            # Coming soon banner
-            with ui.card().classes('w-full bg-blue-900 border-l-4 border-blue-500 mb-4'):
-                ui.label('🚧 Bing Discovery - Coming Soon').classes('text-lg font-bold text-blue-200')
-                ui.label('• Search businesses on Bing Maps and Bing Local').classes('text-sm text-blue-100')
-                ui.label('• Similar functionality to Google Maps discovery').classes('text-sm text-blue-100')
-                ui.label('• Will support query and location-based searches').classes('text-sm text-blue-100')
-
-            # Placeholder configuration
-            ui.label('Search Query').classes('font-semibold mb-2')
-            query_input = ui.input(
-                label='What to search for',
-                placeholder='e.g., pressure washing, car wash, plumber',
-                value='pressure washing'
-            ).props('disable').classes('w-full mb-4')
-
-            ui.label('Location').classes('font-semibold mb-2')
-            location_input = ui.input(
-                label='Where to search',
-                placeholder='e.g., Seattle, WA or Chicago, IL',
-                value='Seattle, WA'
-            ).props('disable').classes('w-full mb-4')
-
-        # Status message
+        # Live output with tabbed multi-worker log viewers
         with ui.card().classes('w-full'):
-            ui.label('Status').classes('text-xl font-bold mb-4')
-            ui.label('Bing scraper implementation is planned. This will allow discovery of businesses from Bing search results.').classes('text-gray-400')
+            ui.label('Live Worker Output').classes('text-xl font-bold mb-2')
+            with ui.tabs().classes('w-full') as bing_tabs:
+                bing_tab_all = ui.tab('All Workers')
+                bing_worker_tabs = []
+                for i in range(5):
+                    bing_worker_tabs.append(ui.tab(f'Worker {i + 1}'))
+
+            with ui.tab_panels(bing_tabs, value=bing_tab_all).classes('w-full'):
+                # All workers merged view
+                with ui.tab_panel(bing_tab_all):
+                    ui.label('📊 Aggregate view - showing Worker 1 log as primary').classes('text-xs text-gray-400 mb-2')
+                    log_viewer_all = LiveLogViewer('logs/bing_worker_1.log', max_lines=400, auto_scroll=True)
+                    log_viewer_all.create()
+                    log_viewer_all.load_last_n_lines(100)
+                    log_viewer_all.start_tailing()
+
+                # Individual worker logs
+                bing_log_viewers = []
+                for i in range(5):
+                    with ui.tab_panel(bing_worker_tabs[i]):
+                        states = bing_worker_states[i]
+                        ui.label(f"🌎 States: {', '.join(states)}").classes('text-xs text-gray-400 mb-2')
+                        log_viewer = LiveLogViewer(f'logs/bing_worker_{i + 1}.log', max_lines=300, auto_scroll=True)
+                        log_viewer.create()
+                        log_viewer.load_last_n_lines(100)
+                        log_viewer.start_tailing()
+                        bing_log_viewers.append(log_viewer)
+
+        # Check worker status function
+        def check_bing_workers_status():
+            """Check if Bing workers are running and update badges."""
+            import subprocess
+            try:
+                pid_file = 'logs/bing_workers.pid'
+                if os.path.exists(pid_file):
+                    with open(pid_file, 'r') as f:
+                        pids = [int(line.strip()) for line in f if line.strip()]
+                    for worker_id, pid in enumerate(pids[:5]):
+                        try:
+                            result = subprocess.run(['ps', '-p', str(pid)], capture_output=True)
+                            if result.returncode == 0:
+                                if worker_id in bing_worker_badges:
+                                    bing_worker_badges[worker_id].set_text('RUNNING')
+                                    bing_worker_badges[worker_id].props('color=positive')
+                                if worker_id in bing_worker_labels:
+                                    bing_worker_labels[worker_id].set_text('Processing targets...')
+                            else:
+                                if worker_id in bing_worker_badges:
+                                    bing_worker_badges[worker_id].set_text('STOPPED')
+                                    bing_worker_badges[worker_id].props('color=warning')
+                        except Exception:
+                            pass
+                else:
+                    # No PID file - all workers stopped
+                    for worker_id in range(5):
+                        if worker_id in bing_worker_badges:
+                            bing_worker_badges[worker_id].set_text('IDLE')
+                            bing_worker_badges[worker_id].props('color=grey')
+                        if worker_id in bing_worker_labels:
+                            bing_worker_labels[worker_id].set_text('Not started')
+            except Exception as e:
+                print(f"Error checking Bing worker status: {e}")
+
+        # Initial check and periodic updates
+        check_bing_workers_status()
+        ui.timer(5.0, check_bing_workers_status)
+
+        # Worker Management Controls
+        with ui.card().classes('w-full mt-4'):
+            ui.label('Worker Management').classes('text-xl font-bold mb-4')
+
+            with ui.row().classes('gap-4 w-full'):
+                async def start_bing_workers():
+                    """Start all 5 Bing workers."""
+                    ui.notify('Starting Bing workers...', type='info')
+                    result = subprocess.run(
+                        ['bash', 'scripts/bing_workers/start_bing_workers.sh'],
+                        capture_output=True,
+                        text=True
+                    )
+                    if result.returncode == 0:
+                        ui.notify('✓ Bing workers started successfully', type='positive')
+                        await asyncio.sleep(2)
+                        check_bing_workers_status()
+                    else:
+                        ui.notify(f'Failed to start workers: {result.stderr}', type='negative')
+
+                async def stop_bing_workers():
+                    """Stop all 5 Bing workers."""
+                    ui.notify('Stopping Bing workers...', type='info')
+                    result = subprocess.run(
+                        ['bash', 'scripts/bing_workers/stop_bing_workers.sh'],
+                        capture_output=True,
+                        text=True
+                    )
+                    if result.returncode == 0:
+                        ui.notify('✓ Bing workers stopped successfully', type='positive')
+                        await asyncio.sleep(2)
+                        check_bing_workers_status()
+                    else:
+                        ui.notify(f'Failed to stop workers: {result.stderr}', type='negative')
+
+                async def restart_bing_workers():
+                    """Restart all 5 Bing workers."""
+                    ui.notify('Restarting Bing workers...', type='info')
+                    result = subprocess.run(
+                        ['bash', 'scripts/bing_workers/restart_bing_workers.sh'],
+                        capture_output=True,
+                        text=True
+                    )
+                    if result.returncode == 0:
+                        ui.notify('✓ Bing workers restarted successfully', type='positive')
+                        await asyncio.sleep(2)
+                        check_bing_workers_status()
+                    else:
+                        ui.notify(f'Failed to restart workers: {result.stderr}', type='negative')
+
+                ui.button('▶ Start Workers', on_click=start_bing_workers).props('color=positive')
+                ui.button('⏹ Stop Workers', on_click=stop_bing_workers).props('color=negative')
+                ui.button('🔄 Restart Workers', on_click=restart_bing_workers).props('color=warning')
+                ui.button('📊 Check Status', on_click=lambda: os.system('bash scripts/bing_workers/check_bing_workers.sh')).props('color=info')
 
 
 def build_yelp_ui(container):
@@ -1674,76 +2101,6 @@ def build_yelp_ui(container):
         with ui.card().classes('w-full'):
             ui.label('Status').classes('text-xl font-bold mb-4')
             ui.label('Yelp scraper implementation is planned. This will allow discovery of businesses with Yelp reviews and ratings.').classes('text-gray-400')
-
-
-def build_bbb_ui(container):
-    """Build BBB (Better Business Bureau) discovery UI in the given container."""
-    with container:
-        # Configuration card
-        with ui.card().classes('w-full mb-4'):
-            ui.label('BBB Discovery Configuration').classes('text-xl font-bold mb-4')
-
-            # Coming soon banner
-            with ui.card().classes('w-full bg-green-900 border-l-4 border-green-500 mb-4'):
-                ui.label('🚧 BBB Discovery - Coming Soon').classes('text-lg font-bold text-green-200')
-                ui.label('• Search accredited businesses on Better Business Bureau').classes('text-sm text-green-100')
-                ui.label('• Includes BBB ratings and complaint history').classes('text-sm text-green-100')
-                ui.label('• Useful for finding reputable, established businesses').classes('text-sm text-green-100')
-
-            # Placeholder configuration
-            ui.label('Business Type').classes('font-semibold mb-2')
-            category_input = ui.input(
-                label='Type of business',
-                placeholder='e.g., cleaning services, contractors',
-                value='cleaning services'
-            ).props('disable').classes('w-full mb-4')
-
-            ui.label('Location').classes('font-semibold mb-2')
-            location_input = ui.input(
-                label='City and state',
-                placeholder='e.g., Seattle, WA',
-                value='Seattle, WA'
-            ).props('disable').classes('w-full mb-4')
-
-        # Status message
-        with ui.card().classes('w-full'):
-            ui.label('Status').classes('text-xl font-bold mb-4')
-            ui.label('BBB scraper implementation is planned. This will allow discovery of accredited businesses with BBB ratings.').classes('text-gray-400')
-
-
-def build_facebook_ui(container):
-    """Build Facebook discovery UI in the given container."""
-    with container:
-        # Configuration card
-        with ui.card().classes('w-full mb-4'):
-            ui.label('Facebook Discovery Configuration').classes('text-xl font-bold mb-4')
-
-            # Coming soon banner
-            with ui.card().classes('w-full bg-indigo-900 border-l-4 border-indigo-500 mb-4'):
-                ui.label('🚧 Facebook Discovery - Coming Soon').classes('text-lg font-bold text-indigo-200')
-                ui.label('• Search business pages on Facebook').classes('text-sm text-indigo-100')
-                ui.label('• Extract contact info, hours, and page data').classes('text-sm text-indigo-100')
-                ui.label('• Note: Facebook scraping has anti-bot protections').classes('text-sm text-indigo-100')
-
-            # Placeholder configuration
-            ui.label('Search Query').classes('font-semibold mb-2')
-            query_input = ui.input(
-                label='Business or service to search',
-                placeholder='e.g., pressure washing companies',
-                value='pressure washing'
-            ).props('disable').classes('w-full mb-4')
-
-            ui.label('Location').classes('font-semibold mb-2')
-            location_input = ui.input(
-                label='City or region',
-                placeholder='e.g., Seattle, WA',
-                value='Seattle, WA'
-            ).props('disable').classes('w-full mb-4')
-
-        # Status message
-        with ui.card().classes('w-full'):
-            ui.label('Status').classes('text-xl font-bold mb-4')
-            ui.label('Facebook scraper implementation is planned. This will allow discovery of business pages and contact information.').classes('text-gray-400')
 
 
 def build_homeadvisor_ui(container):
@@ -2016,7 +2373,7 @@ def discover_page():
         ui.label('Discovery Source').classes('text-xl font-bold mb-4')
 
         source_select = ui.select(
-            options=['Yellow Pages', 'Multi-Worker YP (10x)', 'Google Maps', 'HomeAdvisor', 'Bing', 'Yelp', 'BBB', 'Facebook'],
+            options=['Yellow Pages', 'Multi-Worker YP (10x)', 'Google Maps', 'Bing', 'Yelp'],
             value='Yellow Pages',
             label='Choose discovery source'
         ).classes('w-64')
@@ -2038,15 +2395,9 @@ def discover_page():
             build_multiworker_yp_ui(main_content)
         elif source == 'Google Maps':
             build_google_maps_ui(main_content)
-        elif source == 'HomeAdvisor':
-            build_homeadvisor_ui(main_content)
         elif source == 'Bing':
             build_bing_ui(main_content)
         elif source == 'Yelp':
             build_yelp_ui(main_content)
-        elif source == 'BBB':
-            build_bbb_ui(main_content)
-        elif source == 'Facebook':
-            build_facebook_ui(main_content)
 
     source_select.on('update:model-value', on_source_change)

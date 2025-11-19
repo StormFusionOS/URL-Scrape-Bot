@@ -109,7 +109,6 @@ class AppLayout:
                 {'name': 'Discover', 'icon': 'search', 'page': 'discover'},
                 {'name': 'Database', 'icon': 'storage', 'page': 'database'},
                 {'name': 'Scheduler', 'icon': 'schedule', 'page': 'scheduler'},
-                {'name': 'Logs', 'icon': 'article', 'page': 'logs'},
                 {'name': 'Status', 'icon': 'timeline', 'page': 'status'},
                 {'name': 'Settings', 'icon': 'settings', 'page': 'settings'},
             ]

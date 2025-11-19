@@ -144,9 +144,7 @@ Once YP works, apply same pattern to:
 - Update `run_google_maps_discovery()` to use subprocess
 - Log file: `logs/google_scrape.log`
 
-**HomeAdvisor Discovery:**
 - Create `cli_crawl_ha.py`
-- Update `run_homeadvisor_discovery()` to use subprocess
 - Log file: `logs/ha_crawl.log`
 
 ## Benefits of This Approach
@@ -198,5 +196,4 @@ The dashboard is running at **http://127.0.0.1:8080** with full subprocess integ
 
 1. Test YP instant stop with real crawl
 2. Apply subprocess approach to Google Maps discovery
-3. Apply subprocess approach to HomeAdvisor discovery
 4. Standardize all sources with LiveLogViewer

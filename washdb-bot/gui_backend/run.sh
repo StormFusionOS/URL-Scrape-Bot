@@ -1,5 +1,34 @@
 #!/bin/bash
-# Startup script for Washdb-Bot GUI Backend
+# ⚠️ DEPRECATED: This script is deprecated and no longer maintained
+#
+# The Flask-based gui_backend has been replaced by NiceGUI.
+#
+# Use the following command instead:
+#   cd /home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+#   source venv/bin/activate
+#   python -m niceui.main
+#
+# Or use the restart_dashboard.sh script in the parent directory.
+
+echo "=========================================="
+echo "⚠️  DEPRECATED: gui_backend/run.sh"
+echo "=========================================="
+echo ""
+echo "This Flask-based backend has been replaced by NiceGUI."
+echo ""
+echo "To start the active web interface, run:"
+echo ""
+echo "  cd /home/rivercityscrape/URL-Scrape-Bot/washdb-bot"
+echo "  source venv/bin/activate"
+echo "  python -m niceui.main"
+echo ""
+echo "Or use: ./restart_dashboard.sh"
+echo ""
+echo "=========================================="
+exit 1
+
+# Original script (disabled)
+: <<'DISABLED'
 
 echo "=========================================="
 echo "Washdb-Bot GUI Backend Startup"

@@ -1,13 +1,27 @@
 """
 Subprocess runner for crawlers - enables instant kill and real-time log capture.
+
+Cross-platform subprocess management using psutil.
 """
 
 import subprocess
 import os
+import sys
 import signal
 from pathlib import Path
 from typing import Optional, Callable
 from datetime import datetime
+
+# Platform detection
+IS_WINDOWS = sys.platform == 'win32'
+
+# Import psutil for cross-platform process management
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    psutil = None
+    HAS_PSUTIL = False
 
 
 class SubprocessRunner:
@@ -41,21 +55,34 @@ class SubprocessRunner:
         # Open log file
         log_fd = open(self.log_file, 'a', buffering=1)  # Line buffered
 
-        # Start process with new process group
-        self.process = subprocess.Popen(
-            command,
-            stdout=log_fd,
-            stderr=subprocess.STDOUT,
-            cwd=cwd,
-            preexec_fn=os.setsid  # Create new process group for clean killing
-        )
+        # Start process with new process group (platform-specific)
+        if IS_WINDOWS:
+            # Windows: CREATE_NEW_PROCESS_GROUP
+            self.process = subprocess.Popen(
+                command,
+                stdout=log_fd,
+                stderr=subprocess.STDOUT,
+                cwd=cwd,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            # POSIX: Use process groups
+            self.process = subprocess.Popen(
+                command,
+                stdout=log_fd,
+                stderr=subprocess.STDOUT,
+                cwd=cwd,
+                preexec_fn=os.setsid  # Create new process group for clean killing
+            )
 
         self.pid = self.process.pid
         return self.pid
 
     def kill(self) -> bool:
         """
-        Kill the process immediately (SIGKILL).
+        Kill the process immediately (cross-platform).
+
+        Uses psutil to kill process and all children on both POSIX and Windows.
 
         Returns:
             True if killed successfully
@@ -64,8 +91,35 @@ class SubprocessRunner:
             return False
 
         try:
-            # Kill the entire process group
-            os.killpg(os.getpgid(self.pid), signal.SIGKILL)
+            if HAS_PSUTIL:
+                # Use psutil for cross-platform process tree killing
+                try:
+                    parent = psutil.Process(self.pid)
+                    children = parent.children(recursive=True)
+
+                    # Kill children first
+                    for child in children:
+                        try:
+                            child.kill()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+
+                    # Kill parent
+                    parent.kill()
+
+                except psutil.NoSuchProcess:
+                    # Process already dead
+                    return False
+
+            else:
+                # Fallback to platform-specific kill (POSIX only)
+                if IS_WINDOWS:
+                    # Windows without psutil - use process.kill()
+                    self.process.kill()
+                else:
+                    # POSIX: Kill process group
+                    os.killpg(os.getpgid(self.pid), signal.SIGKILL)
+
             self.end_time = datetime.now()
             self.return_code = -9
             return True
