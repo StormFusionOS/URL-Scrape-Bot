@@ -78,8 +78,9 @@ class ScraperProcessManager:
                 }
 
             try:
-                # Build command
-                cmd = [sys.executable, 'main.py', 'crawl']
+                # Build command using Nathan SEO Bot's venv Python
+                python_path = os.path.join(self.working_dir, 'venv', 'bin', 'python')
+                cmd = [python_path, 'main.py', 'crawl']
 
                 if node_type and node_type != 'all':
                     cmd.append(node_type)
