@@ -1057,3 +1057,5 @@ class SiteCrawlState(Base):
     def __repr__(self) -> str:
         """String representation of SiteCrawlState."""
         return f"<SiteCrawlState(domain='{self.domain}', phase='{self.phase}', pages={self.pages_crawled})>"
+
+
