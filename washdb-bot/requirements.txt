@@ -24,3 +24,14 @@ flask-cors>=4.0.0
 # ===== PROCESS MANAGEMENT (cross-platform) =====
 # Used for cross-platform process management in GUI and scripts
 psutil>=5.9.0
+
+# ===== VECTOR DATABASE & EMBEDDINGS =====
+# Qdrant for semantic search and content embeddings
+qdrant-client>=1.7.0,<2.0.0
+# Sentence transformers for local embedding generation
+sentence-transformers>=2.2.0,<3.0.0
+# Tokenization for chunking
+tiktoken>=0.5.0,<1.0.0
+# Optional: LangChain for advanced embedding workflows
+langchain>=0.1.0,<0.2.0
+langchain-community>=0.0.10

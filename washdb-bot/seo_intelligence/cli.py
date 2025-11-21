@@ -13,6 +13,7 @@ Commands:
     citation    - Check citation directories
     audit       - Run technical SEO audits
     las         - Calculate Local Authority Scores
+    embed       - Manage vector embeddings and semantic search
     changes     - Manage pending changes
     status      - Show system status
 """
@@ -178,6 +179,204 @@ def cmd_changes(args):
         print("Use --list, --approve ID, --reject ID, or --stats")
 
 
+def cmd_embed(args):
+    """Manage vector embeddings and semantic search."""
+    from seo_intelligence.services import get_content_embedder, get_qdrant_manager
+    import os
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.orm import Session
+
+    # Initialize services
+    try:
+        embedder = get_content_embedder()
+        qdrant = get_qdrant_manager()
+
+        # Get database connection
+        database_url = os.getenv("DATABASE_URL")
+        if not database_url:
+            print("ERROR: DATABASE_URL not set")
+            return
+
+        engine = create_engine(database_url, echo=False)
+
+    except Exception as e:
+        print(f"ERROR: Failed to initialize embedding services: {e}")
+        return
+
+    # Initialize Qdrant collections
+    if args.initialize:
+        print("\nInitializing Qdrant Collections")
+        print("=" * 60)
+        try:
+            qdrant.initialize_collections()
+
+            # Check stats
+            for collection in [qdrant.COMPETITOR_PAGES, qdrant.SERP_SNIPPETS]:
+                stats = qdrant.get_collection_stats(collection)
+                print(f"\n{collection}:")
+                print(f"  Vectors: {stats['vectors_count']}")
+                print(f"  Status: {stats['status']}")
+
+            print("\n✓ Collections initialized successfully")
+        except Exception as e:
+            print(f"ERROR: Failed to initialize collections: {e}")
+        return
+
+    # Embed single page
+    if args.page_id:
+        print(f"\nEmbedding Page {args.page_id}")
+        print("=" * 60)
+
+        with Session(engine) as session:
+            # Fetch page data
+            result = session.execute(
+                text("""
+                    SELECT cp.page_id, cp.competitor_id, cp.url, cp.title,
+                           cp.page_type, cp.content_hash
+                    FROM competitor_pages cp
+                    WHERE cp.page_id = :page_id
+                """),
+                {"page_id": args.page_id}
+            ).fetchone()
+
+            if not result:
+                print(f"ERROR: Page {args.page_id} not found")
+                return
+
+            page_id, site_id, url, title, page_type, content_hash = result
+
+            # Note: We don't have the original HTML stored, so we can't re-embed
+            # This command is mainly for demonstration. In production, you'd need to
+            # either store HTML or re-crawl the page
+            print(f"Page: {url}")
+            print(f"Title: {title}")
+            print(f"Type: {page_type}")
+            print(f"\nNote: Re-embedding requires original HTML or re-crawling")
+        return
+
+    # Re-embed all pages
+    if args.reembed_all:
+        print("\nRe-embedding All Pages")
+        print("=" * 60)
+        print("This will re-embed all competitor pages with the current model version.")
+
+        with Session(engine) as session:
+            # Get pages needing re-embedding
+            result = session.execute(
+                text("""
+                    SELECT COUNT(*)
+                    FROM competitor_pages
+                    WHERE embedding_version IS NULL
+                       OR embedding_version != :version
+                """),
+                {"version": os.getenv("EMBEDDING_VERSION", "v1.0")}
+            )
+            count = result.fetchone()[0]
+
+            print(f"\nPages needing re-embedding: {count}")
+            print("\nNote: Re-embedding requires original HTML content.")
+            print("Use the competitor crawler to re-crawl pages with embeddings enabled.")
+        return
+
+    # Semantic search for competitor pages
+    if args.search and args.query:
+        print(f"\nSemantic Search: '{args.query}'")
+        print("=" * 60)
+
+        try:
+            # Embed the query
+            query_vector = embedder.embed_single(args.query)
+
+            # Search similar pages
+            results = qdrant.search_similar_pages(
+                query_vector=query_vector,
+                limit=args.limit,
+                page_type=args.page_type
+            )
+
+            if results:
+                print(f"\nFound {len(results)} similar pages:\n")
+                for i, result in enumerate(results, 1):
+                    print(f"{i}. {result['title']}")
+                    print(f"   URL: {result['url']}")
+                    print(f"   Type: {result['page_type']}")
+                    print(f"   Score: {result['score']:.3f}")
+                    print()
+            else:
+                print("\nNo results found. Make sure pages are embedded first.")
+
+        except Exception as e:
+            print(f"ERROR: Search failed: {e}")
+        return
+
+    # Show embedding status
+    if args.status:
+        print("\nEmbedding Status")
+        print("=" * 60)
+
+        # Show embedding configuration
+        print("\nConfiguration:")
+        info = embedder.get_info()
+        print(f"  Model: {info['model_name']}")
+        print(f"  Version: {info['embedding_version']}")
+        print(f"  Dimension: {info['dimension']}")
+        print(f"  Chunk Size: {info['chunk_size']} tokens")
+
+        # Check Qdrant health
+        print("\nQdrant:")
+        if qdrant.health_check():
+            print(f"  [OK] Connected to {qdrant.host}:{qdrant.port}")
+
+            # Get collection stats
+            try:
+                for collection in [qdrant.COMPETITOR_PAGES, qdrant.SERP_SNIPPETS]:
+                    stats = qdrant.get_collection_stats(collection)
+                    print(f"\n  {collection}:")
+                    print(f"    Vectors: {stats['vectors_count']}")
+                    print(f"    Status: {stats['status']}")
+            except Exception as e:
+                print(f"  [WARN] Could not get collection stats: {e}")
+        else:
+            print(f"  [ERR] Could not connect to Qdrant")
+
+        # Database stats
+        with Session(engine) as session:
+            result = session.execute(
+                text("""
+                    SELECT
+                        COUNT(*) as total,
+                        COUNT(embedding_version) as embedded,
+                        COUNT(CASE WHEN embedding_version = :version THEN 1 END) as current_version
+                    FROM competitor_pages
+                """),
+                {"version": os.getenv("EMBEDDING_VERSION", "v1.0")}
+            ).fetchone()
+
+            print("\nDatabase (competitor_pages):")
+            print(f"  Total pages: {result[0]}")
+            print(f"  Embedded: {result[1]}")
+            print(f"  Current version: {result[2]}")
+
+            result = session.execute(
+                text("""
+                    SELECT
+                        COUNT(*) as total,
+                        COUNT(embedding_version) as embedded
+                    FROM serp_results
+                """)
+            ).fetchone()
+
+            print("\nDatabase (serp_results):")
+            print(f"  Total results: {result[0]}")
+            print(f"  Embedded snippets: {result[1]}")
+
+        print()
+        return
+
+    # If no specific action, show help
+    print("Use --initialize, --page-id, --reembed-all, --search, or --status")
+
+
 def cmd_status(args):
     """Show system status."""
     print("\nSEO Intelligence System Status")
@@ -193,6 +392,8 @@ def cmd_status(args):
         ("Change Manager", "seo_intelligence.services.get_change_manager"),
         ("LAS Calculator", "seo_intelligence.services.get_las_calculator"),
         ("Task Logger", "seo_intelligence.services.get_task_logger"),
+        ("Content Embedder", "seo_intelligence.services.get_content_embedder"),
+        ("Qdrant Manager", "seo_intelligence.services.get_qdrant_manager"),
     ]
 
     print("Services:")
@@ -249,6 +450,9 @@ Examples:
   python -m seo_intelligence.cli competitor --domain example.com
   python -m seo_intelligence.cli audit --url https://mysite.com
   python -m seo_intelligence.cli las --name "My Business" --domain mysite.com
+  python -m seo_intelligence.cli embed --initialize
+  python -m seo_intelligence.cli embed --status
+  python -m seo_intelligence.cli embed --search --query "power washing services"
   python -m seo_intelligence.cli changes --list
   python -m seo_intelligence.cli status
         """
@@ -292,6 +496,17 @@ Examples:
     changes_parser.add_argument('--stats', action='store_true', help='Show stats')
     changes_parser.add_argument('--limit', type=int, default=20, help='List limit')
 
+    # Embed command
+    embed_parser = subparsers.add_parser('embed', help='Manage embeddings')
+    embed_parser.add_argument('--initialize', action='store_true', help='Initialize Qdrant collections')
+    embed_parser.add_argument('--page-id', type=int, help='Embed single page by ID')
+    embed_parser.add_argument('--reembed-all', action='store_true', help='Re-embed all pages')
+    embed_parser.add_argument('--search', action='store_true', help='Semantic search')
+    embed_parser.add_argument('--query', '-q', help='Search query')
+    embed_parser.add_argument('--page-type', help='Filter by page type')
+    embed_parser.add_argument('--limit', type=int, default=10, help='Search result limit')
+    embed_parser.add_argument('--status', action='store_true', help='Show embedding status')
+
     # Status command
     subparsers.add_parser('status', help='Show system status')
 
@@ -307,6 +522,7 @@ Examples:
         'competitor': cmd_competitor,
         'audit': cmd_audit,
         'las': cmd_las,
+        'embed': cmd_embed,
         'changes': cmd_changes,
         'status': cmd_status,
     }

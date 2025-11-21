@@ -105,12 +105,36 @@ class BaseScraper(ABC):
         self.logger.info(f"{name} initialized (tier={tier}, headless={headless})")
 
     def _get_random_delay(self) -> float:
-        """Get randomized delay based on tier configuration."""
+        """
+        Get randomized delay based on tier configuration with ±20% jitter.
+
+        Per SCRAPING_NOTES.md §3: "Per-request base delay: 3-6s with ±20% jitter"
+        """
         from seo_intelligence.services.rate_limiter import TIER_CONFIGS
 
         config = TIER_CONFIGS.get(self.tier, TIER_CONFIGS["C"])
         delay = random.uniform(config.min_delay_seconds, config.max_delay_seconds)
-        return delay
+
+        # Add ±20% jitter per spec
+        jitter = delay * random.uniform(-0.20, 0.20)
+        final_delay = max(0.1, delay + jitter)  # Ensure minimum 0.1s delay
+
+        self.logger.debug(f"Delay: {delay:.2f}s + jitter {jitter:.2f}s = {final_delay:.2f}s")
+        return final_delay
+
+    def _apply_base_delay(self):
+        """
+        Apply base delay (3-6s with ±20% jitter) before each request.
+
+        Per SCRAPING_NOTES.md §3: "Per-request base delay: 3-6s with ±20% jitter"
+        This is in addition to tier-specific rate limiting.
+        """
+        base_delay = random.uniform(3.0, 6.0)
+        jitter = base_delay * random.uniform(-0.20, 0.20)
+        final_delay = max(0.5, base_delay + jitter)  # Ensure minimum 0.5s
+
+        self.logger.debug(f"Base delay: {base_delay:.2f}s + jitter {jitter:.2f}s = {final_delay:.2f}s")
+        time.sleep(final_delay)
 
     def _check_robots(self, url: str) -> bool:
         """
@@ -133,27 +157,50 @@ class BaseScraper(ABC):
 
         return allowed
 
-    def _acquire_rate_limit(self, domain: str) -> bool:
+    @contextmanager
+    def _rate_limit_and_concurrency(self, domain: str):
         """
-        Acquire rate limit token for domain.
+        Context manager for rate limiting and concurrency control.
+
+        Enforces per SCRAPING_NOTES.md §3:
+        - Global max concurrency: 5
+        - Per-domain max concurrency: 1
+        - Per-request base delay: 3-6s with ±20% jitter
+        - Tier-specific rate limits
+
+        Usage:
+            with self._rate_limit_and_concurrency(domain):
+                # Make request to domain
+                pass
 
         Args:
-            domain: Domain to acquire token for
-
-        Returns:
-            bool: True if acquired, False if failed
+            domain: Domain to rate limit
         """
         # Set tier for domain if not already set
         self.rate_limiter.set_domain_tier(domain, self.tier)
 
-        # Try to acquire with reasonable max wait
-        acquired = self.rate_limiter.acquire(domain, wait=True, max_wait=60.0)
-
-        if not acquired:
-            self.logger.warning(f"Rate limit timeout for {domain}")
+        # Acquire concurrency permits (global + per-domain)
+        if not self.rate_limiter.acquire_concurrency(domain, timeout=60.0):
+            self.logger.warning(f"Concurrency timeout for {domain}")
             self.stats["rate_limited"] += 1
+            raise RuntimeError(f"Failed to acquire concurrency permits for {domain}")
 
-        return acquired
+        try:
+            # Acquire rate limit token
+            if not self.rate_limiter.acquire(domain, wait=True, max_wait=60.0):
+                self.logger.warning(f"Rate limit timeout for {domain}")
+                self.stats["rate_limited"] += 1
+                raise RuntimeError(f"Failed to acquire rate limit token for {domain}")
+
+            # Apply base delay with jitter (3-6s ±20%)
+            self._apply_base_delay()
+
+            # Yield control to caller
+            yield
+
+        finally:
+            # Always release concurrency permits
+            self.rate_limiter.release_concurrency(domain)
 
     @contextmanager
     def browser_session(self):

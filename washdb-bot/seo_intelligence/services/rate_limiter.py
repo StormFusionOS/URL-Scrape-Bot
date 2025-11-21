@@ -1,21 +1,26 @@
 """
 Rate Limiter Service
 
-Implements token bucket algorithm for tier-based rate limiting.
+Implements token bucket algorithm for tier-based rate limiting per SCRAPING_NOTES.md.
 
-Tiers (based on SCRAPING_NOTES.md):
-- Tier A: High-value targets (15-30s delay, 2-4 req/min)
-- Tier B: Medium-value targets (10-20s delay, 3-6 req/min)
-- Tier C: Standard targets (8-15s delay, 4-7 req/min)
-- Tier D: Low-priority (5-10s delay, 6-12 req/min)
-- Tier E: Citation directories (3-8s delay, 7-20 req/min)
-- Tier F: Backlink sources (2-5s delay, 12-30 req/min)
-- Tier G: Own sites (1-3s delay, 20-60 req/min)
+Tiers (exact specification from SCRAPING_NOTES.md):
+- Tier A: Maps & majors (GBP, Yelp, BBB, FB) - 1 req / 3-5s (~0.2-0.33 RPS)
+- Tier B: Data aggregators (Data Axle, Localeze) - 1 req / 10s (~0.1 RPS)
+- Tier C: Home-service marketplaces (Angi, Thumbtack) - ~0.15-0.2 RPS
+- Tier D: General directories (YP, Superpages) - ~0.2 RPS
+- Tier E: Social/reputation (LinkedIn, Trustpilot) - ~0.2 RPS
+- Tier F: Industry-specific (PWNA, UAMCC) - ~0.2 RPS
+- Tier G: Local/Regional (Chamber, CVB) - ~0.2 RPS
+
+Global limits (enforced in BaseScraper):
+- Global concurrency: 5 max concurrent requests across all scrapers
+- Per-domain concurrency: 1 max concurrent request per domain
+- Base delay: 3-6s with ±20% jitter
 
 Features:
 - Token bucket algorithm with configurable refill rates
 - Per-domain rate limiting
-- Tier-based configuration
+- Tier-based configuration matching specification
 - Thread-safe implementation
 - Automatic token refill
 """
@@ -44,15 +49,30 @@ class TierConfig:
         return f"TierConfig(delay={self.min_delay_seconds}-{self.max_delay_seconds}s, rate={self.tokens_per_minute}/min)"
 
 
-# Tier configurations based on SCRAPING_NOTES.md
+# Tier configurations - EXACT match to SCRAPING_NOTES.md specification
+# Per-domain RPS from spec: Tier A = 0.2-0.33, B = 0.1, C-G = 0.15-0.2
+# Converted to delays and tokens_per_minute
 TIER_CONFIGS = {
-    'A': TierConfig(min_delay_seconds=15.0, max_delay_seconds=30.0, tokens_per_minute=2.5, bucket_size=5),
-    'B': TierConfig(min_delay_seconds=10.0, max_delay_seconds=20.0, tokens_per_minute=4.0, bucket_size=8),
-    'C': TierConfig(min_delay_seconds=8.0, max_delay_seconds=15.0, tokens_per_minute=5.0, bucket_size=10),
-    'D': TierConfig(min_delay_seconds=5.0, max_delay_seconds=10.0, tokens_per_minute=8.0, bucket_size=15),
-    'E': TierConfig(min_delay_seconds=3.0, max_delay_seconds=8.0, tokens_per_minute=12.0, bucket_size=20),
-    'F': TierConfig(min_delay_seconds=2.0, max_delay_seconds=5.0, tokens_per_minute=20.0, bucket_size=30),
-    'G': TierConfig(min_delay_seconds=1.0, max_delay_seconds=3.0, tokens_per_minute=40.0, bucket_size=60),
+    # Tier A: Maps & majors - 1 req / 3-5s = ~0.2-0.33 RPS = 12-20 req/min
+    'A': TierConfig(min_delay_seconds=3.0, max_delay_seconds=5.0, tokens_per_minute=15.0, bucket_size=5),
+
+    # Tier B: Data aggregators - 1 req / 10s = ~0.1 RPS = 6 req/min
+    'B': TierConfig(min_delay_seconds=10.0, max_delay_seconds=10.0, tokens_per_minute=6.0, bucket_size=3),
+
+    # Tier C: Home-service marketplaces - ~0.15-0.2 RPS = 9-12 req/min (avg 5-6s)
+    'C': TierConfig(min_delay_seconds=5.0, max_delay_seconds=7.0, tokens_per_minute=10.0, bucket_size=5),
+
+    # Tier D: General directories - ~0.2 RPS = 12 req/min (5s)
+    'D': TierConfig(min_delay_seconds=5.0, max_delay_seconds=5.0, tokens_per_minute=12.0, bucket_size=5),
+
+    # Tier E: Social/reputation - ~0.2 RPS = 12 req/min (5s)
+    'E': TierConfig(min_delay_seconds=5.0, max_delay_seconds=5.0, tokens_per_minute=12.0, bucket_size=5),
+
+    # Tier F: Industry-specific - ~0.2 RPS = 12 req/min (5s)
+    'F': TierConfig(min_delay_seconds=5.0, max_delay_seconds=5.0, tokens_per_minute=12.0, bucket_size=5),
+
+    # Tier G: Local/Regional - ~0.2 RPS = 12 req/min (5s)
+    'G': TierConfig(min_delay_seconds=5.0, max_delay_seconds=5.0, tokens_per_minute=12.0, bucket_size=5),
 }
 
 
@@ -166,15 +186,26 @@ class RateLimiter:
 
     Manages separate token buckets for each domain to ensure
     respectful scraping rates.
+
+    Also enforces global and per-domain concurrency limits per SCRAPING_NOTES.md:
+    - Global: max 5 concurrent requests across all domains
+    - Per-domain: max 1 concurrent request per domain
     """
 
     def __init__(self):
-        """Initialize the rate limiter."""
+        """Initialize the rate limiter with concurrency controls."""
         self.buckets: Dict[str, TokenBucket] = {}
         self.domain_tiers: Dict[str, str] = {}  # domain -> tier mapping
         self.lock = threading.Lock()
 
-        logger.info("RateLimiter initialized")
+        # Global concurrency limit: max 5 concurrent requests (SCRAPING_NOTES.md §3)
+        self.global_semaphore = threading.Semaphore(5)
+
+        # Per-domain concurrency: max 1 concurrent request per domain (SCRAPING_NOTES.md §3)
+        self.domain_locks: Dict[str, threading.Lock] = {}
+        self.domain_locks_lock = threading.Lock()  # Protects domain_locks dict
+
+        logger.info("RateLimiter initialized (global_max=5, per_domain_max=1)")
 
     def set_domain_tier(self, domain: str, tier: str):
         """
@@ -297,6 +328,79 @@ class RateLimiter:
                 config = TIER_CONFIGS[tier]
                 self.buckets[domain] = TokenBucket(config)
                 logger.info(f"Reset rate limiter for domain '{domain}'")
+
+    def _get_domain_lock(self, domain: str) -> threading.Lock:
+        """
+        Get or create a lock for a specific domain.
+
+        Args:
+            domain: Domain name
+
+        Returns:
+            threading.Lock: Lock for the domain
+        """
+        with self.domain_locks_lock:
+            if domain not in self.domain_locks:
+                self.domain_locks[domain] = threading.Lock()
+                logger.debug(f"Created concurrency lock for domain '{domain}'")
+            return self.domain_locks[domain]
+
+    def acquire_concurrency(self, domain: str, timeout: Optional[float] = None) -> bool:
+        """
+        Acquire both global and per-domain concurrency permits.
+
+        This enforces:
+        - Global max concurrency of 5 (across all domains)
+        - Per-domain max concurrency of 1
+
+        Per SCRAPING_NOTES.md §3.
+
+        Args:
+            domain: Domain name
+            timeout: Maximum time to wait in seconds (None = wait indefinitely)
+
+        Returns:
+            bool: True if permits acquired, False if timeout
+        """
+        # Try to acquire global semaphore first
+        if not self.global_semaphore.acquire(blocking=True, timeout=timeout):
+            logger.debug("Global concurrency limit reached (5 concurrent requests)")
+            return False
+
+        # Try to acquire per-domain lock
+        domain_lock = self._get_domain_lock(domain)
+        if not domain_lock.acquire(blocking=True, timeout=timeout):
+            # Release global semaphore since we couldn't get domain lock
+            self.global_semaphore.release()
+            logger.debug(f"Per-domain concurrency limit reached for '{domain}' (1 concurrent request)")
+            return False
+
+        logger.debug(f"Acquired concurrency permits for '{domain}'")
+        return True
+
+    def release_concurrency(self, domain: str):
+        """
+        Release both global and per-domain concurrency permits.
+
+        Args:
+            domain: Domain name
+        """
+        # Release per-domain lock
+        domain_lock = self._get_domain_lock(domain)
+        try:
+            domain_lock.release()
+        except RuntimeError:
+            # Lock wasn't held - this is OK, just log it
+            logger.warning(f"Attempted to release non-held lock for domain '{domain}'")
+
+        # Release global semaphore
+        try:
+            self.global_semaphore.release()
+        except ValueError:
+            # Semaphore wasn't held - this is OK, just log it
+            logger.warning("Attempted to release non-held global semaphore")
+
+        logger.debug(f"Released concurrency permits for '{domain}'")
 
 
 # Module-level singleton
