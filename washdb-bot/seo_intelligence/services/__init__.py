@@ -11,6 +11,11 @@ This module contains core services:
 - las_calculator: Local Authority Score calculation
 - qdrant_manager: Vector database management for semantic search
 - embedding_service: Text chunking and embedding generation
+- source_trust: Trust-weighted consensus for canonical field selection
+- section_embedder: Section-level embeddings for fine-grained search
+- nap_validator: NAP consistency validation
+- entity_matcher: Entity deduplication and matching
+- url_canonicalizer: URL normalization and tracking parameter removal
 
 All services support ethical scraping with rate limiting and robots.txt compliance.
 """
@@ -30,6 +35,18 @@ from .embedding_service import (
     TextChunker,
     EmbeddingGenerator,
     extract_main_content
+)
+from .source_trust import SourceTrustConfig, SourceTrustService, get_source_trust
+from .section_embedder import SectionEmbedder, get_section_embedder
+from .nap_validator import NAPValidator, NAPValidationResult, get_nap_validator
+from .entity_matcher import EntityMatcher, MatchResult, get_entity_matcher
+from .url_canonicalizer import URLCanonicalizer, CanonicalURL, get_url_canonicalizer
+from .domain_quarantine import (
+    DomainQuarantine,
+    QuarantineReason,
+    QuarantineEntry,
+    BackoffSchedule,
+    get_domain_quarantine
 )
 
 __all__ = [
@@ -62,4 +79,23 @@ __all__ = [
     "TextChunker",
     "EmbeddingGenerator",
     "extract_main_content",
+    "SourceTrustConfig",
+    "SourceTrustService",
+    "get_source_trust",
+    "SectionEmbedder",
+    "get_section_embedder",
+    "NAPValidator",
+    "NAPValidationResult",
+    "get_nap_validator",
+    "EntityMatcher",
+    "MatchResult",
+    "get_entity_matcher",
+    "URLCanonicalizer",
+    "CanonicalURL",
+    "get_url_canonicalizer",
+    "DomainQuarantine",
+    "QuarantineReason",
+    "QuarantineEntry",
+    "BackoffSchedule",
+    "get_domain_quarantine",
 ]

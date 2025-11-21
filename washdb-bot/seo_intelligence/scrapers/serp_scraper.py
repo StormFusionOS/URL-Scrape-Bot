@@ -228,6 +228,55 @@ class SerpScraper(BaseScraper):
 
         return snapshot_id
 
+    def _save_paa_questions(
+        self,
+        session: Session,
+        snapshot_id: int,
+        query_id: int,
+        snapshot: SerpSnapshot,
+    ):
+        """
+        Save People Also Ask questions to serp_paa table.
+
+        Args:
+            session: Database session
+            snapshot_id: Snapshot ID
+            query_id: Query ID
+            snapshot: Parsed SERP snapshot with PAA data
+        """
+        if not snapshot.people_also_ask:
+            return
+
+        for paa in snapshot.people_also_ask:
+            # Use the upsert function created in migration 022
+            session.execute(
+                text("""
+                    SELECT upsert_paa_question(
+                        :snapshot_id,
+                        :query_id,
+                        :question,
+                        :answer_snippet,
+                        :source_url,
+                        :source_domain,
+                        :position,
+                        :metadata
+                    )
+                """),
+                {
+                    "snapshot_id": snapshot_id,
+                    "query_id": query_id,
+                    "question": paa.question,
+                    "answer_snippet": paa.answer[:500] if paa.answer else None,  # Limit to 500 chars
+                    "source_url": paa.source_url or None,
+                    "source_domain": paa.source_domain or None,
+                    "position": paa.position if paa.position > 0 else None,
+                    "metadata": json.dumps(paa.metadata) if paa.metadata else None,
+                }
+            )
+
+        session.commit()
+        logger.info(f"Saved {len(snapshot.people_also_ask)} PAA questions for snapshot {snapshot_id}")
+
     def _save_results(
         self,
         session: Session,
@@ -385,6 +434,11 @@ class SerpScraper(BaseScraper):
                         self._save_results(
                             session, snapshot_id, snapshot,
                             our_domains, competitor_domains
+                        )
+
+                        # Save People Also Ask questions
+                        self._save_paa_questions(
+                            session, snapshot_id, query_id, snapshot
                         )
 
                         logger.info(

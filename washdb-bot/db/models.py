@@ -23,11 +23,12 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import JSON, TypeDecorator
 
@@ -1055,5 +1056,203 @@ class SiteCrawlState(Base):
     def __repr__(self) -> str:
         """String representation of SiteCrawlState."""
         return f"<SiteCrawlState(domain='{self.domain}', phase='{self.phase}', pages={self.pages_crawled})>"
+
+
+class BusinessSource(Base):
+    """
+    Business data source tracking for NAP consistency validation.
+
+    Tracks business information from multiple sources (YP, Google, Yelp, citations, etc.)
+    to enable multi-source NAP consistency validation and conflict detection.
+    One Company can have many BusinessSources.
+
+    Attributes:
+        source_id: Primary key
+        company_id: Foreign key to companies table
+        source_type: Type of source ('yp', 'google', 'yelp', 'bbb', 'facebook', 'citation')
+        source_name: Human-readable source name ('Yellow Pages', 'Google Business Profile')
+        source_url: Base URL of the source platform
+        profile_url: Direct link to the business profile on this source
+        name: Business name from this source
+        phone: Raw phone number from this source
+        phone_e164: Normalized phone in E.164 format
+        address_raw: Raw address string from this source
+        street: Parsed street address
+        city: Parsed city
+        state: Parsed state
+        zip_code: Parsed ZIP code
+        website: Website URL from this source
+        categories: Business categories/tags from this source
+        rating_value: Rating value (e.g., 4.5)
+        rating_count: Number of reviews
+        description: Business description from this source
+        is_verified: Whether this is an owner-verified listing
+        listing_status: Status ('claimed', 'unclaimed', 'found', 'needs_manual')
+        data_quality_score: Computed quality score 0-100
+        confidence_level: Data confidence ('high', 'medium', 'low')
+        scraped_at: When this data was scraped
+        updated_at: When this record was last updated
+        metadata: Extended fields and raw data (JSONB)
+    """
+
+    __tablename__ = "business_sources"
+
+    # Primary Key
+    source_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Foreign Key to Company
+    company_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("companies.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Links to companies table"
+    )
+
+    # Source Metadata
+    source_type: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        index=True,
+        comment="Source type: yp, google, yelp, bbb, facebook, citation, etc."
+    )
+    source_name: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="Human-readable source name"
+    )
+    source_url: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Base URL of source platform"
+    )
+    profile_url: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        index=True,
+        comment="Direct link to business profile"
+    )
+
+    # NAP Data from this source
+    name: Mapped[Optional[str]] = mapped_column(
+        String(500),
+        nullable=True,
+        comment="Business name from this source"
+    )
+    phone: Mapped[Optional[str]] = mapped_column(
+        String(50),
+        nullable=True,
+        comment="Raw phone number"
+    )
+    phone_e164: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True,
+        index=True,
+        comment="Normalized phone in E.164 format"
+    )
+    address_raw: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Raw address string from source"
+    )
+    street: Mapped[Optional[str]] = mapped_column(
+        String(500),
+        nullable=True,
+        comment="Parsed street address"
+    )
+    city: Mapped[Optional[str]] = mapped_column(
+        String(200),
+        nullable=True,
+        index=True,
+        comment="Parsed city"
+    )
+    state: Mapped[Optional[str]] = mapped_column(
+        String(100),
+        nullable=True,
+        index=True,
+        comment="Parsed state/province"
+    )
+    zip_code: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True,
+        index=True,
+        comment="Parsed ZIP/postal code"
+    )
+
+    # Additional Data
+    website: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Website URL from this source"
+    )
+    categories: Mapped[Optional[list]] = mapped_column(
+        ARRAY(String),
+        nullable=True,
+        comment="Business categories/tags"
+    )
+    rating_value: Mapped[Optional[float]] = mapped_column(
+        Numeric(3, 2),
+        nullable=True,
+        comment="Rating value (e.g., 4.5)"
+    )
+    rating_count: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        nullable=True,
+        comment="Number of reviews"
+    )
+    description: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Business description"
+    )
+
+    # Quality Indicators
+    is_verified: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+        comment="Owner-verified listing"
+    )
+    listing_status: Mapped[Optional[str]] = mapped_column(
+        String(50),
+        nullable=True,
+        comment="claimed, unclaimed, found, needs_manual"
+    )
+    data_quality_score: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        nullable=True,
+        comment="Computed quality score 0-100"
+    )
+    confidence_level: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True,
+        comment="high, medium, low"
+    )
+
+    # Timestamps
+    scraped_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.now(),
+        nullable=False,
+        comment="When this data was scraped"
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime,
+        onupdate=func.now(),
+        nullable=True,
+        comment="Last update timestamp"
+    )
+
+    # Extended Metadata (renamed from 'metadata' to avoid SQLAlchemy reserved name conflict)
+    extra_metadata: Mapped[Optional[dict]] = mapped_column(
+        "metadata",  # Column name in database is still 'metadata'
+        JSON().with_variant(JSONB, "postgresql"),
+        nullable=True,
+        comment="Extended fields, raw data, parsing metadata"
+    )
+
+    def __repr__(self) -> str:
+        """String representation of BusinessSource."""
+        return f"<BusinessSource(id={self.source_id}, company_id={self.company_id}, source='{self.source_type}', name='{self.name}')>"
 
 

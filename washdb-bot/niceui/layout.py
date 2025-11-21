@@ -123,6 +123,7 @@ class AppLayout:
                 {'name': 'SEO Intel', 'icon': 'insights', 'page': 'seo_intelligence'},
                 {'name': 'Local Competitors', 'icon': 'groups', 'page': 'local_competitors'},
                 {'name': 'Database', 'icon': 'dns', 'page': 'seo_database'},
+                {'name': 'Dev Tools', 'icon': 'build', 'page': 'dev_tools'},
             ]
             for item in seo_items:
                 self._create_nav_item(item['name'], item['icon'], item['page'])
@@ -175,6 +176,7 @@ class AppLayout:
             {'name': 'SEO Intel', 'icon': 'insights', 'page': 'seo_intelligence'},
             {'name': 'Local Competitors', 'icon': 'groups', 'page': 'local_competitors'},
             {'name': 'Database', 'icon': 'dns', 'page': 'seo_database'},
+            {'name': 'Dev Tools', 'icon': 'build', 'page': 'dev_tools'},
         ]
         for item in seo_items:
             self._create_nav_item(item['name'], item['icon'], item['page'])

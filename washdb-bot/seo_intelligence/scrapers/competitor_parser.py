@@ -36,21 +36,64 @@ class PageMetrics:
     meta_description: str = ""
     meta_keywords: str = ""
     canonical_url: str = ""
+
+    # OpenGraph metadata
+    og_title: str = ""
+    og_description: str = ""
+    og_image: str = ""
+    og_type: str = ""
+    og_url: str = ""
+
+    # Twitter Card metadata
+    twitter_card: str = ""
+    twitter_title: str = ""
+    twitter_description: str = ""
+    twitter_image: str = ""
+
+    # Robots directives
+    robots_meta: str = ""  # index, noindex, follow, nofollow, etc.
+    x_robots_tag: str = ""  # From HTTP header if available
+
+    # International & pagination
+    hreflang_links: List[Dict[str, str]] = field(default_factory=list)  # [{"lang": "en", "url": "..."}]
+    rel_prev: str = ""
+    rel_next: str = ""
+
+    # Headings
     h1_tags: List[str] = field(default_factory=list)
     h2_tags: List[str] = field(default_factory=list)
     h3_tags: List[str] = field(default_factory=list)
+
+    # Content metrics
     word_count: int = 0
+    content_sections: List[Dict[str, str]] = field(default_factory=list)  # Sections split by H2/H3
+
+    # Link analysis
     internal_links: int = 0
     external_links: int = 0
+
+    # Images
     images: int = 0
     images_with_alt: int = 0
+
+    # Schema
     schema_types: List[str] = field(default_factory=list)
     schema_markup: List[Dict] = field(default_factory=list)
+    schema_summary: Dict[str, Any] = field(default_factory=dict)  # Completeness scoring
+
+    # Contact info
     has_contact_form: bool = False
     has_phone: bool = False
     has_email: bool = False
     social_links: List[str] = field(default_factory=list)
+
+    # Conversion & CTA signals
+    conversion_signals: Dict[str, Any] = field(default_factory=dict)
+
+    # Page classification
     page_type: str = ""  # homepage, services, about, contact, blog, etc.
+
+    # Extended metadata
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -259,6 +302,178 @@ class CompetitorParser:
             'has_form': has_form
         }
 
+    def _detect_conversion_signals(self, soup: BeautifulSoup) -> Dict[str, Any]:
+        """
+        Detect Call-To-Action (CTA) and conversion signals.
+
+        Identifies:
+        - tel: links (click-to-call)
+        - Forms (quote, booking, contact)
+        - CTA buttons and their positioning
+        - Booking widgets (Calendly, etc.)
+        - Chat widgets
+
+        Returns:
+            Dict with comprehensive CTA metrics
+        """
+        signals = {
+            'tel_links': [],
+            'tel_link_count': 0,
+            'forms': [],
+            'form_count': 0,
+            'cta_buttons': [],
+            'cta_button_count': 0,
+            'cta_above_fold': False,
+            'booking_widgets': [],
+            'has_booking_widget': False,
+            'has_chat_widget': False,
+            'total_conversion_points': 0,
+        }
+
+        # Detect tel: links (click-to-call)
+        tel_links = soup.find_all('a', href=re.compile(r'^tel:', re.I))
+        for link in tel_links:
+            phone = link.get('href', '').replace('tel:', '').strip()
+            signals['tel_links'].append({
+                'phone': phone,
+                'text': link.get_text(strip=True)
+            })
+        signals['tel_link_count'] = len(tel_links)
+
+        # Detect forms
+        forms = soup.find_all('form')
+        for form in forms:
+            form_data = {
+                'action': form.get('action', ''),
+                'method': form.get('method', 'GET').upper(),
+                'inputs': len(form.find_all(['input', 'textarea', 'select'])),
+            }
+
+            # Classify form type based on attributes/context
+            form_classes = ' '.join(form.get('class', [])).lower()
+            form_id = form.get('id', '').lower()
+            form_text = form.get_text(strip=True).lower()
+
+            if any(keyword in form_classes + form_id + form_text
+                   for keyword in ['quote', 'estimate', 'pricing']):
+                form_data['type'] = 'quote'
+            elif any(keyword in form_classes + form_id + form_text
+                     for keyword in ['book', 'schedule', 'appointment']):
+                form_data['type'] = 'booking'
+            elif any(keyword in form_classes + form_id + form_text
+                     for keyword in ['contact', 'reach', 'message']):
+                form_data['type'] = 'contact'
+            elif any(keyword in form_classes + form_id + form_text
+                     for keyword in ['subscribe', 'newsletter', 'email']):
+                form_data['type'] = 'newsletter'
+            else:
+                form_data['type'] = 'other'
+
+            signals['forms'].append(form_data)
+
+        signals['form_count'] = len(forms)
+
+        # Detect CTA buttons (buttons and button-like links)
+        cta_patterns = [
+            r'get.*quote', r'request.*quote', r'free.*estimate',
+            r'book.*now', r'schedule', r'call.*now', r'contact.*us',
+            r'get.*started', r'sign.*up', r'learn.*more', r'view.*pricing'
+        ]
+
+        # Check buttons
+        buttons = soup.find_all(['button', 'input'], type=['button', 'submit'])
+        for button in buttons:
+            text = button.get_text(strip=True)
+            if not text:
+                text = button.get('value', '')
+
+            # Check if it's a CTA
+            if any(re.search(pattern, text.lower()) for pattern in cta_patterns):
+                signals['cta_buttons'].append({
+                    'text': text,
+                    'type': 'button',
+                    'tag': button.name
+                })
+
+        # Check CTA-styled links
+        cta_links = soup.find_all('a', attrs={
+            'class': re.compile(r'btn|button|cta|call-to-action', re.I)
+        })
+        for link in cta_links:
+            text = link.get_text(strip=True)
+            if text:
+                signals['cta_buttons'].append({
+                    'text': text,
+                    'type': 'link',
+                    'href': link.get('href', '')
+                })
+
+        signals['cta_button_count'] = len(signals['cta_buttons'])
+
+        # Check if CTA appears above the fold (in first ~800px / first major content section)
+        # Heuristic: Check if CTA appears within first 3 sections or before first H2
+        above_fold_ctas = 0
+        first_h2 = soup.find('h2')
+        if first_h2:
+            # Check CTAs before first H2
+            for cta in signals['cta_buttons'][:3]:  # Check first 3 CTAs
+                # This is a simplified check - in real implementation we'd need positional data
+                above_fold_ctas += 1
+        else:
+            # If no H2, assume first CTA is above fold
+            above_fold_ctas = min(1, len(signals['cta_buttons']))
+
+        signals['cta_above_fold'] = above_fold_ctas > 0
+
+        # Detect booking widgets
+        booking_widget_indicators = [
+            ('calendly', r'calendly\.com'),
+            ('acuity', r'acuityscheduling\.com'),
+            ('setmore', r'setmore\.com'),
+            ('appointlet', r'appointlet\.com'),
+            ('tidycal', r'tidycal\.com'),
+            ('cal.com', r'cal\.com'),
+        ]
+
+        # Check iframes and script sources
+        for widget_name, pattern in booking_widget_indicators:
+            iframes = soup.find_all('iframe', src=re.compile(pattern, re.I))
+            scripts = soup.find_all('script', src=re.compile(pattern, re.I))
+
+            if iframes or scripts:
+                signals['booking_widgets'].append({
+                    'widget': widget_name,
+                    'type': 'iframe' if iframes else 'script',
+                    'count': len(iframes) + len(scripts)
+                })
+
+        signals['has_booking_widget'] = len(signals['booking_widgets']) > 0
+
+        # Detect chat widgets
+        chat_widget_indicators = [
+            r'intercom', r'drift', r'livechat', r'tawk\.to',
+            r'crisp', r'zendesk.*chat', r'olark', r'helpscout'
+        ]
+
+        # Check for chat widget scripts/divs
+        for pattern in chat_widget_indicators:
+            scripts = soup.find_all('script', src=re.compile(pattern, re.I))
+            divs = soup.find_all('div', id=re.compile(pattern, re.I))
+            if scripts or divs:
+                signals['has_chat_widget'] = True
+                break
+
+        # Calculate total conversion points
+        signals['total_conversion_points'] = (
+            signals['tel_link_count'] +
+            signals['form_count'] +
+            signals['cta_button_count'] +
+            (1 if signals['has_booking_widget'] else 0) +
+            (1 if signals['has_chat_widget'] else 0)
+        )
+
+        return signals
+
     def _detect_page_type(self, url: str, soup: BeautifulSoup) -> str:
         """Detect page type based on URL and content."""
         path = urlparse(url).path.lower()
@@ -281,6 +496,202 @@ class CompetitorParser:
             return 'blog'
 
         return 'other'
+
+    def _extract_opengraph(self, soup: BeautifulSoup) -> Dict[str, str]:
+        """Extract OpenGraph metadata."""
+        og_data = {}
+
+        og_properties = ['og:title', 'og:description', 'og:image', 'og:type', 'og:url']
+        for prop in og_properties:
+            meta = soup.find('meta', property=prop)
+            if meta:
+                key = prop.replace('og:', 'og_')
+                og_data[key] = meta.get('content', '')
+
+        return og_data
+
+    def _extract_twitter_card(self, soup: BeautifulSoup) -> Dict[str, str]:
+        """Extract Twitter Card metadata."""
+        twitter_data = {}
+
+        twitter_properties = [
+            'twitter:card', 'twitter:title', 'twitter:description', 'twitter:image'
+        ]
+        for prop in twitter_properties:
+            meta = soup.find('meta', attrs={'name': prop})
+            if meta:
+                key = prop.replace(':', '_')
+                twitter_data[key] = meta.get('content', '')
+
+        return twitter_data
+
+    def _extract_robots(self, soup: BeautifulSoup) -> str:
+        """Extract robots meta directives."""
+        robots_meta = soup.find('meta', attrs={'name': 'robots'})
+        if robots_meta:
+            return robots_meta.get('content', '')
+        return ""
+
+    def _extract_hreflang(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
+        """Extract hreflang links for international targeting."""
+        hreflang_links = []
+
+        for link in soup.find_all('link', rel='alternate', hreflang=True):
+            hreflang_links.append({
+                'lang': link.get('hreflang', ''),
+                'url': link.get('href', '')
+            })
+
+        return hreflang_links
+
+    def _extract_pagination(self, soup: BeautifulSoup) -> Dict[str, str]:
+        """Extract pagination links (rel=prev/next)."""
+        pagination = {'prev': '', 'next': ''}
+
+        prev_link = soup.find('link', rel='prev')
+        if prev_link:
+            pagination['prev'] = prev_link.get('href', '')
+
+        next_link = soup.find('link', rel='next')
+        if next_link:
+            pagination['next'] = next_link.get('href', '')
+
+        return pagination
+
+    def _split_content_sections(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
+        """
+        Split page content into sections by H2/H3 headings.
+
+        Returns:
+            List of sections with heading and content
+        """
+        sections = []
+
+        # Remove script, style, nav, header, footer
+        for elem in soup(['script', 'style', 'nav', 'header', 'footer', 'aside']):
+            elem.decompose()
+
+        # Find all H2 headings
+        h2_headings = soup.find_all('h2')
+
+        for i, h2 in enumerate(h2_headings):
+            heading_text = h2.get_text(strip=True)
+
+            # Get content until next H2
+            content_parts = []
+            current = h2.find_next_sibling()
+
+            while current:
+                # Stop at next H2
+                if current.name == 'h2':
+                    break
+
+                # Collect H3 and content
+                if current.name in ['h3', 'p', 'ul', 'ol', 'div']:
+                    text = current.get_text(separator=' ', strip=True)
+                    if text:
+                        content_parts.append(text)
+
+                current = current.find_next_sibling()
+
+            content = ' '.join(content_parts)
+
+            if heading_text and content:
+                sections.append({
+                    'heading': heading_text,
+                    'heading_level': 'h2',
+                    'content': content[:2000],  # Limit content length
+                    'word_count': len(content.split())
+                })
+
+        # If no H2 sections found, create one default section
+        if not sections:
+            body_text = soup.get_text(separator=' ', strip=True)
+            if body_text:
+                sections.append({
+                    'heading': 'Main Content',
+                    'heading_level': 'body',
+                    'content': body_text[:2000],
+                    'word_count': len(body_text.split())
+                })
+
+        return sections
+
+    def _calculate_schema_summary(self, schemas: List[Dict]) -> Dict[str, Any]:
+        """
+        Calculate schema completeness scoring.
+
+        Analyzes schema.org markup and scores completeness for:
+        - LocalBusiness
+        - Organization
+        - FAQPage
+        - Review / AggregateRating
+
+        Returns:
+            Dict with completeness scores and detected types
+        """
+        summary = {
+            'has_local_business': False,
+            'has_organization': False,
+            'has_faq': False,
+            'has_review': False,
+            'local_business_score': 0,
+            'organization_score': 0,
+            'required_fields': {},
+            'optional_fields': {}
+        }
+
+        # Define required/optional fields for key schema types
+        local_business_required = ['name', 'address', 'telephone']
+        local_business_optional = ['url', 'image', 'priceRange', 'openingHours', 'geo']
+
+        organization_required = ['name', 'url']
+        organization_optional = ['logo', 'contactPoint', 'sameAs', 'address']
+
+        for schema in schemas:
+            schema_type = schema.get('@type', '')
+
+            if isinstance(schema_type, list):
+                schema_type = schema_type[0] if schema_type else ''
+
+            # Check LocalBusiness
+            if 'LocalBusiness' in str(schema_type):
+                summary['has_local_business'] = True
+                required_present = sum(1 for field in local_business_required if field in schema)
+                optional_present = sum(1 for field in local_business_optional if field in schema)
+
+                # Score: 70% from required, 30% from optional
+                req_score = (required_present / len(local_business_required)) * 70
+                opt_score = (optional_present / len(local_business_optional)) * 30
+                summary['local_business_score'] = int(req_score + opt_score)
+
+                summary['required_fields']['local_business'] = {
+                    field: (field in schema) for field in local_business_required
+                }
+
+            # Check Organization
+            if schema_type == 'Organization':
+                summary['has_organization'] = True
+                required_present = sum(1 for field in organization_required if field in schema)
+                optional_present = sum(1 for field in organization_optional if field in schema)
+
+                req_score = (required_present / len(organization_required)) * 70
+                opt_score = (optional_present / len(organization_optional)) * 30
+                summary['organization_score'] = int(req_score + opt_score)
+
+                summary['required_fields']['organization'] = {
+                    field: (field in schema) for field in organization_required
+                }
+
+            # Check FAQPage
+            if schema_type == 'FAQPage':
+                summary['has_faq'] = True
+
+            # Check Review / AggregateRating
+            if 'Review' in str(schema_type) or 'aggregateRating' in schema:
+                summary['has_review'] = True
+
+        return summary
 
     def parse(self, html: str, url: str) -> PageMetrics:
         """
@@ -308,14 +719,33 @@ class CompetitorParser:
         canonical_elem = soup.find('link', rel='canonical')
         canonical_url = canonical_elem.get('href', '') if canonical_elem else ""
 
+        # Extract OpenGraph metadata
+        og_data = self._extract_opengraph(soup)
+
+        # Extract Twitter Card metadata
+        twitter_data = self._extract_twitter_card(soup)
+
+        # Extract robots directives
+        robots_meta = self._extract_robots(soup)
+
+        # Extract hreflang links
+        hreflang_links = self._extract_hreflang(soup)
+
+        # Extract pagination links
+        pagination = self._extract_pagination(soup)
+
         # Extract headings
         h1_tags = self._extract_headings(soup, 'h1')
         h2_tags = self._extract_headings(soup, 'h2')
         h3_tags = self._extract_headings(soup, 'h3')
 
+        # Split content into sections
+        content_sections = self._split_content_sections(soup)
+
         # Extract schema
         schemas = self._extract_schema(soup)
         schema_types = self._extract_schema_types(schemas)
+        schema_summary = self._calculate_schema_summary(schemas)
 
         # Count words
         word_count = self._count_words(soup)
@@ -329,6 +759,9 @@ class CompetitorParser:
         # Detect contact info
         contact = self._detect_contact_info(soup)
 
+        # Detect conversion signals (CTAs, forms, booking widgets)
+        conversion_signals = self._detect_conversion_signals(soup)
+
         # Detect page type
         page_type = self._detect_page_type(url, soup)
 
@@ -339,20 +772,48 @@ class CompetitorParser:
             meta_description=meta_description,
             meta_keywords=meta_keywords,
             canonical_url=canonical_url,
+            # OpenGraph
+            og_title=og_data.get('og_title', ''),
+            og_description=og_data.get('og_description', ''),
+            og_image=og_data.get('og_image', ''),
+            og_type=og_data.get('og_type', ''),
+            og_url=og_data.get('og_url', ''),
+            # Twitter Card
+            twitter_card=twitter_data.get('twitter_card', ''),
+            twitter_title=twitter_data.get('twitter_title', ''),
+            twitter_description=twitter_data.get('twitter_description', ''),
+            twitter_image=twitter_data.get('twitter_image', ''),
+            # Robots
+            robots_meta=robots_meta,
+            # International & Pagination
+            hreflang_links=hreflang_links,
+            rel_prev=pagination['prev'],
+            rel_next=pagination['next'],
+            # Headings
             h1_tags=h1_tags,
             h2_tags=h2_tags[:10],  # Limit to first 10
             h3_tags=h3_tags[:10],
+            # Content
             word_count=word_count,
+            content_sections=content_sections,
+            # Links
             internal_links=links['internal'],
             external_links=links['external'],
+            # Images
             images=images['total'],
             images_with_alt=images['with_alt'],
+            # Schema
             schema_types=schema_types,
             schema_markup=schemas,
+            schema_summary=schema_summary,
+            # Contact
             has_contact_form=contact['has_form'],
             has_phone=contact['has_phone'],
             has_email=contact['has_email'],
             social_links=links['social'],
+            # Conversion signals
+            conversion_signals=conversion_signals,
+            # Page type
             page_type=page_type,
         )
 
