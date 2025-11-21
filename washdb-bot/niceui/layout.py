@@ -116,6 +116,15 @@ class AppLayout:
             for item in nav_items:
                 self._create_nav_item(item['name'], item['icon'], item['page'])
 
+            # Testing section
+            ui.separator().classes('my-3')
+            ui.label('TESTING & QA').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
+            testing_items = [
+                {'name': 'Test Suite', 'icon': 'science', 'page': 'testing'},
+            ]
+            for item in testing_items:
+                self._create_nav_item(item['name'], item['icon'], item['page'])
+
             # SEO Intelligence section
             ui.separator().classes('my-3')
             ui.label('SEO INTELLIGENCE').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
@@ -167,6 +176,15 @@ class AppLayout:
             {'name': 'Settings', 'icon': 'settings', 'page': 'settings'},
         ]
         for item in nav_items:
+            self._create_nav_item(item['name'], item['icon'], item['page'])
+
+        # Testing section
+        ui.separator().classes('my-3')
+        ui.label('TESTING & QA').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
+        testing_items = [
+            {'name': 'Test Suite', 'icon': 'science', 'page': 'testing'},
+        ]
+        for item in testing_items:
             self._create_nav_item(item['name'], item['icon'], item['page'])
 
         # SEO Intelligence section
