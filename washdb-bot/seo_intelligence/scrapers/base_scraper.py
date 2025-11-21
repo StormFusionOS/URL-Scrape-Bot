@@ -17,7 +17,7 @@ import os
 import time
 import random
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from contextlib import contextmanager
 from urllib.parse import urlparse
 
@@ -30,6 +30,7 @@ from seo_intelligence.services import (
     get_proxy_manager,
     get_task_logger,
     get_content_hasher,
+    get_domain_quarantine,
 )
 from runner.logging_setup import get_logger
 
@@ -87,6 +88,7 @@ class BaseScraper(ABC):
         self.proxy_manager = get_proxy_manager()
         self.task_logger = get_task_logger()
         self.content_hasher = get_content_hasher()
+        self.domain_quarantine = get_domain_quarantine()
 
         # Browser state
         self._playwright = None
@@ -378,6 +380,12 @@ class BaseScraper(ABC):
         """
         Fetch a page with all checks and rate limiting.
 
+        Integrates Phase 2 enhancements:
+        - Domain quarantine checks
+        - Exponential backoff on errors
+        - Automatic quarantine on 403, repeated 429, CAPTCHA
+        - Retry-After header respect
+
         Args:
             url: URL to fetch
             page: Playwright Page object
@@ -389,18 +397,33 @@ class BaseScraper(ABC):
         """
         domain = urlparse(url).netloc
 
+        # Check if domain is quarantined (Task 11: Ethical Crawling)
+        if self.domain_quarantine.is_quarantined(domain):
+            quarantine_end = self.domain_quarantine.get_quarantine_end(domain)
+            self.logger.warning(
+                f"Domain {domain} is quarantined until {quarantine_end}, skipping"
+            )
+            self.stats["pages_skipped"] += 1
+            return None
+
         # Check robots.txt
         if not self._check_robots(url):
             self.stats["pages_skipped"] += 1
             return None
 
-        # Acquire rate limit token
-        if not self._acquire_rate_limit(domain):
-            self.stats["pages_skipped"] += 1
-            return None
-
-        # Fetch page with retries
+        # Fetch page with retries and exponential backoff
         for attempt in range(self.max_retries):
+            # Apply exponential backoff delay (Task 11)
+            retry_attempt = self.domain_quarantine.get_retry_attempt(domain)
+            backoff_delay = self.domain_quarantine.get_backoff_delay(retry_attempt)
+
+            if backoff_delay > 0:
+                self.logger.info(
+                    f"Exponential backoff for {domain}: waiting {backoff_delay}s "
+                    f"(retry attempt {retry_attempt})"
+                )
+                time.sleep(backoff_delay)
+
             try:
                 self.logger.debug(f"Fetching {url} (attempt {attempt + 1}/{self.max_retries})")
 
@@ -410,21 +433,60 @@ class BaseScraper(ABC):
                     self.logger.warning(f"No response from {url}")
                     continue
 
+                # Handle HTTP errors
                 if response.status >= 400:
                     self.logger.warning(f"HTTP {response.status} from {url}")
 
+                    # 403 Forbidden - Quarantine domain immediately (Task 11)
+                    if response.status == 403:
+                        self.logger.error(f"403 Forbidden from {domain} - quarantining")
+                        self.domain_quarantine.quarantine_domain(
+                            domain=domain,
+                            reason="403_FORBIDDEN",
+                            metadata={"url": url, "attempt": attempt}
+                        )
+                        self.stats["pages_failed"] += 1
+                        return None
+
+                    # 429 Rate Limited - Record event (auto-quarantines after 3) (Task 11)
                     if response.status == 429:
-                        # Rate limited - wait and retry
-                        wait_time = self._get_random_delay() * 2
+                        self.domain_quarantine.record_error_event(domain, "429")
+
+                        # Check for Retry-After header
+                        retry_after = response.headers.get('retry-after')
+                        retry_after_seconds = None
+
+                        if retry_after:
+                            try:
+                                retry_after_seconds = int(retry_after)
+                                self.logger.info(
+                                    f"Rate limited, Retry-After: {retry_after_seconds}s"
+                                )
+                            except ValueError:
+                                # Retry-After might be a date, ignore for now
+                                pass
+
+                        # Use exponential backoff if no Retry-After
+                        wait_time = retry_after_seconds if retry_after_seconds else (
+                            self._get_random_delay() * 2
+                        )
+
                         self.logger.info(f"Rate limited, waiting {wait_time:.1f}s...")
                         time.sleep(wait_time)
                         continue
 
+                    # 5xx Server Errors - Record event (auto-quarantines after 3) (Task 11)
                     if response.status >= 500:
-                        # Server error - retry
+                        self.domain_quarantine.record_error_event(
+                            domain,
+                            f"{response.status}"
+                        )
+                        self.logger.warning(
+                            f"Server error {response.status}, retrying with backoff..."
+                        )
                         continue
 
-                    # Client error - don't retry
+                    # Other client errors - don't retry
                     self.stats["pages_failed"] += 1
                     return None
 
@@ -441,9 +503,24 @@ class BaseScraper(ABC):
 
                 if not is_valid:
                     self.logger.warning(f"HTML validation failed for {url}: {reason_code}")
+
+                    # Quarantine domain on CAPTCHA or bot detection (Task 11)
+                    if reason_code in ("CAPTCHA_DETECTED", "BOT_DETECTED"):
+                        self.logger.error(
+                            f"{reason_code} on {domain} - quarantining for 60 minutes"
+                        )
+                        self.domain_quarantine.quarantine_domain(
+                            domain=domain,
+                            reason=reason_code,
+                            duration_minutes=60,
+                            metadata={"url": url, "validation_failure": reason_code}
+                        )
+
                     self.stats["pages_failed"] += 1
-                    # Store failure reason for provenance
                     return None
+
+                # SUCCESS - Reset retry attempts (Task 11)
+                self.domain_quarantine.reset_retry_attempts(domain)
 
                 self.stats["pages_crawled"] += 1
                 self.logger.debug(f"Fetched {url} ({len(content)} chars) - validation passed")

@@ -1243,8 +1243,9 @@ class BusinessSource(Base):
         comment="Last update timestamp"
     )
 
-    # Extended Metadata
-    metadata: Mapped[Optional[dict]] = mapped_column(
+    # Extended Metadata (renamed from 'metadata' to avoid SQLAlchemy reserved name conflict)
+    extra_metadata: Mapped[Optional[dict]] = mapped_column(
+        "metadata",  # Column name in database is still 'metadata'
         JSON().with_variant(JSONB, "postgresql"),
         nullable=True,
         comment="Extended fields, raw data, parsing metadata"

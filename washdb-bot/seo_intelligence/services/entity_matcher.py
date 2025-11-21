@@ -32,7 +32,7 @@ import phonenumbers
 from sqlalchemy import select, text, and_, or_
 from sqlalchemy.orm import Session
 
-from db.database import get_db_session
+from db import create_session
 from db.models import Company
 from runner.logging_setup import get_logger
 
@@ -185,7 +185,7 @@ class EntityMatcher:
         """
         close_session = False
         if session is None:
-            session = next(get_db_session())
+            session = next(create_session())
             close_session = True
 
         try:
@@ -367,7 +367,7 @@ class EntityMatcher:
         """
         close_session = False
         if session is None:
-            session = next(get_db_session())
+            session = next(create_session())
             close_session = True
 
         try:
@@ -462,7 +462,7 @@ class EntityMatcher:
         """
         close_session = False
         if session is None:
-            session = next(get_db_session())
+            session = next(create_session())
             close_session = True
 
         try:

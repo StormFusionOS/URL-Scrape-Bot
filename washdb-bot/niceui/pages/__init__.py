@@ -13,6 +13,7 @@ from .scheduler import scheduler_page
 from .seo_intelligence import seo_intelligence_page
 from .seo_database import seo_database_page
 from .local_competitors import local_competitors_page
+from .dev_tools import dev_tools_page
 
 __all__ = [
     'dashboard_page',
@@ -25,4 +26,5 @@ __all__ = [
     'seo_intelligence_page',
     'seo_database_page',
     'local_competitors_page',
+    'dev_tools_page',
 ]

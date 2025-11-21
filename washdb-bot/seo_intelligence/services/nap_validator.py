@@ -31,7 +31,7 @@ import phonenumbers
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from db.database import get_db_session
+from db import create_session
 from db.models import Company, BusinessSource
 from seo_intelligence.services.source_trust import get_source_trust
 from runner.logging_setup import get_logger
@@ -219,7 +219,7 @@ class NAPValidator:
         """
         close_session = False
         if session is None:
-            session = next(get_db_session())
+            session = next(create_session())
             close_session = True
 
         try:
@@ -368,7 +368,7 @@ class NAPValidator:
         """
         close_session = False
         if session is None:
-            session = next(get_db_session())
+            session = next(create_session())
             close_session = True
 
         try:
@@ -413,7 +413,7 @@ class NAPValidator:
         Returns:
             Tuple of (total_processed, conflict_count, success_count)
         """
-        session = next(get_db_session())
+        session = next(create_session())
 
         try:
             # Get total company count
@@ -475,7 +475,7 @@ class NAPValidator:
         """
         close_session = False
         if session is None:
-            session = next(get_db_session())
+            session = next(create_session())
             close_session = True
 
         try:
