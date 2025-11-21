@@ -24,6 +24,21 @@ logger = get_logger("serp_parser")
 
 
 @dataclass
+class PAAQuestion:
+    """Represents a People Also Ask question with full details."""
+    question: str
+    answer: str = ""
+    source_url: str = ""
+    source_domain: str = ""
+    position: int = 0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+
+
+@dataclass
 class SerpResult:
     """Represents a single SERP result."""
     position: int
@@ -61,8 +76,9 @@ class SerpSnapshot:
     total_results: Optional[int] = None
     featured_snippet: Optional[Dict] = None
     local_pack: List[Dict] = field(default_factory=list)
-    people_also_ask: List[str] = field(default_factory=list)
+    people_also_ask: List[PAAQuestion] = field(default_factory=list)
     related_searches: List[str] = field(default_factory=list)
+    serp_features: List[str] = field(default_factory=list)  # Track detected SERP features
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -74,8 +90,9 @@ class SerpSnapshot:
             "total_results": self.total_results,
             "featured_snippet": self.featured_snippet,
             "local_pack": self.local_pack,
-            "people_also_ask": self.people_also_ask,
+            "people_also_ask": [paa.to_dict() for paa in self.people_also_ask],
             "related_searches": self.related_searches,
+            "serp_features": self.serp_features,
             "metadata": self.metadata,
         }
 
@@ -325,30 +342,97 @@ class SerpParser:
 
         return local_results
 
-    def _parse_people_also_ask(self, soup: BeautifulSoup) -> List[str]:
+    def _parse_people_also_ask(self, soup: BeautifulSoup) -> List[PAAQuestion]:
         """
-        Parse "People Also Ask" questions.
+        Parse "People Also Ask" questions with full structured data.
 
         Args:
             soup: BeautifulSoup object of SERP
 
         Returns:
-            List of question strings
+            List of PAAQuestion objects with question, answer, source, position
         """
-        questions = []
+        paa_questions = []
 
-        # Find PAA container
-        paa_elements = soup.select("div.related-question-pair") or soup.select("div[data-q]")
+        # Multiple selectors for PAA sections (Google layout varies)
+        paa_selectors = [
+            "div.related-question-pair",  # Classic PAA container
+            "div[jsname='yEVEE']",        # Alternative container
+            "div.cbphWd",                  # Another variant
+            "div[data-q]",                 # Data attribute approach
+        ]
 
-        for elem in paa_elements:
-            try:
-                question = elem.get("data-q") or elem.get_text(strip=True)
-                if question:
-                    questions.append(question)
-            except Exception:
-                continue
+        position = 1
+        for selector in paa_selectors:
+            paa_elements = soup.select(selector)
 
-        return questions
+            for elem in paa_elements:
+                try:
+                    # Extract question text
+                    question = None
+
+                    # Try data-q attribute first
+                    if elem.get("data-q"):
+                        question = elem.get("data-q")
+                    else:
+                        # Look for question in various elements
+                        question_elem = (
+                            elem.select_one("div[role='button']") or
+                            elem.select_one("span[jsname]") or
+                            elem.select_one("div.JlqpRe") or
+                            elem.select_one("div")
+                        )
+                        if question_elem:
+                            question = question_elem.get_text(strip=True)
+
+                    if not question or len(question) < 5:
+                        continue
+
+                    # Extract answer text (expandable content)
+                    answer = ""
+                    answer_elem = (
+                        elem.select_one("div.hgKElc") or  # Answer container
+                        elem.select_one("div.kno-rdesc") or  # Knowledge answer
+                        elem.select_one("div[data-attrid='wa:/description']") or
+                        elem.select_one("span.hgKElc")
+                    )
+                    if answer_elem:
+                        answer = answer_elem.get_text(strip=True)
+
+                    # Extract source URL and domain
+                    source_url = ""
+                    source_domain = ""
+                    source_link = elem.select_one("a[href]")
+                    if source_link:
+                        source_url = self._clean_url(source_link.get("href", ""))
+                        if source_url:
+                            try:
+                                parsed = urlparse(source_url)
+                                source_domain = parsed.netloc.lower()
+                                if source_domain.startswith("www."):
+                                    source_domain = source_domain[4:]
+                            except Exception:
+                                pass
+
+                    paa_questions.append(PAAQuestion(
+                        question=question,
+                        answer=answer[:500],  # Limit answer length
+                        source_url=source_url,
+                        source_domain=source_domain,
+                        position=position
+                    ))
+
+                    position += 1
+
+                except Exception as e:
+                    logger.debug(f"Error parsing PAA question: {e}")
+                    continue
+
+            # If we found PAA questions, don't try other selectors
+            if paa_questions:
+                break
+
+        return paa_questions
 
     def _parse_related_searches(self, soup: BeautifulSoup) -> List[str]:
         """
@@ -398,6 +482,134 @@ class SerpParser:
 
         return None
 
+    def _detect_serp_features(self, soup: BeautifulSoup) -> List[str]:
+        """
+        Detect and flag SERP features present on the page.
+
+        Detects:
+        - Featured snippets
+        - Knowledge panels
+        - Knowledge cards
+        - Local packs / map results
+        - Image carousels / packs
+        - Video carousels
+        - News results
+        - Shopping results
+        - People Also Ask
+        - Related searches
+        - Site links
+        - Reviews/ratings
+
+        Args:
+            soup: BeautifulSoup object of SERP
+
+        Returns:
+            List of detected feature names
+        """
+        features = []
+
+        # Featured snippet detection
+        featured_selectors = [
+            "div.xpdopen",              # Classic featured snippet
+            "div.kp-blk",               # Knowledge panel variant
+            "div[data-attrid='FeaturedSnippet']",
+            "div.IZ6rdc",               # Answer box
+            "div.kno-rdesc",            # Quick answer
+        ]
+        for selector in featured_selectors:
+            if soup.select_one(selector):
+                features.append("featured_snippet")
+                break
+
+        # Knowledge panel / card
+        knowledge_selectors = [
+            "div.kp-wholepage",         # Full knowledge panel
+            "div.knowledge-panel",      # Knowledge panel container
+            "div.kno-kp",               # KP container
+            "div[data-attrid='kc:/']",  # Knowledge card
+        ]
+        for selector in knowledge_selectors:
+            if soup.select_one(selector):
+                features.append("knowledge_panel")
+                break
+
+        # Local pack / map results
+        if soup.select_one("div.VkpGBb") or soup.select_one("div[data-attrid='kc:/local:']"):
+            features.append("local_pack")
+
+        # Image carousel / pack
+        image_selectors = [
+            "div.islrc",                # Image results container
+            "g-scrolling-carousel",     # Image carousel
+            "div[data-tray]",           # Image tray
+        ]
+        for selector in image_selectors:
+            if soup.select_one(selector):
+                features.append("image_carousel")
+                break
+
+        # Video carousel
+        video_selectors = [
+            "g-section-with-header[data-header-text*='Videos']",
+            "div[data-attrid='VideoCarousel']",
+            "div.YpRj3e",  # Video result container
+        ]
+        for selector in video_selectors:
+            if soup.select_one(selector):
+                features.append("video_carousel")
+                break
+
+        # News results
+        news_selectors = [
+            "div.nChh6e",               # Top stories
+            "div[data-attrid='TopStories']",
+            "g-section-with-header[data-header-text*='Top stories']",
+        ]
+        for selector in news_selectors:
+            if soup.select_one(selector):
+                features.append("news_results")
+                break
+
+        # Shopping results / product listings
+        shopping_selectors = [
+            "div.pla-unit",             # Shopping ad
+            "div[data-attrid='ShoppingResults']",
+            "div.cu-container",         # Comparison unit
+        ]
+        for selector in shopping_selectors:
+            if soup.select_one(selector):
+                features.append("shopping_results")
+                break
+
+        # People Also Ask
+        paa_selectors = [
+            "div.related-question-pair",
+            "div[jsname='yEVEE']",
+            "div.cbphWd",
+        ]
+        for selector in paa_selectors:
+            if soup.select(selector):
+                features.append("people_also_ask")
+                break
+
+        # Related searches
+        if soup.select_one("div#brs") or soup.select_one("div.AJLUJb"):
+            features.append("related_searches")
+
+        # Site links (multiple links from same domain)
+        if soup.select("div.usJj9c"):  # Sitelinks container
+            features.append("sitelinks")
+
+        # Reviews / ratings
+        if soup.select_one("span.z3HNkc") or soup.select_one("div.fG8Fp"):
+            features.append("reviews_ratings")
+
+        # Twitter carousel / social media
+        if soup.select_one("g-section-with-header[data-header-text*='Twitter']"):
+            features.append("twitter_carousel")
+
+        return list(set(features))  # Remove duplicates
+
     def parse(self, html: str, query: str, location: Optional[str] = None) -> SerpSnapshot:
         """
         Parse a Google SERP page.
@@ -441,11 +653,15 @@ class SerpParser:
         snapshot.people_also_ask = self._parse_people_also_ask(soup)
         snapshot.related_searches = self._parse_related_searches(soup)
 
+        # Detect SERP features
+        snapshot.serp_features = self._detect_serp_features(soup)
+
         logger.info(
             f"Parsed SERP for '{query}': "
             f"{len(snapshot.results)} organic, "
             f"{len(snapshot.local_pack)} local, "
-            f"{len(snapshot.people_also_ask)} PAA"
+            f"{len(snapshot.people_also_ask)} PAA, "
+            f"{len(snapshot.serp_features)} features"
         )
 
         return snapshot

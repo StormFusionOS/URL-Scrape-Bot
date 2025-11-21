@@ -24,12 +24,13 @@ from urllib.parse import urlparse, quote_plus
 from dataclasses import dataclass, field, asdict
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, select
 from sqlalchemy.orm import Session
 
 from seo_intelligence.scrapers.base_scraper import BaseScraper
 from seo_intelligence.services import get_task_logger
 from runner.logging_setup import get_logger
+from db.models import Company, BusinessSource
 
 # Load environment
 load_dotenv()
@@ -371,6 +372,175 @@ class CitationCrawler(BaseScraper):
 
         return result
 
+    def _calculate_business_source_quality_score(
+        self,
+        name: Optional[str],
+        phone: Optional[str],
+        street: Optional[str],
+        city: Optional[str],
+        state: Optional[str],
+        zip_code: Optional[str],
+        website: Optional[str],
+        is_verified: bool,
+        rating_count: Optional[int]
+    ) -> int:
+        """Calculate data quality score (0-100) based on completeness and verification."""
+        score = 0
+
+        # Base NAP completeness (60 points max)
+        if name and len(name) > 0:
+            score += 15
+        if phone and len(phone) > 0:
+            score += 15
+        if street and len(street) > 0:
+            score += 10
+        if city and len(city) > 0:
+            score += 10
+        if state and len(state) > 0:
+            score += 5
+        if zip_code and len(zip_code) > 0:
+            score += 5
+
+        # Additional data (20 points max)
+        if website and len(website) > 0:
+            score += 10
+        if rating_count is not None and rating_count > 0:
+            score += 10
+
+        # Verification bonus (20 points)
+        if is_verified:
+            score += 20
+
+        return score
+
+    def _create_business_source_from_citation(
+        self,
+        session: Session,
+        company_id: int,
+        business: BusinessInfo,
+        result: CitationResult,
+    ) -> None:
+        """
+        Create or update a BusinessSource record from citation data.
+
+        Args:
+            session: Database session
+            company_id: ID of the Company record
+            business: Business information
+            result: Citation result with directory info
+        """
+        # Determine source_type from directory key
+        source_type_map = {
+            "google_business": "google",
+            "yelp": "yelp",
+            "yellowpages": "yp",
+            "bbb": "bbb",
+            "facebook": "facebook",
+            "angies_list": "angi",
+            "thumbtack": "thumbtack",
+            "homeadvisor": "homeadvisor",
+            "mapquest": "mapquest",
+            "manta": "manta",
+        }
+        source_type = source_type_map.get(result.directory, result.directory)
+
+        # Calculate quality score
+        quality_score = self._calculate_business_source_quality_score(
+            name=business.name if result.is_listed else None,
+            phone=business.phone if result.phone_match else None,
+            street=business.address if result.address_match else None,
+            city=business.city,
+            state=business.state,
+            zip_code=business.zip_code,
+            website=business.website,
+            is_verified=False,  # Citations don't typically have verification status
+            rating_count=result.review_count if result.has_reviews else None
+        )
+
+        # Determine confidence level
+        if quality_score >= 80 or result.nap_score >= 0.8:
+            confidence = "high"
+        elif quality_score >= 50 or result.nap_score >= 0.5:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        # Build metadata
+        metadata = {
+            "directory_name": result.directory,
+            "nap_match_score": result.nap_score,
+            "name_match": result.name_match,
+            "address_match": result.address_match,
+            "phone_match": result.phone_match,
+            "has_reviews": result.has_reviews,
+            "is_present": result.is_listed,
+        }
+        metadata.update(result.metadata)
+
+        # Check if BusinessSource already exists for this company + source_type
+        existing_bs = session.execute(
+            select(BusinessSource).where(
+                BusinessSource.company_id == company_id,
+                BusinessSource.source_type == source_type
+            )
+        ).scalar_one_or_none()
+
+        if existing_bs:
+            # Update existing BusinessSource
+            if result.is_listed:
+                existing_bs.source_name = result.directory_url
+                existing_bs.profile_url = result.listing_url
+                existing_bs.name = business.name
+                existing_bs.phone = business.phone if result.phone_match else None
+                existing_bs.address_raw = business.address if result.address_match else None
+                existing_bs.street = business.address if result.address_match else None
+                existing_bs.city = business.city
+                existing_bs.state = business.state
+                existing_bs.zip_code = business.zip_code
+                existing_bs.website = business.website
+                existing_bs.rating_value = result.rating
+                existing_bs.rating_count = result.review_count if result.has_reviews else None
+                existing_bs.is_verified = False
+                existing_bs.listing_status = "found"
+                existing_bs.data_quality_score = quality_score
+                existing_bs.confidence_level = confidence
+                existing_bs.metadata = metadata
+            else:
+                existing_bs.listing_status = "not_found"
+                existing_bs.metadata = metadata
+
+            logger.debug(f"Updated BusinessSource for company_id={company_id}, source={source_type}")
+        else:
+            # Create new BusinessSource record only if listed
+            if result.is_listed:
+                business_source = BusinessSource(
+                    company_id=company_id,
+                    source_type=source_type,
+                    source_name=result.directory_url,
+                    source_url=CITATION_DIRECTORIES.get(result.directory, {}).get("search_url", ""),
+                    profile_url=result.listing_url,
+                    name=business.name,
+                    phone=business.phone if result.phone_match else None,
+                    phone_e164=None,  # TODO: Implement E.164 normalization
+                    address_raw=business.address if result.address_match else None,
+                    street=business.address if result.address_match else None,
+                    city=business.city,
+                    state=business.state,
+                    zip_code=business.zip_code,
+                    website=business.website,
+                    categories=None,  # Citations don't typically provide categories
+                    rating_value=result.rating,
+                    rating_count=result.review_count if result.has_reviews else None,
+                    is_verified=False,
+                    listing_status="found",
+                    data_quality_score=quality_score,
+                    confidence_level=confidence,
+                    metadata=metadata
+                )
+
+                session.add(business_source)
+                logger.debug(f"Created BusinessSource for company_id={company_id}, source={source_type}, quality={quality_score}")
+
     def _save_citation(
         self,
         session: Session,
@@ -395,6 +565,22 @@ class CitationCrawler(BaseScraper):
             "rating": result.rating,
         }
         metadata.update(result.metadata)
+
+        # Try to find company by website or name for BusinessSource creation
+        company = None
+        if business.website:
+            # Try to find by website first
+            company = session.execute(
+                select(Company).where(Company.website == business.website)
+            ).scalar_one_or_none()
+
+        if not company and business.name:
+            # Fallback: try to find by name (case-insensitive, fuzzy match)
+            company = session.execute(
+                select(Company).where(Company.name.ilike(f"%{business.name}%"))
+            ).first()
+            if company:
+                company = company[0]  # Extract from tuple
 
         # Check if citation exists
         existing = session.execute(
@@ -432,6 +618,19 @@ class CitationCrawler(BaseScraper):
                     "metadata": json.dumps(metadata),
                 }
             )
+
+            # Create/update BusinessSource if we found a company
+            if company:
+                try:
+                    self._create_business_source_from_citation(
+                        session=session,
+                        company_id=company.id,
+                        business=business,
+                        result=result
+                    )
+                except Exception as bs_error:
+                    logger.warning(f"Failed to create BusinessSource for {business.name}: {bs_error}")
+
             session.commit()
             return row[0]
 
@@ -461,6 +660,19 @@ class CitationCrawler(BaseScraper):
                 "metadata": json.dumps(metadata),
             }
         )
+
+        # Create/update BusinessSource if we found a company
+        if company:
+            try:
+                self._create_business_source_from_citation(
+                    session=session,
+                    company_id=company.id,
+                    business=business,
+                    result=result
+                )
+            except Exception as bs_error:
+                logger.warning(f"Failed to create BusinessSource for {business.name}: {bs_error}")
+
         session.commit()
 
         return new_result.fetchone()[0]
