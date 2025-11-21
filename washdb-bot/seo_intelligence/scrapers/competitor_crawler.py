@@ -35,6 +35,7 @@ from seo_intelligence.services import (
     get_qdrant_manager,
     extract_main_content
 )
+from seo_intelligence.services.section_embedder import get_section_embedder
 from runner.logging_setup import get_logger
 
 # Load environment
@@ -87,7 +88,8 @@ class CompetitorCrawler(BaseScraper):
             try:
                 self.embedder = get_content_embedder()
                 self.qdrant = get_qdrant_manager()
-                logger.info("✓ Embedding services initialized")
+                self.section_embedder = get_section_embedder()
+                logger.info("✓ Embedding services initialized (page + section level)")
             except Exception as e:
                 logger.warning(f"Embedding services unavailable: {e}. Continuing without embeddings.")
                 self.enable_embeddings = False
@@ -279,6 +281,20 @@ class CompetitorCrawler(BaseScraper):
                         )
                         session.commit()
                         logger.info(f"✓ Embedded page {page_id} ({len(chunks)} chunks, {len(main_text)} chars)")
+
+                        # Also embed sections (section-level semantic search)
+                        if metrics.content_sections and len(metrics.content_sections) > 0:
+                            try:
+                                section_count = self.section_embedder.embed_and_store_sections(
+                                    page_id=page_id,
+                                    site_id=competitor_id,
+                                    url=metrics.url,
+                                    page_type=metrics.page_type,
+                                    sections=metrics.content_sections
+                                )
+                                logger.info(f"✓ Embedded {section_count} sections for page {page_id}")
+                            except Exception as e:
+                                logger.error(f"Failed to embed sections for page {page_id}: {e}")
                 else:
                     logger.debug(f"Skipping embedding for page {page_id} - insufficient content")
             except Exception as e:

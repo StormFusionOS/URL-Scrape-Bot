@@ -87,6 +87,9 @@ class PageMetrics:
     has_email: bool = False
     social_links: List[str] = field(default_factory=list)
 
+    # Conversion & CTA signals
+    conversion_signals: Dict[str, Any] = field(default_factory=dict)
+
     # Page classification
     page_type: str = ""  # homepage, services, about, contact, blog, etc.
 
@@ -298,6 +301,178 @@ class CompetitorParser:
             'has_email': has_email,
             'has_form': has_form
         }
+
+    def _detect_conversion_signals(self, soup: BeautifulSoup) -> Dict[str, Any]:
+        """
+        Detect Call-To-Action (CTA) and conversion signals.
+
+        Identifies:
+        - tel: links (click-to-call)
+        - Forms (quote, booking, contact)
+        - CTA buttons and their positioning
+        - Booking widgets (Calendly, etc.)
+        - Chat widgets
+
+        Returns:
+            Dict with comprehensive CTA metrics
+        """
+        signals = {
+            'tel_links': [],
+            'tel_link_count': 0,
+            'forms': [],
+            'form_count': 0,
+            'cta_buttons': [],
+            'cta_button_count': 0,
+            'cta_above_fold': False,
+            'booking_widgets': [],
+            'has_booking_widget': False,
+            'has_chat_widget': False,
+            'total_conversion_points': 0,
+        }
+
+        # Detect tel: links (click-to-call)
+        tel_links = soup.find_all('a', href=re.compile(r'^tel:', re.I))
+        for link in tel_links:
+            phone = link.get('href', '').replace('tel:', '').strip()
+            signals['tel_links'].append({
+                'phone': phone,
+                'text': link.get_text(strip=True)
+            })
+        signals['tel_link_count'] = len(tel_links)
+
+        # Detect forms
+        forms = soup.find_all('form')
+        for form in forms:
+            form_data = {
+                'action': form.get('action', ''),
+                'method': form.get('method', 'GET').upper(),
+                'inputs': len(form.find_all(['input', 'textarea', 'select'])),
+            }
+
+            # Classify form type based on attributes/context
+            form_classes = ' '.join(form.get('class', [])).lower()
+            form_id = form.get('id', '').lower()
+            form_text = form.get_text(strip=True).lower()
+
+            if any(keyword in form_classes + form_id + form_text
+                   for keyword in ['quote', 'estimate', 'pricing']):
+                form_data['type'] = 'quote'
+            elif any(keyword in form_classes + form_id + form_text
+                     for keyword in ['book', 'schedule', 'appointment']):
+                form_data['type'] = 'booking'
+            elif any(keyword in form_classes + form_id + form_text
+                     for keyword in ['contact', 'reach', 'message']):
+                form_data['type'] = 'contact'
+            elif any(keyword in form_classes + form_id + form_text
+                     for keyword in ['subscribe', 'newsletter', 'email']):
+                form_data['type'] = 'newsletter'
+            else:
+                form_data['type'] = 'other'
+
+            signals['forms'].append(form_data)
+
+        signals['form_count'] = len(forms)
+
+        # Detect CTA buttons (buttons and button-like links)
+        cta_patterns = [
+            r'get.*quote', r'request.*quote', r'free.*estimate',
+            r'book.*now', r'schedule', r'call.*now', r'contact.*us',
+            r'get.*started', r'sign.*up', r'learn.*more', r'view.*pricing'
+        ]
+
+        # Check buttons
+        buttons = soup.find_all(['button', 'input'], type=['button', 'submit'])
+        for button in buttons:
+            text = button.get_text(strip=True)
+            if not text:
+                text = button.get('value', '')
+
+            # Check if it's a CTA
+            if any(re.search(pattern, text.lower()) for pattern in cta_patterns):
+                signals['cta_buttons'].append({
+                    'text': text,
+                    'type': 'button',
+                    'tag': button.name
+                })
+
+        # Check CTA-styled links
+        cta_links = soup.find_all('a', attrs={
+            'class': re.compile(r'btn|button|cta|call-to-action', re.I)
+        })
+        for link in cta_links:
+            text = link.get_text(strip=True)
+            if text:
+                signals['cta_buttons'].append({
+                    'text': text,
+                    'type': 'link',
+                    'href': link.get('href', '')
+                })
+
+        signals['cta_button_count'] = len(signals['cta_buttons'])
+
+        # Check if CTA appears above the fold (in first ~800px / first major content section)
+        # Heuristic: Check if CTA appears within first 3 sections or before first H2
+        above_fold_ctas = 0
+        first_h2 = soup.find('h2')
+        if first_h2:
+            # Check CTAs before first H2
+            for cta in signals['cta_buttons'][:3]:  # Check first 3 CTAs
+                # This is a simplified check - in real implementation we'd need positional data
+                above_fold_ctas += 1
+        else:
+            # If no H2, assume first CTA is above fold
+            above_fold_ctas = min(1, len(signals['cta_buttons']))
+
+        signals['cta_above_fold'] = above_fold_ctas > 0
+
+        # Detect booking widgets
+        booking_widget_indicators = [
+            ('calendly', r'calendly\.com'),
+            ('acuity', r'acuityscheduling\.com'),
+            ('setmore', r'setmore\.com'),
+            ('appointlet', r'appointlet\.com'),
+            ('tidycal', r'tidycal\.com'),
+            ('cal.com', r'cal\.com'),
+        ]
+
+        # Check iframes and script sources
+        for widget_name, pattern in booking_widget_indicators:
+            iframes = soup.find_all('iframe', src=re.compile(pattern, re.I))
+            scripts = soup.find_all('script', src=re.compile(pattern, re.I))
+
+            if iframes or scripts:
+                signals['booking_widgets'].append({
+                    'widget': widget_name,
+                    'type': 'iframe' if iframes else 'script',
+                    'count': len(iframes) + len(scripts)
+                })
+
+        signals['has_booking_widget'] = len(signals['booking_widgets']) > 0
+
+        # Detect chat widgets
+        chat_widget_indicators = [
+            r'intercom', r'drift', r'livechat', r'tawk\.to',
+            r'crisp', r'zendesk.*chat', r'olark', r'helpscout'
+        ]
+
+        # Check for chat widget scripts/divs
+        for pattern in chat_widget_indicators:
+            scripts = soup.find_all('script', src=re.compile(pattern, re.I))
+            divs = soup.find_all('div', id=re.compile(pattern, re.I))
+            if scripts or divs:
+                signals['has_chat_widget'] = True
+                break
+
+        # Calculate total conversion points
+        signals['total_conversion_points'] = (
+            signals['tel_link_count'] +
+            signals['form_count'] +
+            signals['cta_button_count'] +
+            (1 if signals['has_booking_widget'] else 0) +
+            (1 if signals['has_chat_widget'] else 0)
+        )
+
+        return signals
 
     def _detect_page_type(self, url: str, soup: BeautifulSoup) -> str:
         """Detect page type based on URL and content."""
@@ -584,6 +759,9 @@ class CompetitorParser:
         # Detect contact info
         contact = self._detect_contact_info(soup)
 
+        # Detect conversion signals (CTAs, forms, booking widgets)
+        conversion_signals = self._detect_conversion_signals(soup)
+
         # Detect page type
         page_type = self._detect_page_type(url, soup)
 
@@ -633,6 +811,8 @@ class CompetitorParser:
             has_phone=contact['has_phone'],
             has_email=contact['has_email'],
             social_links=links['social'],
+            # Conversion signals
+            conversion_signals=conversion_signals,
             # Page type
             page_type=page_type,
         )

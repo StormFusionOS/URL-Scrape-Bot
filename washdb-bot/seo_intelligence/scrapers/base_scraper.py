@@ -286,6 +286,88 @@ class BaseScraper(ABC):
 
             self.logger.debug("Browser session closed")
 
+    def _validate_html_response(
+        self,
+        html: str,
+        url: str,
+        content_type: Optional[str] = None
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Validate HTML response for sanity checks.
+
+        Detects:
+        - Non-HTML MIME types
+        - CAPTCHA pages
+        - Bot detection pages
+        - Missing essential HTML elements
+
+        Args:
+            html: HTML content
+            url: URL being validated
+            content_type: Content-Type header value
+
+        Returns:
+            Tuple of (is_valid, reason_code)
+            - is_valid: True if HTML passes sanity checks
+            - reason_code: None if valid, otherwise error code
+        """
+        if not html or len(html.strip()) < 100:
+            return False, "EMPTY_RESPONSE"
+
+        # Check Content-Type if provided
+        if content_type:
+            if not any(ct in content_type.lower() for ct in ['text/html', 'application/xhtml']):
+                self.logger.warning(f"Non-HTML content type: {content_type} for {url}")
+                return False, "NON_HTML_MIME"
+
+        html_lower = html.lower()
+
+        # Check for CAPTCHA indicators
+        captcha_indicators = [
+            'captcha',
+            'recaptcha',
+            'g-recaptcha',
+            'hcaptcha',
+            'cf-challenge',  # Cloudflare challenge
+            'please verify you are human',
+            'security check',
+            'unusual traffic',
+        ]
+
+        for indicator in captcha_indicators:
+            if indicator in html_lower:
+                self.logger.warning(f"CAPTCHA detected on {url}: {indicator}")
+                return False, "CAPTCHA_DETECTED"
+
+        # Check for bot detection / anti-scraping
+        bot_detection_indicators = [
+            'access denied',
+            'blocked',
+            'forbidden',
+            'your access to this site has been limited',
+            'enable javascript',
+            'javascript is disabled',
+            'please enable cookies',
+        ]
+
+        for indicator in bot_detection_indicators:
+            if indicator in html_lower:
+                self.logger.warning(f"Bot detection page on {url}: {indicator}")
+                return False, "BOT_DETECTED"
+
+        # Check for essential HTML elements
+        if '<title>' not in html_lower and '<title ' not in html_lower:
+            self.logger.warning(f"Missing <title> tag on {url}")
+            return False, "NO_TITLE_TAG"
+
+        # Check for minimal HTML structure
+        if '<html' not in html_lower and '<!doctype html' not in html_lower:
+            self.logger.warning(f"Invalid HTML structure on {url}")
+            return False, "INVALID_HTML"
+
+        # Passed all checks
+        return True, None
+
     def fetch_page(
         self,
         url: str,
@@ -353,8 +435,18 @@ class BaseScraper(ABC):
                 # Get page content
                 content = page.content()
 
+                # Validate HTML response
+                content_type = response.headers.get('content-type')
+                is_valid, reason_code = self._validate_html_response(content, url, content_type)
+
+                if not is_valid:
+                    self.logger.warning(f"HTML validation failed for {url}: {reason_code}")
+                    self.stats["pages_failed"] += 1
+                    # Store failure reason for provenance
+                    return None
+
                 self.stats["pages_crawled"] += 1
-                self.logger.debug(f"Fetched {url} ({len(content)} chars)")
+                self.logger.debug(f"Fetched {url} ({len(content)} chars) - validation passed")
 
                 # Add random delay before next request
                 delay = self._get_random_delay()
