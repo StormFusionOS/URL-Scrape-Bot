@@ -109,12 +109,22 @@ class AppLayout:
                 {'name': 'Dashboard', 'icon': 'dashboard', 'page': 'dashboard'},
                 {'name': 'Discover', 'icon': 'search', 'page': 'discover'},
                 {'name': 'Database', 'icon': 'storage', 'page': 'database'},
-                {'name': 'SEO Intel', 'icon': 'insights', 'page': 'seo_intelligence'},
                 {'name': 'Scheduler', 'icon': 'schedule', 'page': 'scheduler'},
                 {'name': 'Status', 'icon': 'timeline', 'page': 'status'},
                 {'name': 'Settings', 'icon': 'settings', 'page': 'settings'},
             ]
             for item in nav_items:
+                self._create_nav_item(item['name'], item['icon'], item['page'])
+
+            # SEO Intelligence section
+            ui.separator().classes('my-3')
+            ui.label('SEO INTELLIGENCE').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
+            seo_items = [
+                {'name': 'SEO Intel', 'icon': 'insights', 'page': 'seo_intelligence'},
+                {'name': 'Local Competitors', 'icon': 'groups', 'page': 'local_competitors'},
+                {'name': 'Database', 'icon': 'dns', 'page': 'seo_database'},
+            ]
+            for item in seo_items:
                 self._create_nav_item(item['name'], item['icon'], item['page'])
 
     def _create_nav_item(self, name: str, icon: str, page: str):
@@ -150,13 +160,23 @@ class AppLayout:
             {'name': 'Dashboard', 'icon': 'dashboard', 'page': 'dashboard'},
             {'name': 'Discover', 'icon': 'search', 'page': 'discover'},
             {'name': 'Database', 'icon': 'storage', 'page': 'database'},
-            {'name': 'SEO Intel', 'icon': 'insights', 'page': 'seo_intelligence'},
             {'name': 'Scheduler', 'icon': 'schedule', 'page': 'scheduler'},
             {'name': 'Logs', 'icon': 'article', 'page': 'logs'},
             {'name': 'Status', 'icon': 'timeline', 'page': 'status'},
             {'name': 'Settings', 'icon': 'settings', 'page': 'settings'},
         ]
         for item in nav_items:
+            self._create_nav_item(item['name'], item['icon'], item['page'])
+
+        # SEO Intelligence section
+        ui.separator().classes('my-3')
+        ui.label('SEO INTELLIGENCE').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
+        seo_items = [
+            {'name': 'SEO Intel', 'icon': 'insights', 'page': 'seo_intelligence'},
+            {'name': 'Local Competitors', 'icon': 'groups', 'page': 'local_competitors'},
+            {'name': 'Database', 'icon': 'dns', 'page': 'seo_database'},
+        ]
+        for item in seo_items:
             self._create_nav_item(item['name'], item['icon'], item['page'])
 
     def create_content_area(self):

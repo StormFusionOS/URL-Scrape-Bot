@@ -11,6 +11,8 @@ from .status import status_page
 from .settings import settings_page
 from .scheduler import scheduler_page
 from .seo_intelligence import seo_intelligence_page
+from .seo_database import seo_database_page
+from .local_competitors import local_competitors_page
 
 __all__ = [
     'dashboard_page',
@@ -21,4 +23,6 @@ __all__ = [
     'settings_page',
     'scheduler_page',
     'seo_intelligence_page',
+    'seo_database_page',
+    'local_competitors_page',
 ]

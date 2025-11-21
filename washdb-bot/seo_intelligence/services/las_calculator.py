@@ -148,17 +148,28 @@ class LASCalculator:
         """
         recommendations = []
 
-        # Get citations for this business
-        result = session.execute(
-            text("""
-                SELECT directory_name, is_present, nap_match_score,
-                       name_match, address_match, phone_match
-                FROM citations
-                WHERE business_name = :name
-            """),
-            {"name": business_name}
-        )
-        citations = {row[0]: row for row in result.fetchall()}
+        # Get citations for this business (handle missing table)
+        try:
+            result = session.execute(
+                text("""
+                    SELECT directory_name, is_present, nap_match_score,
+                           name_match, address_match, phone_match
+                    FROM citations
+                    WHERE business_name = :name
+                """),
+                {"name": business_name}
+            )
+            citations = {row[0]: row for row in result.fetchall()}
+        except Exception as e:
+            logger.warning(f"Citations table not available: {e}")
+            session.rollback()  # Clear failed transaction state
+            # Return baseline score with recommendations
+            return 50.0, [
+                "Set up Google Business Profile",
+                "Create Yelp business page",
+                "Add Yellow Pages listing",
+                "Consider BBB accreditation",
+            ]
 
         score = 0.0
         max_score = 100.0
@@ -239,22 +250,27 @@ class LASCalculator:
             recommendations.append("Add website domain to track backlinks")
             return 0.0, recommendations
 
-        # Get backlink stats
-        result = session.execute(
-            text("""
-                SELECT
-                    COUNT(DISTINCT b.backlink_id) as total_backlinks,
-                    COUNT(DISTINCT b.domain_id) as referring_domains,
-                    SUM(CASE WHEN b.link_type = 'dofollow' THEN 1 ELSE 0 END) as dofollow_count,
-                    AVG(rd.domain_authority) as avg_da
-                FROM backlinks b
-                JOIN referring_domains rd ON b.domain_id = rd.domain_id
-                WHERE b.target_url LIKE :domain_pattern
-                AND b.is_active = TRUE
-            """),
-            {"domain_pattern": f"%{domain}%"}
-        )
-        row = result.fetchone()
+        # Get backlink stats (handle missing tables)
+        try:
+            result = session.execute(
+                text("""
+                    SELECT
+                        COUNT(DISTINCT b.backlink_id) as total_backlinks,
+                        COUNT(DISTINCT b.domain_id) as referring_domains,
+                        SUM(CASE WHEN b.link_type = 'dofollow' THEN 1 ELSE 0 END) as dofollow_count,
+                        AVG(rd.domain_authority) as avg_da
+                    FROM backlinks b
+                    JOIN referring_domains rd ON b.domain_id = rd.domain_id
+                    WHERE b.target_url LIKE :domain_pattern
+                    AND b.is_active = TRUE
+                """),
+                {"domain_pattern": f"%{domain}%"}
+            )
+            row = result.fetchone()
+        except Exception as e:
+            logger.warning(f"Backlinks table not available: {e}")
+            session.rollback()  # Clear failed transaction state
+            return 50.0, ["Build local backlinks from community sites", "Request links from business partners"]
 
         if row:
             total_backlinks = row[0] or 0
@@ -316,16 +332,21 @@ class LASCalculator:
         recommendations = []
         score = 0.0
 
-        # Get review data from citations metadata
-        result = session.execute(
-            text("""
-                SELECT directory_name, metadata
-                FROM citations
-                WHERE business_name = :name
-                AND is_present = TRUE
-            """),
-            {"name": business_name}
-        )
+        # Get review data from citations metadata (handle missing table)
+        try:
+            result = session.execute(
+                text("""
+                    SELECT directory_name, metadata
+                    FROM citations
+                    WHERE business_name = :name
+                    AND is_present = TRUE
+                """),
+                {"name": business_name}
+            )
+        except Exception as e:
+            logger.warning(f"Citations table not available for reviews: {e}")
+            session.rollback()  # Clear failed transaction state
+            return 50.0, ["Collect customer reviews on Google", "Respond to existing reviews"]
 
         total_reviews = 0
         ratings = []
@@ -395,17 +416,25 @@ class LASCalculator:
         recommendations = []
         score = 0.0
 
-        # Check for Google Business specifically
-        result = session.execute(
-            text("""
-                SELECT is_present, nap_match_score, metadata
-                FROM citations
-                WHERE business_name = :name
-                AND directory_name = 'google_business'
-            """),
-            {"name": business_name}
-        )
-        row = result.fetchone()
+        # Check for Google Business specifically (handle missing table)
+        try:
+            result = session.execute(
+                text("""
+                    SELECT is_present, nap_match_score, metadata
+                    FROM citations
+                    WHERE business_name = :name
+                    AND directory_name = 'google_business'
+                """),
+                {"name": business_name}
+            )
+            row = result.fetchone()
+        except Exception as e:
+            logger.warning(f"Citations table not available for completeness: {e}")
+            session.rollback()  # Clear failed transaction state
+            # Return score based on domain only
+            if domain:
+                return 60.0, ["Set up Google Business Profile", "Expand directory presence"]
+            return 30.0, ["Create business website", "Set up Google Business Profile"]
 
         if row:
             is_present = row[0]
@@ -431,21 +460,26 @@ class LASCalculator:
         else:
             recommendations.append("Create a business website")
 
-        # Check citation coverage
-        result = session.execute(
-            text("""
-                SELECT COUNT(*) FROM citations
-                WHERE business_name = :name AND is_present = TRUE
-            """),
-            {"name": business_name}
-        )
-        citation_count = result.fetchone()[0]
+        # Check citation coverage (handle missing table)
+        try:
+            result = session.execute(
+                text("""
+                    SELECT COUNT(*) FROM citations
+                    WHERE business_name = :name AND is_present = TRUE
+                """),
+                {"name": business_name}
+            )
+            citation_count = result.fetchone()[0]
 
-        if citation_count >= 5:
-            score += 20
-        elif citation_count >= 3:
-            score += 10
-        else:
+            if citation_count >= 5:
+                score += 20
+            elif citation_count >= 3:
+                score += 10
+            else:
+                recommendations.append("Expand presence across more directories")
+        except Exception as e:
+            logger.warning(f"Citations count query failed: {e}")
+            session.rollback()
             recommendations.append("Expand presence across more directories")
 
         return min(score, 100.0), recommendations

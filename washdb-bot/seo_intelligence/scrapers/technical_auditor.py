@@ -20,6 +20,9 @@ import os
 import re
 import json
 import time
+import ssl
+import socket
+import requests
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
@@ -141,7 +144,7 @@ class TechnicalAuditor(BaseScraper):
             respect_robots=False,  # Can audit own sites regardless
             use_proxy=use_proxy,
             max_retries=2,
-            page_timeout=45000,
+            page_timeout=20000,  # Reduced from 45s to 20s
         )
 
         # Database connection
@@ -153,6 +156,84 @@ class TechnicalAuditor(BaseScraper):
             logger.warning("DATABASE_URL not set - database storage disabled")
 
         logger.info("TechnicalAuditor initialized (tier=D)")
+
+    def _http_fallback_audit(self, url: str) -> Optional[Tuple[str, Dict[str, Any], List[AuditIssue]]]:
+        """
+        Simple HTTP fallback when Playwright fails.
+        Returns (html_content, metrics, issues) or None if also fails.
+        """
+        issues = []
+        metrics = {"fallback_mode": True}
+
+        try:
+            start_time = time.time()
+            response = requests.get(
+                url,
+                timeout=15,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                },
+                verify=True,
+                allow_redirects=True,
+            )
+            load_time = time.time() - start_time
+
+            metrics["http_status"] = response.status_code
+            metrics["load_time_seconds"] = round(load_time, 2)
+            metrics["content_length"] = len(response.text)
+            metrics["redirect_count"] = len(response.history)
+
+            # Check response time
+            if load_time > 5:
+                issues.append(AuditIssue(
+                    category=IssueCategory.PERFORMANCE.value,
+                    severity=IssueSeverity.HIGH.value,
+                    issue_type="slow_response",
+                    description=f"Slow response time: {load_time:.1f}s",
+                    recommendation="Optimize server response time"
+                ))
+
+            # Check HTTP status
+            if response.status_code >= 400:
+                issues.append(AuditIssue(
+                    category=IssueCategory.TECHNICAL.value,
+                    severity=IssueSeverity.CRITICAL.value,
+                    issue_type="http_error",
+                    description=f"HTTP {response.status_code} error",
+                    recommendation="Fix server error"
+                ))
+
+            # Check for redirect chains
+            if len(response.history) > 2:
+                issues.append(AuditIssue(
+                    category=IssueCategory.PERFORMANCE.value,
+                    severity=IssueSeverity.MEDIUM.value,
+                    issue_type="redirect_chain",
+                    description=f"Redirect chain of {len(response.history)} hops",
+                    recommendation="Minimize redirect chains"
+                ))
+
+            logger.info(f"HTTP fallback succeeded for {url} (status={response.status_code})")
+            return response.text, metrics, issues
+
+        except requests.exceptions.SSLError as e:
+            issues.append(AuditIssue(
+                category=IssueCategory.SECURITY.value,
+                severity=IssueSeverity.CRITICAL.value,
+                issue_type="ssl_error",
+                description=f"SSL certificate error: {str(e)[:100]}",
+                recommendation="Fix SSL certificate configuration"
+            ))
+            logger.warning(f"SSL error for {url}: {e}")
+            return None, metrics, issues
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"HTTP fallback timeout for {url}")
+            return None, metrics, issues
+
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"HTTP fallback failed for {url}: {e}")
+            return None, metrics, issues
 
     def _check_ssl(self, url: str) -> Tuple[List[AuditIssue], Dict[str, Any]]:
         """Check SSL/HTTPS configuration."""
@@ -576,26 +657,37 @@ class TechnicalAuditor(BaseScraper):
         result: AuditResult,
     ) -> int:
         """Save audit result to database."""
-        # Insert page audit
+        # Prepare extended metadata with all scores
+        extended_metadata = {
+            **result.metrics,
+            "performance_score": result.performance_score,
+            "seo_score": result.seo_score,
+            "accessibility_score": result.accessibility_score,
+            "security_score": result.security_score,
+            "issues_count": len(result.issues),
+            "critical_count": len(result.critical_issues),
+            "high_count": len(result.high_issues),
+        }
+
+        # Insert page audit - using actual table schema
         audit_result = session.execute(
             text("""
                 INSERT INTO page_audits (
-                    url, audit_type, overall_score, performance_score,
-                    seo_score, accessibility_score, issues_count, metadata
+                    url, audit_type, overall_score, page_load_time_ms,
+                    page_size_kb, total_requests, metadata
                 ) VALUES (
-                    :url, 'technical', :overall_score, :performance_score,
-                    :seo_score, :accessibility_score, :issues_count, :metadata::jsonb
+                    :url, 'technical', :overall_score, :page_load_time_ms,
+                    :page_size_kb, :total_requests, CAST(:audit_metadata AS jsonb)
                 )
                 RETURNING audit_id
             """),
             {
                 "url": result.url,
                 "overall_score": result.overall_score,
-                "performance_score": result.performance_score,
-                "seo_score": result.seo_score,
-                "accessibility_score": result.accessibility_score,
-                "issues_count": len(result.issues),
-                "metadata": json.dumps(result.metrics),
+                "page_load_time_ms": int(result.metrics.get("load_time_seconds", 0) * 1000),
+                "page_size_kb": result.metrics.get("html_size", 0) // 1024,
+                "total_requests": result.metrics.get("script_count", 0) + result.metrics.get("stylesheet_count", 0),
+                "audit_metadata": json.dumps(extended_metadata),
             }
         )
         audit_id = audit_result.fetchone()[0]
@@ -606,10 +698,10 @@ class TechnicalAuditor(BaseScraper):
                 text("""
                     INSERT INTO audit_issues (
                         audit_id, category, severity, issue_type,
-                        description, affected_element, recommendation, metadata
+                        description, element, recommendation, metadata
                     ) VALUES (
                         :audit_id, :category, :severity, :issue_type,
-                        :description, :affected_element, :recommendation, :metadata::jsonb
+                        :description, :element, :recommendation, CAST(:issue_metadata AS jsonb)
                     )
                 """),
                 {
@@ -618,9 +710,9 @@ class TechnicalAuditor(BaseScraper):
                     "severity": issue.severity,
                     "issue_type": issue.issue_type,
                     "description": issue.description,
-                    "affected_element": issue.affected_element[:500] if issue.affected_element else "",
+                    "element": issue.affected_element[:500] if issue.affected_element else "",
                     "recommendation": issue.recommendation,
-                    "metadata": json.dumps(issue.metadata),
+                    "issue_metadata": json.dumps(issue.metadata),
                 }
             )
 
@@ -653,32 +745,58 @@ class TechnicalAuditor(BaseScraper):
             if not ssl_issues:
                 passed_checks.append("SSL/HTTPS configured")
 
-            # Fetch page
-            with self.browser_session() as (browser, context, page):
-                start_time = time.time()
+            # Fetch page - try Playwright first, fall back to HTTP if in asyncio loop
+            html = None
+            page = None
+            use_http_fallback = False
 
-                html = self.fetch_page(
-                    url=url,
-                    page=page,
-                    wait_for="networkidle",
-                    extra_wait=1.0,
-                )
+            try:
+                with self.browser_session() as (browser, context, page):
+                    start_time = time.time()
 
-                load_time = time.time() - start_time
-                all_metrics["load_time_seconds"] = round(load_time, 2)
+                    html = self.fetch_page(
+                        url=url,
+                        page=page,
+                        wait_for="domcontentloaded",  # Changed from networkidle - faster
+                        extra_wait=0.5,
+                    )
 
-                if load_time > 5:
-                    all_issues.append(AuditIssue(
-                        category=IssueCategory.PERFORMANCE.value,
-                        severity=IssueSeverity.HIGH.value,
-                        issue_type="slow_page_load",
-                        description=f"Page load time: {load_time:.1f}s",
-                        recommendation="Optimize page load time to under 3 seconds"
-                    ))
-                elif load_time < 3:
-                    passed_checks.append(f"Fast page load ({load_time:.1f}s)")
+                    load_time = time.time() - start_time
+                    all_metrics["load_time_seconds"] = round(load_time, 2)
 
-                if not html:
+                    if load_time > 5:
+                        all_issues.append(AuditIssue(
+                            category=IssueCategory.PERFORMANCE.value,
+                            severity=IssueSeverity.HIGH.value,
+                            issue_type="slow_page_load",
+                            description=f"Page load time: {load_time:.1f}s",
+                            recommendation="Optimize page load time to under 3 seconds"
+                        ))
+                    elif load_time < 3:
+                        passed_checks.append(f"Fast page load ({load_time:.1f}s)")
+            except Exception as pw_error:
+                # Playwright can't run in asyncio loop (NiceGUI dashboard)
+                if "asyncio" in str(pw_error).lower():
+                    logger.info(f"Playwright unavailable in async context, using HTTP for {url}")
+                    use_http_fallback = True
+                else:
+                    logger.warning(f"Playwright error for {url}: {pw_error}")
+                    use_http_fallback = True
+
+            if use_http_fallback or not html:
+                # Use HTTP fallback
+                logger.info(f"Using HTTP fallback for {url}")
+                fallback_result = self._http_fallback_audit(url)
+                if fallback_result and fallback_result[0]:
+                    html, fb_metrics, fb_issues = fallback_result
+                    all_metrics.update(fb_metrics)
+                    all_issues.extend(fb_issues)
+                else:
+                    # HTTP fallback failed
+                    if fallback_result:
+                        _, fb_metrics, fb_issues = fallback_result
+                        all_metrics.update(fb_metrics)
+                        all_issues.extend(fb_issues)
                     return AuditResult(
                         url=url,
                         audit_date=datetime.now(),
@@ -687,31 +805,34 @@ class TechnicalAuditor(BaseScraper):
                         seo_score=0,
                         accessibility_score=0,
                         security_score=0,
-                        issues=[AuditIssue(
+                        issues=all_issues + [AuditIssue(
                             category=IssueCategory.TECHNICAL.value,
                             severity=IssueSeverity.CRITICAL.value,
                             issue_type="page_unreachable",
-                            description="Could not load page",
+                            description="Could not load page (HTTP fallback failed)",
                             recommendation="Check if URL is accessible"
                         )],
                         metrics=all_metrics,
                     )
 
-                soup = BeautifulSoup(html, 'html.parser')
+            soup = BeautifulSoup(html, 'html.parser')
 
-                # Run all checks
-                checks = [
-                    self._check_meta_tags(soup, url),
-                    self._check_headings(soup),
-                    self._check_images(soup, url),
-                    self._check_links(soup, url),
-                    self._check_schema(soup),
-                    self._check_performance(page, soup),
-                ]
+            # Run all checks (skip page-dependent checks if using HTTP fallback)
+            checks = [
+                self._check_meta_tags(soup, url),
+                self._check_headings(soup),
+                self._check_images(soup, url),
+                self._check_links(soup, url),
+                self._check_schema(soup),
+            ]
 
-                for issues, metrics in checks:
-                    all_issues.extend(issues)
-                    all_metrics.update(metrics)
+            # Only run performance check if we have a Playwright page
+            if page and not use_http_fallback:
+                checks.append(self._check_performance(page, soup))
+
+            for issues, metrics in checks:
+                all_issues.extend(issues)
+                all_metrics.update(metrics)
 
             # Calculate scores
             overall, perf, seo, access, security = self._calculate_scores(
