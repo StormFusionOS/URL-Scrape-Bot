@@ -8,6 +8,7 @@ This module contains core services:
 - content_hasher: SHA-256 content change detection
 - user_agent_rotator: User agent rotation for anti-detection
 - proxy_manager: Proxy pool integration
+- las_calculator: Local Authority Score calculation
 
 All services support ethical scraping with rate limiting and robots.txt compliance.
 """
@@ -18,6 +19,7 @@ from .robots_checker import RobotsChecker, get_robots_checker
 from .content_hasher import ContentHasher, get_content_hasher
 from .user_agent_rotator import UserAgentRotator, get_user_agent_rotator, DeviceType
 from .proxy_manager import ProxyManager, get_proxy_manager
+from .las_calculator import LASCalculator, LASResult, LASComponents, get_las_calculator
 
 __all__ = [
     "TaskLogger",
@@ -34,4 +36,8 @@ __all__ = [
     "DeviceType",
     "ProxyManager",
     "get_proxy_manager",
+    "LASCalculator",
+    "LASResult",
+    "LASComponents",
+    "get_las_calculator",
 ]
