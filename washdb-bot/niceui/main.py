@@ -48,6 +48,7 @@ def register_pages():
     router.register('logs', pages.logs_page)
     router.register('status', pages.status_page)
     router.register('settings', pages.settings_page)
+    router.register('seo_intelligence', pages.seo_intelligence_page)
 
 
 def create_app():
