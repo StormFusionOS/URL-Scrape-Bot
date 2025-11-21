@@ -1,4 +1,4 @@
-# Washbot Integrated Dashboard Guide
+# Washbot Dashboard Guide
 
 ## Quick Start
 ```bash
@@ -9,11 +9,13 @@ Access at: **http://127.0.0.1:8080**
 
 ## Features Overview
 
-### Washbot (Original)
-- Dashboard, Discover, Database, Scheduler, Status, Settings
-
-### SEO Intelligence (New)
-- SEO Database, Run Scraper, Scraped Data, DB Sync, Competitors
+### Washbot
+- Dashboard: Main overview with KPIs and stats
+- Discover: YP crawler controls and telemetry
+- Database: Company data browser with CSV export
+- Scheduler: Scheduled job configuration
+- Status: System status and health checks
+- Settings: Configuration management
 
 ## Auto-Start on Boot
 ```bash
@@ -27,7 +29,3 @@ sudo systemctl start washbot-dashboard
 - **Check logs**: `tail -f logs/dashboard.log`
 - **Port in use**: `lsof -i :8080`
 - **Stop dashboard**: `pkill -f "python -m niceui.main"`
-
-## Independent Systems
-- **Port 8080**: Integrated Washbot (Washbot + SEO Intelligence)  
-- **Port 8082**: SEO Intelligence (independent, unchanged)

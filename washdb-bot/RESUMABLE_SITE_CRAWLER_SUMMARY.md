@@ -59,7 +59,7 @@ class SiteCrawlState(Base):
 
 **To Apply**:
 ```bash
-PGPASSWORD='ScraperPass123' psql -U scraper_user -d scraper -h localhost \
+PGPASSWORD='Washdb123' psql -U washbot -d washbot_db -h localhost \
     -f db/migrations/add_site_crawl_state_table.sql
 ```
 
@@ -332,11 +332,11 @@ GROUP BY phase;
 ### 1. Create Table
 ```bash
 # Apply migration
-PGPASSWORD='ScraperPass123' psql -U scraper_user -d scraper -h localhost \
+PGPASSWORD='Washdb123' psql -U washbot -d washbot_db -h localhost \
     -f db/migrations/add_site_crawl_state_table.sql
 
 # Verify table exists
-PGPASSWORD='ScraperPass123' psql -U scraper_user -d scraper -h localhost \
+PGPASSWORD='Washdb123' psql -U washbot -d washbot_db -h localhost \
     -c "\d site_crawl_state"
 ```
 

@@ -23,10 +23,10 @@ echo ""
 cd "$PROJECT_ROOT" || exit 1
 
 # Database credentials from environment or defaults
-export PGPASSWORD="${DATABASE_PASSWORD:-ScraperPass123}"
+export PGPASSWORD="${DATABASE_PASSWORD:-Washdb123}"
 DB_HOST="${DB_HOST:-localhost}"
-DB_NAME="${DB_NAME:-scraper}"
-DB_USER="${DB_USER:-scraper_user}"
+DB_NAME="${DB_NAME:-washbot_db}"
+DB_USER="${DB_USER:-washbot}"
 
 PID_FILE="logs/google_workers.pid"
 

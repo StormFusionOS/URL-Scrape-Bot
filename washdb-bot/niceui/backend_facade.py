@@ -530,55 +530,12 @@ class BackendFacade:
         finally:
             session.close()
 
-    def get_bing_target_stats(self, state_ids: Optional[List[str]] = None) -> Dict[str, Any]:
-        """
-        Get statistics about Bing Local city-first targets.
-
-        Args:
-            state_ids: Optional list of state codes to filter by
-
-        Returns:
-            Dict with target statistics by status and priority
-        """
-        from db.models import BingTarget
-
-        session = create_session()
-        try:
-            query = session.query(BingTarget)
-            if state_ids:
-                query = query.filter(BingTarget.state_id.in_(state_ids))
-
-            total = query.count()
-
-            # Get counts by status
-            by_status = {}
-            for status in ["PLANNED", "IN_PROGRESS", "DONE", "FAILED"]:
-                count = query.filter(BingTarget.status == status).count()
-                if count > 0:
-                    by_status[status] = count
-
-            # Get counts by priority
-            by_priority = {}
-            for priority in [1, 2, 3]:
-                count = query.filter(BingTarget.priority == priority).count()
-                if count > 0:
-                    by_priority[priority] = count
-
-            return {
-                "total": total,
-                "by_status": by_status,
-                "by_priority": by_priority,
-                "states": state_ids if state_ids else "all"
-            }
-        finally:
-            session.close()
-
     def get_discovery_source_statuses(self) -> Dict[str, Dict[str, Any]]:
         """
         Get comprehensive status for all discovery sources.
 
         Returns:
-            Dict with status for each source (YP, Google, Bing, Site):
+            Dict with status for each source (YP, Google, Site):
             {
                 'YP': {
                     'is_running': bool,
@@ -589,11 +546,10 @@ class BackendFacade:
                     'last_run': {'timestamp': str, 'city': str, 'category': str} or None
                 },
                 'Google': {...},
-                'Bing': {...},
                 'Site': {...}
             }
         """
-        from db.models import YPTarget, GoogleTarget, BingTarget
+        from db.models import YPTarget, GoogleTarget
         from sqlalchemy import func, desc
         from datetime import datetime
 
@@ -672,43 +628,6 @@ class BackendFacade:
                     'category': google_last.category_label,
                     'results_saved': google_last.results_saved or 0
                 } if google_last else None
-            }
-
-            # ===== Bing Local Status =====
-            bing_in_progress = session.query(func.count(BingTarget.id)).filter(
-                func.upper(BingTarget.status) == 'IN_PROGRESS'
-            ).scalar() or 0
-
-            bing_planned = session.query(func.count(BingTarget.id)).filter(
-                func.upper(BingTarget.status) == 'PLANNED'
-            ).scalar() or 0
-
-            bing_done = session.query(func.count(BingTarget.id)).filter(
-                func.upper(BingTarget.status) == 'DONE'
-            ).scalar() or 0
-
-            bing_failed = session.query(func.count(BingTarget.id)).filter(
-                func.upper(BingTarget.status) == 'FAILED'
-            ).scalar() or 0
-
-            # Get last completed Bing target
-            bing_last = session.query(BingTarget).filter(
-                func.upper(BingTarget.status) == 'DONE',
-                BingTarget.finished_at.isnot(None)
-            ).order_by(desc(BingTarget.finished_at)).first()
-
-            statuses['Bing'] = {
-                'is_running': bing_in_progress > 0,
-                'active_count': bing_in_progress,
-                'pending_count': bing_planned,
-                'done_count': bing_done,
-                'failed_count': bing_failed,
-                'last_run': {
-                    'timestamp': bing_last.finished_at.isoformat() if bing_last.finished_at else None,
-                    'city': bing_last.city,
-                    'category': bing_last.category_label,
-                    'results_saved': bing_last.results_saved or 0
-                } if bing_last else None
             }
 
             return statuses

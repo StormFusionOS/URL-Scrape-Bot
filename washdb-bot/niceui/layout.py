@@ -63,50 +63,6 @@ class AppLayout:
 
     def create_header(self):
         """Create application header."""
-        # Add Socket.IO client-side JavaScript for real-time updates
-        ui.add_head_html('''
-            <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
-            <script>
-                // Initialize Socket.IO connection
-                const socket = io({
-                    path: '/socket.io/',
-                    transports: ['websocket', 'polling']
-                });
-
-                socket.on('connect', () => {
-                    console.log('Socket.IO connected:', socket.id);
-
-                    // Subscribe to SEO Intelligence events
-                    socket.emit('subscribe', {
-                        events: [
-                            'job_started',
-                            'job_completed',
-                            'job_failed',
-                            'new_error',
-                            'critical_error',
-                            'new_warning',
-                            'crawler_status_change'
-                        ]
-                    });
-                });
-
-                socket.on('disconnect', () => {
-                    console.log('Socket.IO disconnected');
-                });
-
-                socket.on('connection_established', (data) => {
-                    console.log('Connection established:', data);
-                });
-
-                socket.on('subscribed', (data) => {
-                    console.log('Subscribed to events:', data.events);
-                });
-
-                // Make socket available globally for pages to use
-                window.seoSocket = socket;
-            </script>
-        ''')
-
         with ui.header().classes('items-center').style(
             f'background-color: {COLORS["primary"]}; padding: 0.5rem 1rem;'
         ) as self.header_element:
@@ -160,19 +116,6 @@ class AppLayout:
             for item in nav_items:
                 self._create_nav_item(item['name'], item['icon'], item['page'])
 
-            # SEO Intelligence navigation items
-            ui.separator().classes('my-2')
-            ui.label('SEO INTELLIGENCE').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
-            seo_items = [
-                {'name': 'SEO Database', 'icon': 'storage', 'page': 'seo_database'},
-                {'name': 'Run Scraper', 'icon': 'play_circle', 'page': 'seo_scraper'},
-                {'name': 'Scraped Data', 'icon': 'analytics', 'page': 'seo_data'},
-                {'name': 'DB Sync', 'icon': 'sync', 'page': 'washdb_sync'},
-                {'name': 'Competitors', 'icon': 'business', 'page': 'competitors'},
-            ]
-            for item in seo_items:
-                self._create_nav_item(item['name'], item['icon'], item['page'])
-
     def _create_nav_item(self, name: str, icon: str, page: str):
         """Create a navigation item."""
         is_active = router.current_page == page
@@ -212,19 +155,6 @@ class AppLayout:
             {'name': 'Settings', 'icon': 'settings', 'page': 'settings'},
         ]
         for item in nav_items:
-            self._create_nav_item(item['name'], item['icon'], item['page'])
-
-        # SEO Intelligence navigation items
-        ui.separator().classes('my-2')
-        ui.label('SEO INTELLIGENCE').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
-        seo_items = [
-            {'name': 'SEO Database', 'icon': 'storage', 'page': 'seo_database'},
-            {'name': 'Run Scraper', 'icon': 'play_circle', 'page': 'seo_scraper'},
-            {'name': 'Scraped Data', 'icon': 'analytics', 'page': 'seo_data'},
-            {'name': 'DB Sync', 'icon': 'sync', 'page': 'washdb_sync'},
-            {'name': 'Competitors', 'icon': 'business', 'page': 'competitors'},
-        ]
-        for item in seo_items:
             self._create_nav_item(item['name'], item['icon'], item['page'])
 
     def create_content_area(self):
@@ -295,35 +225,3 @@ class AppLayout:
 
 # Global layout instance
 layout = AppLayout()
-
-# SEO Intelligence page layout helper
-from contextlib import contextmanager
-from typing import Optional
-
-@contextmanager
-def page_layout(
-    title: str,
-    subtitle: Optional[str] = None,
-    show_refresh: bool = True,
-    refresh_callback: Optional[callable] = None
-):
-    """
-    Create a standard page layout with header and content area
-    (Compatible with SEO Intelligence pages)
-    """
-    with ui.column().classes('w-full h-full gap-6 p-6'):
-        # Page header
-        with ui.row().classes('items-center justify-between w-full'):
-            with ui.column().classes('gap-1'):
-                ui.label(title).classes('text-3xl font-bold')
-                if subtitle:
-                    ui.label(subtitle).classes('text-sm text-gray-400')
-
-            if show_refresh:
-                refresh_btn = ui.button(icon='refresh', on_click=refresh_callback or (lambda: ui.notify('Refreshed!')))
-                refresh_btn.props('flat round')
-                refresh_btn.classes('hover:rotate-180 transition-transform duration-500')
-
-        # Content area
-        with ui.column().classes('w-full gap-4'):
-            yield

@@ -278,27 +278,6 @@ def build_discovery_status_cards(status_container):
 
                 ui.label(f"{google_status.get('active_count', 0)} active, {google_status.get('pending_count', 0)} pending").classes('text-xs text-gray-300')
 
-            # Bing Local
-            bing_status = source_statuses.get('Bing', {})
-            with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
-                with ui.row().classes('items-center gap-2 mb-2'):
-                    if bing_status.get('is_running', False):
-                        ui.icon('fiber_manual_record', size='sm').classes('text-green-400')
-                    elif bing_status.get('pending_count', 0) > 0:
-                        ui.icon('fiber_manual_record', size='sm').classes('text-yellow-400')
-                    else:
-                        ui.icon('fiber_manual_record', size='sm').classes('text-red-400')
-                    ui.label('Bing Local').classes('text-sm text-gray-200 font-bold')
-
-                if bing_status.get('is_running', False):
-                    ui.badge('RUNNING', color='positive').classes('mb-1')
-                elif bing_status.get('pending_count', 0) > 0:
-                    ui.badge('READY', color='warning').classes('mb-1')
-                else:
-                    ui.badge('IDLE', color='grey').classes('mb-1')
-
-                ui.label(f"{bing_status.get('active_count', 0)} active, {bing_status.get('pending_count', 0)} pending").classes('text-xs text-gray-300')
-
         # Last Run & System Info Row
         with ui.row().classes('w-full gap-4'):
             # Last Run Per Source
@@ -322,7 +301,7 @@ def build_discovery_status_cards(status_container):
                     else:
                         return "Just now"
 
-                for source_name in ['YP', 'Google', 'Bing']:
+                for source_name in ['YP', 'Google']:
                     status = source_statuses.get(source_name, {})
                     last_run = status.get('last_run')
                     if last_run and last_run.get('timestamp'):

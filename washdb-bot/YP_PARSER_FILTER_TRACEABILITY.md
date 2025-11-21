@@ -205,7 +205,7 @@ ON companies ((parse_metadata->>'filter_reason'));
 
 **To Apply**:
 ```bash
-psql -U scraper_user -d scraper -h localhost -f db/migrations/add_parse_metadata_field.sql
+psql -U washbot -d washbot_db -h localhost -f db/migrations/add_parse_metadata_field.sql
 ```
 
 **Impact**: Schema updated with backward-compatible JSONB field and efficient indexes.
@@ -441,7 +441,7 @@ if sample:
 
 1. **Apply database migration**:
    ```bash
-   psql -U scraper_user -d scraper -h localhost -f db/migrations/add_parse_metadata_field.sql
+   psql -U washbot -d washbot_db -h localhost -f db/migrations/add_parse_metadata_field.sql
    ```
 
 2. **Update YP crawler** to pass `source_page_url`:

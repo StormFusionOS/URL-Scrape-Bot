@@ -59,8 +59,6 @@ class Company(Base):
         reviews_google: Number of Google reviews
         reviews_yp: Number of Yellow Pages reviews
         reviews_bing: Number of Bing reviews
-        rating_ha: HomeAdvisor rating
-        reviews_ha: Number of HomeAdvisor reviews
         active: Whether the company is active
         created_at: Record creation timestamp
         last_updated: Last update timestamp

@@ -107,7 +107,7 @@ parse_metadata: Mapped[Optional[dict]] = mapped_column(
 
 **Fix Required**: Run migration script
 ```bash
-PGPASSWORD='ScraperPass123' psql -U scraper_user -d scraper -h localhost \
+PGPASSWORD='Washdb123' psql -U washbot -d washbot_db -h localhost \
     -f db/migrations/add_parse_metadata_field.sql
 ```
 
@@ -199,11 +199,11 @@ To use the `parse_metadata` field in production, run the migration:
 
 ```bash
 # Apply migration to PostgreSQL database
-PGPASSWORD='ScraperPass123' psql -U scraper_user -d scraper -h localhost \
+PGPASSWORD='Washdb123' psql -U washbot -d washbot_db -h localhost \
     -f db/migrations/add_parse_metadata_field.sql
 
 # Verify column exists
-PGPASSWORD='ScraperPass123' psql -U scraper_user -d scraper -h localhost \
+PGPASSWORD='Washdb123' psql -U washbot -d washbot_db -h localhost \
     -c "\d companies" | grep parse_metadata
 ```
 

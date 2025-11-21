@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from scrape_google.google_filter import GoogleFilter
 from scrape_yp.yp_filter import YPFilter
-from scrape_bing.bing_filter import BingFilter
 
 
 class FilterPreview:
@@ -29,7 +28,6 @@ class FilterPreview:
         # Initialize filters
         self.google_filter = GoogleFilter()
         self.yp_filter = YPFilter()
-        self.bing_filter = BingFilter()
 
         # UI elements
         self.business_name_input = None
@@ -55,8 +53,7 @@ class FilterPreview:
                     options={
                         'all': 'All Sources',
                         'google': 'Google Maps',
-                        'yp': 'Yellow Pages',
-                        'bing': 'Bing Local'
+                        'yp': 'Yellow Pages'
                     },
                     value='all',
                     label='Discovery Source'
@@ -192,9 +189,6 @@ class FilterPreview:
         if source == 'all' or source == 'yp':
             results['Yellow Pages'] = self._test_yp_filter(business_data, category)
 
-        if source == 'all' or source == 'bing':
-            results['Bing Local'] = self._test_bing_filter(business_data)
-
         # Display results
         self._display_results(results, business_data)
 
@@ -212,10 +206,6 @@ class FilterPreview:
             'website': business_data['website']
         }
         return self.yp_filter.filter_listing(yp_data)
-
-    def _test_bing_filter(self, business_data: Dict) -> Dict:
-        """Test against Bing filter."""
-        return self.bing_filter.filter_business(business_data)
 
     def _display_results(self, results: Dict, business_data: Dict):
         """
@@ -319,7 +309,6 @@ class FilterPreview:
         """Reload all filters from disk."""
         self.google_filter = GoogleFilter()
         self.yp_filter = YPFilter()
-        self.bing_filter = BingFilter()
         ui.notify('Filters reloaded!', type='positive')
 
 

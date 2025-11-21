@@ -1,4 +1,4 @@
--- Migration: Create city_registry table for ZIP code-based HomeAdvisor searches
+-- Migration: Create city_registry table for ZIP code-based city searches
 -- This table stores US cities with their ZIP codes from uscities.csv
 
 CREATE TABLE IF NOT EXISTS city_registry (
@@ -37,4 +37,4 @@ CREATE INDEX IF NOT EXISTS idx_city_registry_population ON city_registry(populat
 CREATE INDEX IF NOT EXISTS idx_city_registry_primary_zip ON city_registry(primary_zip);
 
 -- Add comment
-COMMENT ON TABLE city_registry IS 'US cities with ZIP codes for HomeAdvisor scraping (from uscities.csv)';
+COMMENT ON TABLE city_registry IS 'US cities with ZIP codes for city-based scraping (from uscities.csv)';
