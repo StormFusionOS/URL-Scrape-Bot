@@ -1,388 +1,335 @@
--- Migration: Add SEO Intelligence Tables for Canonical AI SEO System
--- Created: 2025-11-20
--- Description: Adds 12 canonical tables for SERP monitoring, competitor tracking,
---              backlinks, citations, technical audits, and governance logging
+-- Migration: Add SEO Intelligence System Tables
+-- This migration creates 12 tables for AI-powered SEO intelligence tracking
+--
+-- Table Groups:
+-- 1. SERP Tracking: search_queries, serp_snapshots, serp_results
+-- 2. Competitor Analysis: competitors, competitor_pages
+-- 3. Backlinks & Authority: backlinks, referring_domains
+-- 4. Citations: citations
+-- 5. Technical Audits: page_audits, audit_issues
+-- 6. Governance: change_log, task_logs
 
 -- ============================================================================
--- 1. Search Queries - Tracked keywords for SERP monitoring
+-- 1. SERP TRACKING TABLES
 -- ============================================================================
+
+-- Search queries table (tracks what we're monitoring)
 CREATE TABLE IF NOT EXISTS search_queries (
-    id SERIAL PRIMARY KEY,
-    query_text TEXT NOT NULL,
-    search_engine VARCHAR(50) NOT NULL DEFAULT 'Google',
-    locale VARCHAR(10) NOT NULL DEFAULT 'en-US',
-    location VARCHAR(255),
-    track BOOLEAN NOT NULL DEFAULT TRUE,
-    priority INTEGER NOT NULL DEFAULT 2,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_checked TIMESTAMP
+    query_id SERIAL PRIMARY KEY,
+    query_text VARCHAR(500) NOT NULL,
+    location VARCHAR(200),  -- e.g., "Austin, TX" or "78701"
+    search_engine VARCHAR(50) DEFAULT 'google',  -- google, bing, duckduckgo
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    metadata JSONB,  -- Extended metadata (device, language, etc.)
+
+    CONSTRAINT unique_query_location UNIQUE (query_text, location, search_engine)
 );
 
-CREATE INDEX IF NOT EXISTS ix_search_queries_query_text ON search_queries(query_text);
-CREATE INDEX IF NOT EXISTS ix_search_queries_track ON search_queries(track);
-CREATE UNIQUE INDEX IF NOT EXISTS ix_query_engine_locale ON search_queries(query_text, search_engine, locale);
+CREATE INDEX idx_search_queries_active ON search_queries(is_active);
+CREATE INDEX idx_search_queries_text ON search_queries(query_text);
+CREATE INDEX idx_search_queries_metadata ON search_queries USING GIN(metadata);
 
-COMMENT ON TABLE search_queries IS 'Tracked keywords for SERP monitoring';
-COMMENT ON COLUMN search_queries.query_text IS 'Search keyword or phrase';
-COMMENT ON COLUMN search_queries.search_engine IS 'Search engine (Google, Bing, etc.)';
-COMMENT ON COLUMN search_queries.locale IS 'Locale for search results';
-COMMENT ON COLUMN search_queries.location IS 'Geographic location for localized results';
-COMMENT ON COLUMN search_queries.track IS 'Whether to actively track this query';
-COMMENT ON COLUMN search_queries.priority IS '1=high, 2=medium, 3=low';
-COMMENT ON COLUMN search_queries.last_checked IS 'Last SERP capture timestamp';
-
-
--- ============================================================================
--- 2. SERP Snapshots - Daily SERP captures per query
--- ============================================================================
+-- SERP snapshots (time-series data)
+-- Supports partitioning by captured_at for performance
 CREATE TABLE IF NOT EXISTS serp_snapshots (
-    id SERIAL PRIMARY KEY,
-    query_id INTEGER NOT NULL REFERENCES search_queries(id) ON DELETE CASCADE,
-    snapshot_date TIMESTAMP NOT NULL,
-    search_engine VARCHAR(50) NOT NULL DEFAULT 'Google',
-    our_rank INTEGER,
-    featured_snippet BOOLEAN NOT NULL DEFAULT FALSE,
-    featured_snippet_data JSONB,
-    paa_questions JSONB,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    snapshot_id SERIAL PRIMARY KEY,
+    query_id INTEGER NOT NULL REFERENCES search_queries(query_id) ON DELETE CASCADE,
+    captured_at TIMESTAMP DEFAULT NOW(),
+    result_count INTEGER,  -- Total results found
+    snapshot_hash VARCHAR(64),  -- SHA-256 hash for change detection
+    raw_html TEXT,  -- Optional: full HTML snapshot
+    metadata JSONB,  -- SERP features, ads, knowledge panels, etc.
+
+    CONSTRAINT fk_serp_query FOREIGN KEY (query_id) REFERENCES search_queries(query_id)
 );
 
-CREATE INDEX IF NOT EXISTS ix_serp_snapshots_query_id ON serp_snapshots(query_id);
-CREATE INDEX IF NOT EXISTS ix_serp_snapshots_snapshot_date ON serp_snapshots(snapshot_date);
-CREATE UNIQUE INDEX IF NOT EXISTS ix_serp_query_date ON serp_snapshots(query_id, snapshot_date);
+CREATE INDEX idx_serp_snapshots_query ON serp_snapshots(query_id);
+CREATE INDEX idx_serp_snapshots_captured ON serp_snapshots(captured_at DESC);
+CREATE INDEX idx_serp_snapshots_hash ON serp_snapshots(snapshot_hash);
+CREATE INDEX idx_serp_snapshots_metadata ON serp_snapshots USING GIN(metadata);
 
-COMMENT ON TABLE serp_snapshots IS 'Daily SERP snapshot for tracked queries';
-COMMENT ON COLUMN serp_snapshots.snapshot_date IS 'Date of snapshot (for daily tracking and partitioning)';
-COMMENT ON COLUMN serp_snapshots.our_rank IS 'Our ranking position if found in top results';
-COMMENT ON COLUMN serp_snapshots.featured_snippet IS 'Whether a featured snippet was present';
-COMMENT ON COLUMN serp_snapshots.featured_snippet_data IS 'JSON with featured snippet text, URL, type';
-COMMENT ON COLUMN serp_snapshots.paa_questions IS 'JSON array of People Also Ask questions with answers';
-
-
--- ============================================================================
--- 3. SERP Results - Individual organic results per snapshot
--- ============================================================================
+-- SERP results (individual result entries)
 CREATE TABLE IF NOT EXISTS serp_results (
-    id SERIAL PRIMARY KEY,
-    snapshot_id INTEGER NOT NULL REFERENCES serp_snapshots(id) ON DELETE CASCADE,
-    rank INTEGER NOT NULL,
+    result_id SERIAL PRIMARY KEY,
+    snapshot_id INTEGER NOT NULL REFERENCES serp_snapshots(snapshot_id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,  -- 1-based ranking position
     url TEXT NOT NULL,
-    title TEXT NOT NULL,
-    snippet TEXT,
-    domain VARCHAR(255) NOT NULL,
-    is_ours BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    title TEXT,
+    description TEXT,
+    domain VARCHAR(500),
+    is_our_company BOOLEAN DEFAULT FALSE,  -- Track our own rankings
+    is_competitor BOOLEAN DEFAULT FALSE,
+    competitor_id INTEGER,  -- FK to competitors table (nullable)
+    metadata JSONB,  -- Rich snippets, features, schema markup
+
+    CONSTRAINT fk_serp_snapshot FOREIGN KEY (snapshot_id) REFERENCES serp_snapshots(snapshot_id)
 );
 
-CREATE INDEX IF NOT EXISTS ix_serp_results_snapshot_id ON serp_results(snapshot_id);
-CREATE INDEX IF NOT EXISTS ix_serp_results_domain ON serp_results(domain);
-CREATE INDEX IF NOT EXISTS ix_serp_results_is_ours ON serp_results(is_ours);
-
-COMMENT ON TABLE serp_results IS 'Individual SERP result (top 10 organic results per snapshot)';
-COMMENT ON COLUMN serp_results.rank IS 'Position in SERP (1-10)';
-COMMENT ON COLUMN serp_results.domain IS 'Domain extracted from URL';
-COMMENT ON COLUMN serp_results.is_ours IS 'Whether this result belongs to our domain';
-
+CREATE INDEX idx_serp_results_snapshot ON serp_results(snapshot_id);
+CREATE INDEX idx_serp_results_position ON serp_results(position);
+CREATE INDEX idx_serp_results_domain ON serp_results(domain);
+CREATE INDEX idx_serp_results_competitor ON serp_results(competitor_id) WHERE competitor_id IS NOT NULL;
+CREATE INDEX idx_serp_results_metadata ON serp_results USING GIN(metadata);
 
 -- ============================================================================
--- 4. Competitors - Competitor domain tracking
+-- 2. COMPETITOR ANALYSIS TABLES
 -- ============================================================================
+
+-- Competitors table (track competing businesses)
 CREATE TABLE IF NOT EXISTS competitors (
-    id SERIAL PRIMARY KEY,
-    domain VARCHAR(255) UNIQUE NOT NULL,
-    name VARCHAR(255),
-    category VARCHAR(100),
-    priority INTEGER NOT NULL DEFAULT 2,
-    active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_crawled TIMESTAMP
+    competitor_id SERIAL PRIMARY KEY,
+    name VARCHAR(500) NOT NULL,
+    domain VARCHAR(500) NOT NULL UNIQUE,
+    website_url TEXT,
+    business_type VARCHAR(200),  -- e.g., "pressure washing", "window cleaning"
+    location VARCHAR(200),
+    is_active BOOLEAN DEFAULT TRUE,
+    confidence_score DECIMAL(5,2),  -- 0-100 confidence this is a real competitor
+    discovered_at TIMESTAMP DEFAULT NOW(),
+    last_crawled_at TIMESTAMP,
+    metadata JSONB,  -- Contact info, social links, etc.
+
+    CONSTRAINT unique_competitor_domain UNIQUE (domain)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS ix_competitors_domain ON competitors(domain);
-CREATE INDEX IF NOT EXISTS ix_competitors_active ON competitors(active);
+CREATE INDEX idx_competitors_domain ON competitors(domain);
+CREATE INDEX idx_competitors_active ON competitors(is_active);
+CREATE INDEX idx_competitors_location ON competitors(location);
+CREATE INDEX idx_competitors_metadata ON competitors USING GIN(metadata);
 
-COMMENT ON TABLE competitors IS 'Competitor domain tracking';
-COMMENT ON COLUMN competitors.domain IS 'Competitor domain (e.g., example.com)';
-COMMENT ON COLUMN competitors.name IS 'Business/site name';
-COMMENT ON COLUMN competitors.category IS 'Business category';
-COMMENT ON COLUMN competitors.priority IS '1=high, 2=medium, 3=low';
-COMMENT ON COLUMN competitors.active IS 'Whether actively tracking this competitor';
-COMMENT ON COLUMN competitors.last_crawled IS 'Last crawl timestamp';
-
-
--- ============================================================================
--- 5. Competitor Pages - Page-level data with hashing and snapshots
--- ============================================================================
+-- Competitor pages (snapshots of competitor pages with change detection)
 CREATE TABLE IF NOT EXISTS competitor_pages (
-    id SERIAL PRIMARY KEY,
-    site_id INTEGER NOT NULL REFERENCES competitors(id) ON DELETE CASCADE,
+    page_id SERIAL PRIMARY KEY,
+    competitor_id INTEGER NOT NULL REFERENCES competitors(competitor_id) ON DELETE CASCADE,
     url TEXT NOT NULL,
-    page_type VARCHAR(50) NOT NULL DEFAULT 'other',
-    meta_title TEXT,
+    page_type VARCHAR(100),  -- 'homepage', 'services', 'pricing', 'blog', etc.
+    title TEXT,
     meta_description TEXT,
-    h1_text TEXT,
-    h2_text JSONB,
-    canonical_url TEXT,
-    robots_meta VARCHAR(255),
-    last_hash VARCHAR(64),
-    last_scraped TIMESTAMP,
+    h1_tags TEXT[],  -- Array of H1 tags
+    content_hash VARCHAR(64),  -- SHA-256 hash for change detection
+    word_count INTEGER,
+    crawled_at TIMESTAMP DEFAULT NOW(),
     status_code INTEGER,
-    data JSONB,
-    html_snapshot_path TEXT,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_updated TIMESTAMP
+    schema_markup JSONB,  -- Extracted schema.org markup
+    links JSONB,  -- Internal/external link analysis
+    metadata JSONB,  -- Images, videos, CTAs, forms, etc.
+
+    CONSTRAINT fk_competitor FOREIGN KEY (competitor_id) REFERENCES competitors(competitor_id)
 );
 
-CREATE INDEX IF NOT EXISTS ix_competitor_pages_site_id ON competitor_pages(site_id);
-CREATE INDEX IF NOT EXISTS ix_competitor_pages_url ON competitor_pages(url);
-CREATE INDEX IF NOT EXISTS ix_competitor_pages_page_type ON competitor_pages(page_type);
-CREATE INDEX IF NOT EXISTS ix_competitor_pages_last_hash ON competitor_pages(last_hash);
-CREATE INDEX IF NOT EXISTS ix_competitor_pages_last_scraped ON competitor_pages(last_scraped);
-CREATE UNIQUE INDEX IF NOT EXISTS ix_competitor_pages_site_url ON competitor_pages(site_id, url);
-
-COMMENT ON TABLE competitor_pages IS 'Competitor page data with hashing, snapshots, and structured data';
-COMMENT ON COLUMN competitor_pages.url IS 'Page URL';
-COMMENT ON COLUMN competitor_pages.page_type IS 'homepage, service, blog, contact, listing, other';
-COMMENT ON COLUMN competitor_pages.h1_text IS 'H1 heading text';
-COMMENT ON COLUMN competitor_pages.h2_text IS 'JSON array of H2 headings';
-COMMENT ON COLUMN competitor_pages.robots_meta IS 'Robots meta directives (e.g., noindex, nofollow)';
-COMMENT ON COLUMN competitor_pages.last_hash IS 'SHA-256 hash of normalized DOM for change detection';
-COMMENT ON COLUMN competitor_pages.status_code IS 'HTTP status code from last fetch';
-COMMENT ON COLUMN competitor_pages.data IS 'JSONB with structured signals: schema.ld_json[], links.internal[], links.external[], images.alt_coverage, video.embeds[], etc.';
-COMMENT ON COLUMN competitor_pages.html_snapshot_path IS 'Path to archived HTML snapshot file';
-
+CREATE INDEX idx_competitor_pages_competitor ON competitor_pages(competitor_id);
+CREATE INDEX idx_competitor_pages_url ON competitor_pages(url);
+CREATE INDEX idx_competitor_pages_type ON competitor_pages(page_type);
+CREATE INDEX idx_competitor_pages_crawled ON competitor_pages(crawled_at DESC);
+CREATE INDEX idx_competitor_pages_hash ON competitor_pages(content_hash);
+CREATE INDEX idx_competitor_pages_schema ON competitor_pages USING GIN(schema_markup);
 
 -- ============================================================================
--- 6. Backlinks - Link tracking (source → target)
+-- 3. BACKLINKS & AUTHORITY TABLES
 -- ============================================================================
+
+-- Backlinks table (track inbound links)
 CREATE TABLE IF NOT EXISTS backlinks (
-    id SERIAL PRIMARY KEY,
-    source_url TEXT NOT NULL,
-    target_url TEXT NOT NULL,
-    source_domain VARCHAR(255) NOT NULL,
-    target_domain VARCHAR(255) NOT NULL,
+    backlink_id SERIAL PRIMARY KEY,
+    target_domain VARCHAR(500) NOT NULL,  -- Domain being linked to
+    target_url TEXT NOT NULL,  -- Specific page being linked to
+    source_domain VARCHAR(500) NOT NULL,  -- Domain of the linking page
+    source_url TEXT NOT NULL,  -- Page containing the link
     anchor_text TEXT,
-    rel_attr VARCHAR(100),
-    position VARCHAR(50) NOT NULL DEFAULT 'unknown',
-    first_seen TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_checked TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    alive BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    link_type VARCHAR(50),  -- 'dofollow', 'nofollow', 'sponsored', 'ugc'
+    discovered_at TIMESTAMP DEFAULT NOW(),
+    last_seen_at TIMESTAMP DEFAULT NOW(),
+    is_active BOOLEAN DEFAULT TRUE,
+    metadata JSONB,  -- Context, position, surrounding text
+
+    CONSTRAINT unique_backlink UNIQUE (target_url, source_url)
 );
 
-CREATE INDEX IF NOT EXISTS ix_backlinks_source_url ON backlinks(source_url);
-CREATE INDEX IF NOT EXISTS ix_backlinks_target_url ON backlinks(target_url);
-CREATE INDEX IF NOT EXISTS ix_backlinks_source_domain ON backlinks(source_domain);
-CREATE INDEX IF NOT EXISTS ix_backlinks_target_domain ON backlinks(target_domain);
-CREATE INDEX IF NOT EXISTS ix_backlinks_alive ON backlinks(alive);
-CREATE UNIQUE INDEX IF NOT EXISTS ix_backlinks_source_target ON backlinks(source_url, target_url);
+CREATE INDEX idx_backlinks_target_domain ON backlinks(target_domain);
+CREATE INDEX idx_backlinks_source_domain ON backlinks(source_domain);
+CREATE INDEX idx_backlinks_active ON backlinks(is_active);
+CREATE INDEX idx_backlinks_discovered ON backlinks(discovered_at DESC);
+CREATE INDEX idx_backlinks_metadata ON backlinks USING GIN(metadata);
 
-COMMENT ON TABLE backlinks IS 'Backlink tracking (source → target)';
-COMMENT ON COLUMN backlinks.source_url IS 'URL where the link was found';
-COMMENT ON COLUMN backlinks.target_url IS 'URL being linked to';
-COMMENT ON COLUMN backlinks.source_domain IS 'Source domain for aggregation';
-COMMENT ON COLUMN backlinks.target_domain IS 'Target domain';
-COMMENT ON COLUMN backlinks.rel_attr IS 'Rel attribute: nofollow, sponsored, ugc, etc.';
-COMMENT ON COLUMN backlinks.position IS 'in-body, nav, footer, aside';
-COMMENT ON COLUMN backlinks.first_seen IS 'First discovery timestamp';
-COMMENT ON COLUMN backlinks.last_checked IS 'Last verification timestamp';
-COMMENT ON COLUMN backlinks.alive IS 'Whether link is still present';
-
-
--- ============================================================================
--- 7. Referring Domains - Domain-level aggregates for LAS
--- ============================================================================
+-- Referring domains (aggregate authority metrics)
 CREATE TABLE IF NOT EXISTS referring_domains (
-    id SERIAL PRIMARY KEY,
-    domain VARCHAR(255) UNIQUE NOT NULL,
-    backlink_count INTEGER NOT NULL DEFAULT 0,
-    inbody_link_count INTEGER NOT NULL DEFAULT 0,
-    authority_score DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    domain_id SERIAL PRIMARY KEY,
+    domain VARCHAR(500) NOT NULL UNIQUE,
+    total_backlinks INTEGER DEFAULT 0,
+    dofollow_count INTEGER DEFAULT 0,
+    nofollow_count INTEGER DEFAULT 0,
+    local_authority_score DECIMAL(5,2),  -- LAS: 0-100 custom authority metric
+    first_seen_at TIMESTAMP DEFAULT NOW(),
+    last_updated_at TIMESTAMP DEFAULT NOW(),
+    metadata JSONB,  -- Domain age, TLD, industry relevance, etc.
+
+    CONSTRAINT unique_referring_domain UNIQUE (domain)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS ix_referring_domains_domain ON referring_domains(domain);
-CREATE INDEX IF NOT EXISTS ix_referring_domains_authority_score ON referring_domains(authority_score);
-
-COMMENT ON TABLE referring_domains IS 'Domain-level backlink aggregates for Local Authority Score (LAS)';
-COMMENT ON COLUMN referring_domains.domain IS 'Domain being aggregated';
-COMMENT ON COLUMN referring_domains.backlink_count IS 'Total backlinks to this domain';
-COMMENT ON COLUMN referring_domains.inbody_link_count IS 'Count of in-body links (weighted higher)';
-COMMENT ON COLUMN referring_domains.authority_score IS 'Local Authority Score (0-100, normalized)';
-COMMENT ON COLUMN referring_domains.last_updated IS 'Last aggregation timestamp';
-
+CREATE INDEX idx_referring_domains_domain ON referring_domains(domain);
+CREATE INDEX idx_referring_domains_las ON referring_domains(local_authority_score DESC);
+CREATE INDEX idx_referring_domains_backlinks ON referring_domains(total_backlinks DESC);
+CREATE INDEX idx_referring_domains_metadata ON referring_domains USING GIN(metadata);
 
 -- ============================================================================
--- 8. Citations - Directory presence, NAP matching, reviews
+-- 4. CITATIONS TABLE
 -- ============================================================================
+
+-- Citations (business directory listings)
 CREATE TABLE IF NOT EXISTS citations (
-    id SERIAL PRIMARY KEY,
-    site_name VARCHAR(100) UNIQUE NOT NULL,
-    profile_url TEXT,
-    listed BOOLEAN NOT NULL DEFAULT FALSE,
-    nap_match BOOLEAN NOT NULL DEFAULT FALSE,
-    business_name VARCHAR(255),
-    phone VARCHAR(50),
+    citation_id SERIAL PRIMARY KEY,
+    directory_name VARCHAR(500) NOT NULL,  -- e.g., "Yelp", "Yellow Pages", "BBB"
+    directory_url TEXT,
+    listing_url TEXT,
+    business_name VARCHAR(500),
     address TEXT,
-    rating DOUBLE PRECISION,
+    phone VARCHAR(50),
+    nap_match_score DECIMAL(5,2),  -- 0-100 consistency score (Name, Address, Phone)
+    has_website_link BOOLEAN DEFAULT FALSE,
+    is_claimed BOOLEAN DEFAULT FALSE,
+    rating DECIMAL(3,2),
     review_count INTEGER,
-    last_audited TIMESTAMP,
-    first_seen TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    issues TEXT,
-    data JSONB,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    discovered_at TIMESTAMP DEFAULT NOW(),
+    last_verified_at TIMESTAMP,
+    metadata JSONB,  -- Hours, categories, photos, etc.
+
+    CONSTRAINT unique_citation UNIQUE (directory_name, listing_url)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS ix_citations_site_name ON citations(site_name);
-CREATE INDEX IF NOT EXISTS ix_citations_listed ON citations(listed);
-CREATE INDEX IF NOT EXISTS ix_citations_last_audited ON citations(last_audited);
-
-COMMENT ON TABLE citations IS 'Citations tracking (directory presence, NAP matching, reviews)';
-COMMENT ON COLUMN citations.site_name IS 'Directory name (e.g., Yelp, BBB, Angi)';
-COMMENT ON COLUMN citations.profile_url IS 'URL to business profile on directory';
-COMMENT ON COLUMN citations.listed IS 'Whether business is listed on this directory';
-COMMENT ON COLUMN citations.nap_match IS 'Whether NAP (Name, Address, Phone) matches canonical data';
-COMMENT ON COLUMN citations.rating IS 'Average rating (if available)';
-COMMENT ON COLUMN citations.review_count IS 'Number of reviews';
-COMMENT ON COLUMN citations.last_audited IS 'Last audit timestamp';
-COMMENT ON COLUMN citations.first_seen IS 'First discovery timestamp';
-COMMENT ON COLUMN citations.issues IS 'Text description of issues (e.g., NAP mismatch details)';
-COMMENT ON COLUMN citations.data IS 'JSONB with extended fields (review samples, hours, etc.)';
-
+CREATE INDEX idx_citations_directory ON citations(directory_name);
+CREATE INDEX idx_citations_nap_score ON citations(nap_match_score DESC);
+CREATE INDEX idx_citations_claimed ON citations(is_claimed);
+CREATE INDEX idx_citations_discovered ON citations(discovered_at DESC);
+CREATE INDEX idx_citations_metadata ON citations USING GIN(metadata);
 
 -- ============================================================================
--- 9. Page Audits - Technical/accessibility audit summaries
+-- 5. TECHNICAL AUDIT TABLES
 -- ============================================================================
+
+-- Page audits (technical/accessibility audits of our pages)
 CREATE TABLE IF NOT EXISTS page_audits (
-    id SERIAL PRIMARY KEY,
-    page_url TEXT NOT NULL,
-    audit_date TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    status_code INTEGER NOT NULL,
-    indexable BOOLEAN NOT NULL DEFAULT TRUE,
-    render_differs BOOLEAN NOT NULL DEFAULT FALSE,
-    performance_proxy DOUBLE PRECISION,
-    issues_found INTEGER NOT NULL DEFAULT 0,
-    notes TEXT,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    audit_id SERIAL PRIMARY KEY,
+    url TEXT NOT NULL,
+    audit_type VARCHAR(100),  -- 'technical', 'accessibility', 'performance', 'seo'
+    overall_score DECIMAL(5,2),  -- 0-100 aggregate score
+    audited_at TIMESTAMP DEFAULT NOW(),
+    page_load_time_ms INTEGER,
+    page_size_kb INTEGER,
+    total_requests INTEGER,
+    metadata JSONB  -- Lighthouse scores, Core Web Vitals, etc.
 );
 
-CREATE INDEX IF NOT EXISTS ix_page_audits_page_url ON page_audits(page_url);
-CREATE INDEX IF NOT EXISTS ix_page_audits_audit_date ON page_audits(audit_date);
+CREATE INDEX idx_page_audits_url ON page_audits(url);
+CREATE INDEX idx_page_audits_type ON page_audits(audit_type);
+CREATE INDEX idx_page_audits_score ON page_audits(overall_score DESC);
+CREATE INDEX idx_page_audits_audited ON page_audits(audited_at DESC);
+CREATE INDEX idx_page_audits_metadata ON page_audits USING GIN(metadata);
 
-COMMENT ON TABLE page_audits IS 'Page-level technical/accessibility audit summary';
-COMMENT ON COLUMN page_audits.page_url IS 'URL audited';
-COMMENT ON COLUMN page_audits.audit_date IS 'Audit timestamp';
-COMMENT ON COLUMN page_audits.status_code IS 'HTTP status code';
-COMMENT ON COLUMN page_audits.indexable IS 'Whether page is indexable (no robots blocks)';
-COMMENT ON COLUMN page_audits.render_differs IS 'Whether rendered DOM differs from raw HTML';
-COMMENT ON COLUMN page_audits.performance_proxy IS 'Estimated performance score (0-100)';
-COMMENT ON COLUMN page_audits.issues_found IS 'Count of issues detected';
-COMMENT ON COLUMN page_audits.notes IS 'Optional notes about the audit';
-
-
--- ============================================================================
--- 10. Audit Issues - Individual technical/accessibility issues
--- ============================================================================
+-- Audit issues (individual findings from audits)
 CREATE TABLE IF NOT EXISTS audit_issues (
-    id SERIAL PRIMARY KEY,
-    audit_id INTEGER NOT NULL REFERENCES page_audits(id) ON DELETE CASCADE,
-    issue_type VARCHAR(100) NOT NULL,
-    description TEXT NOT NULL,
-    severity VARCHAR(20) NOT NULL DEFAULT 'medium',
-    fixed BOOLEAN NOT NULL DEFAULT FALSE,
-    fixed_date TIMESTAMP,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    issue_id SERIAL PRIMARY KEY,
+    audit_id INTEGER NOT NULL REFERENCES page_audits(audit_id) ON DELETE CASCADE,
+    severity VARCHAR(50),  -- 'critical', 'warning', 'info'
+    category VARCHAR(100),  -- 'meta', 'images', 'links', 'performance', 'accessibility'
+    issue_type VARCHAR(200),  -- Specific issue (e.g., "missing_alt_text", "broken_link")
+    description TEXT,
+    element TEXT,  -- CSS selector or element identifier
+    recommendation TEXT,
+    metadata JSONB,  -- Additional context, code snippets, etc.
+
+    CONSTRAINT fk_issue_audit FOREIGN KEY (audit_id) REFERENCES page_audits(audit_id)
 );
 
-CREATE INDEX IF NOT EXISTS ix_audit_issues_audit_id ON audit_issues(audit_id);
-CREATE INDEX IF NOT EXISTS ix_audit_issues_issue_type ON audit_issues(issue_type);
-CREATE INDEX IF NOT EXISTS ix_audit_issues_fixed ON audit_issues(fixed);
-
-COMMENT ON TABLE audit_issues IS 'Individual technical/accessibility audit issue';
-COMMENT ON COLUMN audit_issues.issue_type IS 'Type: render_js_only_text, no_canonical, a11y_alt_missing, html_error, etc.';
-COMMENT ON COLUMN audit_issues.description IS 'Detailed description of the issue';
-COMMENT ON COLUMN audit_issues.severity IS 'high, medium, low';
-COMMENT ON COLUMN audit_issues.fixed IS 'Whether issue has been fixed';
-COMMENT ON COLUMN audit_issues.fixed_date IS 'When issue was fixed';
-
+CREATE INDEX idx_audit_issues_audit ON audit_issues(audit_id);
+CREATE INDEX idx_audit_issues_severity ON audit_issues(severity);
+CREATE INDEX idx_audit_issues_category ON audit_issues(category);
+CREATE INDEX idx_audit_issues_type ON audit_issues(issue_type);
+CREATE INDEX idx_audit_issues_metadata ON audit_issues USING GIN(metadata);
 
 -- ============================================================================
--- 11. Task Logs - Job execution logging for governance
+-- 6. GOVERNANCE TABLES
 -- ============================================================================
-CREATE TABLE IF NOT EXISTS task_logs (
-    id SERIAL PRIMARY KEY,
-    task_name VARCHAR(255) NOT NULL,
-    module VARCHAR(100) NOT NULL,
-    started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    completed_at TIMESTAMP,
-    status VARCHAR(50) NOT NULL,
-    message TEXT,
-    items_processed INTEGER NOT NULL DEFAULT 0,
-    items_new INTEGER NOT NULL DEFAULT 0,
-    items_updated INTEGER NOT NULL DEFAULT 0,
-    items_failed INTEGER NOT NULL DEFAULT 0,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
 
-CREATE INDEX IF NOT EXISTS ix_task_logs_task_name ON task_logs(task_name);
-CREATE INDEX IF NOT EXISTS ix_task_logs_module ON task_logs(module);
-CREATE INDEX IF NOT EXISTS ix_task_logs_started_at ON task_logs(started_at);
-CREATE INDEX IF NOT EXISTS ix_task_logs_status ON task_logs(status);
-
-COMMENT ON TABLE task_logs IS 'Task execution logging for governance and accountability';
-COMMENT ON COLUMN task_logs.task_name IS 'Name of the task (e.g., serp_scraper, competitor_crawler)';
-COMMENT ON COLUMN task_logs.module IS 'Module name (e.g., serp, competitor, backlinks)';
-COMMENT ON COLUMN task_logs.started_at IS 'Task start timestamp';
-COMMENT ON COLUMN task_logs.completed_at IS 'Task completion timestamp';
-COMMENT ON COLUMN task_logs.status IS 'success, failed, partial, timeout';
-COMMENT ON COLUMN task_logs.message IS 'Summary message or error details';
-COMMENT ON COLUMN task_logs.items_processed IS 'Number of items processed';
-COMMENT ON COLUMN task_logs.items_new IS 'Number of new items created';
-COMMENT ON COLUMN task_logs.items_updated IS 'Number of items updated';
-COMMENT ON COLUMN task_logs.items_failed IS 'Number of items that failed';
-
-
--- ============================================================================
--- 12. Change Log - SEO change proposals for review-mode governance
--- ============================================================================
+-- Change log (review-mode governance - all changes go here first)
 CREATE TABLE IF NOT EXISTS change_log (
-    id SERIAL PRIMARY KEY,
-    module VARCHAR(100) NOT NULL,
-    change_type VARCHAR(100) NOT NULL,
-    target_url TEXT NOT NULL,
-    proposed_change JSONB NOT NULL,
-    rationale TEXT,
-    status VARCHAR(50) NOT NULL DEFAULT 'pending',
-    priority INTEGER NOT NULL DEFAULT 2,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    change_id SERIAL PRIMARY KEY,
+    table_name VARCHAR(100) NOT NULL,  -- Which table the change is for
+    record_id INTEGER,  -- ID of the record being changed/created
+    operation VARCHAR(50) NOT NULL,  -- 'insert', 'update', 'delete'
+    proposed_data JSONB NOT NULL,  -- The proposed change data
+    status VARCHAR(50) DEFAULT 'pending',  -- 'pending', 'approved', 'rejected'
+    reason TEXT,  -- Approval/rejection reason
+    proposed_at TIMESTAMP DEFAULT NOW(),
     reviewed_at TIMESTAMP,
-    reviewed_by VARCHAR(100),
-    executed_at TIMESTAMP,
-    reverted_at TIMESTAMP
+    reviewed_by VARCHAR(200),  -- User/system that reviewed
+    metadata JSONB,  -- Change context, diff, justification
+
+    CONSTRAINT valid_operation CHECK (operation IN ('insert', 'update', 'delete')),
+    CONSTRAINT valid_status CHECK (status IN ('pending', 'approved', 'rejected'))
 );
 
-CREATE INDEX IF NOT EXISTS ix_change_log_module ON change_log(module);
-CREATE INDEX IF NOT EXISTS ix_change_log_change_type ON change_log(change_type);
-CREATE INDEX IF NOT EXISTS ix_change_log_target_url ON change_log(target_url);
-CREATE INDEX IF NOT EXISTS ix_change_log_status ON change_log(status);
-CREATE INDEX IF NOT EXISTS ix_change_log_created_at ON change_log(created_at);
+CREATE INDEX idx_change_log_table ON change_log(table_name);
+CREATE INDEX idx_change_log_status ON change_log(status);
+CREATE INDEX idx_change_log_proposed ON change_log(proposed_at DESC);
+CREATE INDEX idx_change_log_reviewed ON change_log(reviewed_at DESC);
+CREATE INDEX idx_change_log_metadata ON change_log USING GIN(metadata);
 
-COMMENT ON TABLE change_log IS 'SEO change proposals for review-mode governance';
-COMMENT ON COLUMN change_log.module IS 'Module that proposed the change';
-COMMENT ON COLUMN change_log.change_type IS 'Type: title_update, schema_add, internal_link, meta_update, etc.';
-COMMENT ON COLUMN change_log.target_url IS 'URL to be modified';
-COMMENT ON COLUMN change_log.proposed_change IS 'JSON with change details (before/after, anchor text, etc.)';
-COMMENT ON COLUMN change_log.rationale IS 'Explanation of why this change is recommended';
-COMMENT ON COLUMN change_log.status IS 'pending, approved, rejected, executed, reverted';
-COMMENT ON COLUMN change_log.priority IS '1=high, 2=medium, 3=low';
-COMMENT ON COLUMN change_log.created_at IS 'Proposal creation timestamp';
-COMMENT ON COLUMN change_log.reviewed_at IS 'When change was reviewed';
-COMMENT ON COLUMN change_log.reviewed_by IS 'Who reviewed the change';
-COMMENT ON COLUMN change_log.executed_at IS 'When change was applied';
-COMMENT ON COLUMN change_log.reverted_at IS 'When change was reverted';
+-- Task logs (execution tracking for all scraper tasks)
+-- Supports partitioning by started_at for performance
+CREATE TABLE IF NOT EXISTS task_logs (
+    task_id SERIAL PRIMARY KEY,
+    task_name VARCHAR(200) NOT NULL,  -- e.g., "serp_scraper", "competitor_crawler"
+    task_type VARCHAR(100),  -- 'scraper', 'analyzer', 'audit'
+    status VARCHAR(50) DEFAULT 'running',  -- 'running', 'success', 'failed', 'cancelled'
+    started_at TIMESTAMP DEFAULT NOW(),
+    completed_at TIMESTAMP,
+    duration_seconds INTEGER,
+    records_processed INTEGER DEFAULT 0,
+    records_created INTEGER DEFAULT 0,
+    records_updated INTEGER DEFAULT 0,
+    error_message TEXT,
+    metadata JSONB,  -- Parameters, configuration, results summary
 
+    CONSTRAINT valid_task_status CHECK (status IN ('running', 'success', 'failed', 'cancelled'))
+);
+
+CREATE INDEX idx_task_logs_name ON task_logs(task_name);
+CREATE INDEX idx_task_logs_status ON task_logs(status);
+CREATE INDEX idx_task_logs_started ON task_logs(started_at DESC);
+CREATE INDEX idx_task_logs_completed ON task_logs(completed_at DESC);
+CREATE INDEX idx_task_logs_metadata ON task_logs USING GIN(metadata);
 
 -- ============================================================================
--- Migration Complete
+-- TABLE COMMENTS
 -- ============================================================================
+
+COMMENT ON TABLE search_queries IS 'SERP monitoring queries with location targeting';
+COMMENT ON TABLE serp_snapshots IS 'Time-series SERP snapshot data with change detection';
+COMMENT ON TABLE serp_results IS 'Individual SERP result entries with position tracking';
+COMMENT ON TABLE competitors IS 'Competitor business directory with domain tracking';
+COMMENT ON TABLE competitor_pages IS 'Competitor page snapshots with content hashing';
+COMMENT ON TABLE backlinks IS 'Inbound link tracking with anchor text analysis';
+COMMENT ON TABLE referring_domains IS 'Domain-level authority metrics and LAS scores';
+COMMENT ON TABLE citations IS 'Business directory citations with NAP matching';
+COMMENT ON TABLE page_audits IS 'Technical/accessibility audit results';
+COMMENT ON TABLE audit_issues IS 'Individual audit findings and recommendations';
+COMMENT ON TABLE change_log IS 'Review-mode governance for all data changes';
+COMMENT ON TABLE task_logs IS 'Execution tracking for all scraper tasks';
+
+-- ============================================================================
+-- NOTES ON FUTURE ENHANCEMENTS
+-- ============================================================================
+
+-- Time-series partitioning for serp_snapshots:
+-- CREATE TABLE serp_snapshots_2025_01 PARTITION OF serp_snapshots
+--     FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+
+-- Time-series partitioning for task_logs:
+-- CREATE TABLE task_logs_2025_01 PARTITION OF task_logs
+--     FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+
+-- Full-text search on competitor pages:
+-- CREATE INDEX idx_competitor_pages_fulltext ON competitor_pages
+--     USING gin(to_tsvector('english', title || ' ' || meta_description));

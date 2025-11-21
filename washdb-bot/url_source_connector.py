@@ -210,10 +210,8 @@ class URLSourceConnector:
                     source,
                     rating_yp,
                     rating_google,
-                    rating_ha,
                     reviews_google,
                     reviews_yp,
-                    reviews_ha,
                     confidence_score,
                     data_completeness,
                     created_at
@@ -255,13 +253,11 @@ class URLSourceConnector:
                     'source': row[9],
                     'rating_yp': row[10],
                     'rating_google': row[11],
-                    'rating_ha': row[12],
-                    'reviews_google': row[13],
-                    'reviews_yp': row[14],
-                    'reviews_ha': row[15],
-                    'confidence_score': row[16],
-                    'data_completeness': row[17],
-                    'created_at': row[18]
+                    'reviews_google': row[12],
+                    'reviews_yp': row[13],
+                    'confidence_score': row[14],
+                    'data_completeness': row[15],
+                    'created_at': row[16]
                 })
 
             cursor.close()

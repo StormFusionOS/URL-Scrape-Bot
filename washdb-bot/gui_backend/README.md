@@ -14,17 +14,6 @@
 
 Backend API server for controlling and monitoring the washdb-bot scraper.
 
-## Key Separation from Nathan SEO Bot
-
-This GUI backend is **completely separate** from the Nathan SEO Bot dashboard:
-
-| Feature | Washdb-Bot GUI | Nathan SEO Bot Dashboard |
-|---------|----------------|--------------------------|
-| **Port** | 5001 | 5000 |
-| **Database** | washdb (PostgreSQL) | Nathan SEO Bot DB |
-| **Purpose** | Control washdb-bot only | Control Nathan SEO Bot |
-| **Codebase** | URL-Scrape-Bot repo | ai_seo_scraper repo |
-
 ## Architecture
 
 ```
@@ -276,4 +265,3 @@ When adding new features:
 1. Add routes to appropriate blueprint in `api/`
 2. Add database methods to `models/db_manager.py`
 3. Update this README with new endpoints
-4. Keep separation from Nathan SEO Bot intact

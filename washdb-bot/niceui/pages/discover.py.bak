@@ -459,6 +459,194 @@ async def run_yellow_pages_discovery(
         progress_bar.value = 0
 
 
+async def run_homeadvisor_discovery(
+    categories,
+    states,
+    pages_per_pair,
+    stats_card,
+    progress_bar,
+    run_button,
+    stop_button
+):
+    """Run HomeAdvisor discovery in background with progress updates."""
+    discovery_state.running = True
+    discovery_state.reset()
+    discovery_state.start_time = datetime.now()
+
+    # Register job in process manager
+    job_id = 'discovery_ha'
+    process_manager.register(job_id, 'HA Discovery', log_file='logs/ha_crawl.log')
+
+    # Disable run button, enable stop button
+    run_button.disable()
+    stop_button.enable()
+
+    # Start tailing log file
+    if discovery_state.log_viewer:
+        discovery_state.log_viewer.load_last_n_lines(50)
+        discovery_state.log_viewer.start_tailing()
+
+    # Add initial log messages
+    discovery_state.add_log('=' * 60, 'info')
+    discovery_state.add_log('Starting HomeAdvisor Discovery', 'info')
+    discovery_state.add_log('=' * 60, 'info')
+    discovery_state.add_log(f'Categories: {", ".join(categories)}', 'info')
+    discovery_state.add_log(f'States: {", ".join(states)}', 'info')
+    discovery_state.add_log(f'Pages per pair: {pages_per_pair}', 'info')
+    discovery_state.add_log(f'Total pairs: {len(categories)} × {len(states)} = {len(categories) * len(states)}', 'info')
+    discovery_state.add_log('-' * 60, 'info')
+
+    # Clear stats
+    stats_card.clear()
+    with stats_card:
+        ui.label('Running discovery...').classes('text-lg font-bold')
+        stat_labels = {
+            'found': ui.label('Found: 0'),
+            'new': ui.label('New: 0'),
+            'updated': ui.label('Updated: 0'),
+            'errors': ui.label('Errors: 0'),
+            'progress': ui.label('Progress: 0/0 pairs')
+        }
+
+    try:
+        ui.notify('Starting HomeAdvisor crawler as subprocess...', type='info')
+
+        # Build command for subprocess
+        categories_str = ','.join(categories)
+        states_str = ','.join(states)
+
+        cmd = [
+            sys.executable,
+            'cli_crawl_ha.py',
+            '--categories', categories_str,
+            '--states', states_str,
+            '--pages', str(pages_per_pair)
+        ]
+
+        # Create subprocess runner
+        runner = SubprocessRunner(job_id, 'logs/ha_crawl.log')
+        discovery_state.subprocess_runner = runner
+
+        # Start subprocess
+        pid = runner.start(cmd, cwd=os.getcwd())
+        ui.notify(f'Crawler started with PID {pid}', type='positive')
+
+        # Update process manager with actual PID
+        process_manager.update_pid(job_id, pid)
+
+        # Wait for subprocess to complete (check every second)
+        total_pairs = len(categories) * len(states)
+        while runner.is_running():
+            await asyncio.sleep(1.0)
+
+            # Update progress bar based on time elapsed (rough estimate)
+            elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
+            # Rough estimate: 20 seconds per pair
+            estimated_pairs_done = min(int(elapsed / 20), total_pairs)
+            progress_bar.value = estimated_pairs_done / total_pairs if total_pairs > 0 else 0
+            stat_labels['progress'].set_text(f"Progress: ~{estimated_pairs_done}/{total_pairs} pairs (estimated)")
+
+            # Check for cancellation
+            if discovery_state.is_cancelled():
+                ui.notify('Killing crawler process...', type='warning')
+                runner.kill()
+                break
+
+        # Get final status
+        status = runner.get_status()
+        return_code = status['return_code']
+
+        if return_code == 0:
+            ui.notify('Crawler completed successfully!', type='positive')
+        elif return_code == -9:
+            ui.notify('Crawler was killed by user', type='warning')
+        else:
+            ui.notify(f'Crawler exited with code {return_code}', type='negative')
+
+        # Parse results from database (crawler saves directly to DB)
+        result = await run.io_bound(backend.kpis)
+        result = {
+            'found': result.get('total_companies', 0),
+            'new': result.get('new_7d', 0),
+            'updated': 0,
+            'errors': 0,
+            'pairs_done': total_pairs if return_code == 0 else estimated_pairs_done,
+            'pairs_total': total_pairs
+        }
+
+        # Update final stats
+        elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
+
+        # Log final results
+        discovery_state.add_log('-' * 60, 'info')
+        discovery_state.add_log('Discovery Complete!', 'success')
+        discovery_state.add_log(f'Elapsed time: {elapsed:.1f}s', 'info')
+        discovery_state.add_log(f'Found: {result["found"]} businesses', 'success')
+        discovery_state.add_log(f'New: {result["new"]} businesses added', 'success')
+        discovery_state.add_log(f'Updated: {result["updated"]} businesses updated', 'info')
+        discovery_state.add_log(f'Errors: {result["errors"]}', 'error' if result["errors"] > 0 else 'info')
+        discovery_state.add_log(f'Pairs processed: {result["pairs_done"]}/{result["pairs_total"]}', 'info')
+        discovery_state.add_log('=' * 60, 'info')
+
+        stats_card.clear()
+        with stats_card:
+            ui.label('Discovery Complete!').classes('text-lg font-bold text-green-500')
+            ui.label(f'Elapsed: {elapsed:.1f}s').classes('text-sm text-gray-400')
+            ui.separator()
+            ui.label(f'Found: {result["found"]}').classes('text-lg')
+            ui.label(f'New: {result["new"]}').classes('text-lg text-green-500')
+            ui.label(f'Updated: {result["updated"]}').classes('text-lg text-blue-500')
+            ui.label(f'Errors: {result["errors"]}').classes('text-lg text-red-500')
+            ui.label(f'Pairs: {result["pairs_done"]}/{result["pairs_total"]}').classes('text-sm')
+
+        # Update progress bar
+        if result["pairs_total"] > 0:
+            progress_bar.value = result["pairs_done"] / result["pairs_total"]
+
+        # Store summary
+        discovery_state.last_run_summary = {
+            'source': 'homeadvisor',
+            'elapsed': elapsed,
+            'result': result,
+            'timestamp': discovery_state.start_time.isoformat()
+        }
+
+        # Show notification
+        if discovery_state.cancel_requested:
+            ui.notify('Discovery cancelled', type='warning')
+        else:
+            ui.notify(
+                f'Discovery complete! Found {result["found"]}, New {result["new"]}',
+                type='positive'
+            )
+
+    except Exception as e:
+        discovery_state.add_log('-' * 60, 'error')
+        discovery_state.add_log('Discovery Failed!', 'error')
+        discovery_state.add_log(f'Error: {str(e)}', 'error')
+        discovery_state.add_log('=' * 60, 'error')
+
+        stats_card.clear()
+        with stats_card:
+            ui.label('Discovery Failed').classes('text-lg font-bold text-red-500')
+            ui.label(f'Error: {str(e)}').classes('text-sm text-red-400')
+
+        ui.notify(f'Discovery failed: {str(e)}', type='negative')
+
+    finally:
+        # Stop tailing log file
+        if discovery_state.log_viewer:
+            discovery_state.log_viewer.stop_tailing()
+
+        # Mark job as completed in process manager
+        process_manager.mark_completed('discovery_ha', success=not discovery_state.cancel_requested)
+
+        # Re-enable run button, disable stop button
+        discovery_state.running = False
+        run_button.enable()
+        stop_button.disable()
+        progress_bar.value = 0
+
 
 async def run_google_maps_discovery(
     query,
@@ -1752,6 +1940,263 @@ def build_yelp_ui(container):
             ui.label('Status').classes('text-xl font-bold mb-4')
             ui.label('Yelp scraper implementation is planned. This will allow discovery of businesses with Yelp reviews and ratings.').classes('text-gray-400')
 
+
+def build_homeadvisor_ui(container):
+    """Build HomeAdvisor discovery UI in the given container."""
+    with container:
+        # Configuration card
+        with ui.card().classes('w-full mb-4'):
+            ui.label('HomeAdvisor Discovery Configuration').classes('text-xl font-bold mb-4')
+
+            # Info banner
+            with ui.card().classes('w-full bg-teal-900 border-l-4 border-teal-500 mb-4'):
+                ui.label('✨ HomeAdvisor Two-Phase Discovery').classes('text-lg font-bold text-teal-200')
+                ui.label('• Phase 1: Extract business names, addresses, phones from list pages (fast)').classes('text-sm text-teal-100')
+                ui.label('• Phase 2: Search DuckDuckGo to find real external websites (slower)').classes('text-sm text-teal-100')
+                ui.label('• Uses HomeAdvisor profile URLs as temporary placeholders').classes('text-sm text-teal-100')
+
+            # Category selection
+            ui.label('Service Categories').classes('font-semibold mb-2')
+            ui.label('Select categories to search (click to toggle):').classes('text-sm text-gray-400 mb-2')
+
+            # HomeAdvisor categories (from ha_crawl.py)
+            HA_CATEGORIES = [
+                "power washing",
+                "window cleaning services",
+                "deck staining or painting",
+                "fence painting or staining",
+            ]
+
+            category_checkboxes = {}
+            with ui.grid(columns=2).classes('w-full gap-2 mb-4'):
+                for cat in HA_CATEGORIES:
+                    category_checkboxes[cat] = ui.checkbox(cat, value=True).classes('text-sm')
+
+            # Quick select buttons
+            with ui.row().classes('gap-2 mb-4'):
+                def select_all_categories():
+                    for cb in category_checkboxes.values():
+                        cb.value = True
+
+                def deselect_all_categories():
+                    for cb in category_checkboxes.values():
+                        cb.value = False
+
+                ui.button('Select All', icon='check_box', on_click=select_all_categories).props('flat dense')
+                ui.button('Deselect All', icon='check_box_outline_blank', on_click=deselect_all_categories).props('flat dense')
+
+            ui.separator()
+
+            # State selection
+            ui.label('US States').classes('font-semibold mb-2 mt-4')
+            ui.label('Select states to search (click to toggle):').classes('text-sm text-gray-400 mb-2')
+
+            state_checkboxes = {}
+            with ui.grid(columns=10).classes('w-full gap-1 mb-4'):
+                for state in ALL_STATES:
+                    state_checkboxes[state] = ui.checkbox(state, value=False).classes('text-xs')
+
+            # Quick select buttons
+            with ui.row().classes('gap-2 mb-4'):
+                def select_all_states():
+                    for cb in state_checkboxes.values():
+                        cb.value = True
+
+                def deselect_all_states():
+                    for cb in state_checkboxes.values():
+                        cb.value = False
+
+                ui.button('Select All', icon='check_box', on_click=select_all_states).props('flat dense')
+                ui.button('Deselect All', icon='check_box_outline_blank', on_click=deselect_all_states).props('flat dense')
+
+            ui.separator()
+
+            # Pages per pair
+            ui.label('Crawl Settings').classes('font-semibold mb-2 mt-4')
+            pages_input = ui.number(
+                label='Pages Per State (Phase 1)',
+                value=3,
+                min=1,
+                max=50,
+                step=1
+            ).classes('w-64')
+            ui.label('Number of list pages to scrape per category/state pair').classes('text-xs text-gray-400')
+
+        # Phase 1: Discovery
+        with ui.card().classes('w-full mb-4'):
+            ui.label('Phase 1: Discover Businesses').classes('text-xl font-bold mb-4')
+            ui.label('Extract business names, addresses, and phones from HomeAdvisor list pages').classes('text-sm text-gray-400 mb-3')
+
+            # Stats card
+            stats_card = ui.column().classes('w-full mb-4')
+            with stats_card:
+                ui.label('Ready to start').classes('text-lg')
+
+            # Progress bar
+            progress_bar = ui.linear_progress(value=0).classes('w-full mb-4')
+
+            # Control buttons
+            with ui.row().classes('gap-2'):
+                run_button = ui.button('START PHASE 1', icon='play_arrow', color='positive')
+                stop_button = ui.button('STOP', icon='stop', color='negative')
+
+                # Set initial button states based on global discovery state
+                if discovery_state.running:
+                    run_button.disable()
+                    stop_button.enable()
+                else:
+                    run_button.enable()
+                    stop_button.disable()
+
+            # Live output for Phase 1
+            with ui.card().classes('w-full mt-3'):
+                ui.label('Live Output').classes('text-sm font-bold mb-2')
+                log_viewer_phase1 = LiveLogViewer('logs/ha_crawl.log', max_lines=300, auto_scroll=True)
+                log_viewer_phase1.create()
+
+        # Phase 2: URL Finding
+        with ui.card().classes('w-full mb-4'):
+            ui.label('Phase 2: Find External URLs').classes('text-xl font-bold mb-4')
+            ui.label('Search DuckDuckGo to find real external websites for discovered businesses').classes('text-sm text-gray-400 mb-3')
+
+            # URL finder settings
+            ui.label('URL Finder Settings').classes('font-semibold mb-2')
+            url_limit_input = ui.number(
+                label='Max Companies to Process (Phase 2)',
+                value=10,
+                min=1,
+                max=1000,
+                step=10
+            ).classes('w-64 mb-2')
+            ui.label('Limit number of companies to find URLs for (leave small for testing)').classes('text-xs text-gray-400 mb-3')
+
+            # Stats for Phase 2
+            stats_card_phase2 = ui.column().classes('w-full mb-4')
+            with stats_card_phase2:
+                ui.label('Ready to start').classes('text-lg')
+
+            # Progress bar
+            progress_bar_phase2 = ui.linear_progress(value=0).classes('w-full mb-4')
+
+            # Control buttons for Phase 2
+            with ui.row().classes('gap-2'):
+                run_button_phase2 = ui.button('START PHASE 2', icon='search', color='secondary')
+                stop_button_phase2 = ui.button('STOP', icon='stop', color='negative')
+
+                run_button_phase2.enable()
+                stop_button_phase2.disable()
+
+            # Live output for Phase 2
+            with ui.card().classes('w-full mt-3'):
+                ui.label('Live Output').classes('text-sm font-bold mb-2')
+                log_viewer_phase2 = LiveLogViewer('logs/url_finder.log', max_lines=300, auto_scroll=True)
+                log_viewer_phase2.create()
+
+        # Store references
+        discovery_state.log_viewer = log_viewer_phase1
+        discovery_state.log_element = None
+
+        # Run button click handler for Phase 1
+        async def start_phase1():
+            # Get selected categories and states
+            selected_categories = [cat for cat, cb in category_checkboxes.items() if cb.value]
+            selected_states = [state for state, cb in state_checkboxes.items() if cb.value]
+
+            # Validate
+            if not selected_categories:
+                ui.notify('Please select at least one category', type='warning')
+                return
+            if not selected_states:
+                ui.notify('Please select at least one state', type='warning')
+                return
+
+            # Run HomeAdvisor discovery (Phase 1)
+            await run_homeadvisor_discovery(
+                selected_categories,
+                selected_states,
+                int(pages_input.value),
+                stats_card,
+                progress_bar,
+                run_button,
+                stop_button
+            )
+
+        # Run button click handler for Phase 2
+        async def start_phase2():
+            """Start URL finder bot."""
+            run_button_phase2.disable()
+            stop_button_phase2.enable()
+
+            # Start log tailing
+            log_viewer_phase2.load_last_n_lines(50)
+            log_viewer_phase2.start_tailing()
+
+            # Clear stats
+            stats_card_phase2.clear()
+            with stats_card_phase2:
+                ui.label('Finding URLs...').classes('text-lg font-bold')
+                stat_labels_phase2 = {
+                    'found': ui.label('Found: 0'),
+                    'failed': ui.label('Failed: 0'),
+                }
+
+            try:
+                ui.notify('Starting URL finder as subprocess...', type='info')
+
+                # Build command
+                cmd = [
+                    sys.executable,
+                    'cli_find_urls.py',
+                    '--limit', str(int(url_limit_input.value))
+                ]
+
+                # Create subprocess runner
+                job_id = 'url_finder_ha'
+                runner = SubprocessRunner(job_id, 'logs/url_finder.log')
+
+                # Start subprocess
+                pid = runner.start(cmd, cwd=os.getcwd())
+                ui.notify(f'URL finder started with PID {pid}', type='positive')
+
+                # Wait for subprocess to complete
+                while runner.is_running():
+                    await asyncio.sleep(1.0)
+                    # Update progress (estimate based on time)
+                    # Check for cancellation if needed
+
+                # Get final status
+                status = runner.get_status()
+                return_code = status['return_code']
+
+                if return_code == 0:
+                    ui.notify('URL finder completed successfully!', type='positive')
+                else:
+                    ui.notify(f'URL finder exited with code {return_code}', type='negative')
+
+                # Update final stats
+                stats_card_phase2.clear()
+                with stats_card_phase2:
+                    ui.label('URL Finding Complete!').classes('text-lg font-bold text-green-500')
+                    ui.label('Check log output for details').classes('text-sm text-gray-400')
+
+                progress_bar_phase2.value = 1.0
+
+            except Exception as e:
+                ui.notify(f'URL finder failed: {str(e)}', type='negative')
+                stats_card_phase2.clear()
+                with stats_card_phase2:
+                    ui.label('Failed').classes('text-lg font-bold text-red-500')
+                    ui.label(f'Error: {str(e)}').classes('text-sm text-red-400')
+
+            finally:
+                log_viewer_phase2.stop_tailing()
+                run_button_phase2.enable()
+                stop_button_phase2.disable()
+                progress_bar_phase2.value = 0
+
+        run_button.on('click', start_phase1)
+        stop_button.on('click', stop_discovery)
+        run_button_phase2.on('click', start_phase2)
 
 
 def discover_page():

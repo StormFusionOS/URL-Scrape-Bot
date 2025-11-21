@@ -153,7 +153,6 @@ def build_keyword_management_section():
             shared_tab = ui.tab('Shared', icon='public')
             google_tab = ui.tab('Google', icon='map')
             yp_tab = ui.tab('Yellow Pages', icon='menu_book')
-            bing_tab = ui.tab('Bing', icon='search')
 
         with ui.tab_panels(tabs, value=shared_tab).classes('w-full'):
             # SHARED KEYWORDS TAB
@@ -235,20 +234,6 @@ def build_keyword_management_section():
                     description='Additional anti-keywords specific to Yellow Pages (currently unused in code)',
                     color='orange'
                 )
-
-            # BING TAB
-            with ui.tab_panel(bing_tab):
-                ui.label('Bing Local Discovery').classes('text-xl font-bold mb-4')
-                ui.label('Bing uses shared keywords only.').classes(
-                    'text-sm text-gray-400 mb-6'
-                )
-
-                with ui.card().classes('w-full bg-blue-900/10'):
-                    ui.label('ℹ Info').classes('text-lg font-bold mb-2')
-                    ui.label(
-                        'Bing Local discovery inherits all filtering logic from Google Maps, '
-                        'using the shared anti-keywords and positive hints above.'
-                    ).classes('text-sm text-gray-400')
 
 
 def reload_all_keywords():

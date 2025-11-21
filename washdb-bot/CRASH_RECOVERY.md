@@ -122,7 +122,7 @@ PLANNED → IN_PROGRESS → DONE
 Run the migration to add new fields:
 
 ```bash
-psql -U scraper_user -d scraper -f db/migrations/add_yp_crash_recovery_fields.sql
+psql -U washbot -d washbot_db -f db/migrations/add_yp_crash_recovery_fields.sql
 ```
 
 This adds:

@@ -59,7 +59,7 @@ class GoogleFilter:
 
             # Directories and listing sites
             'yelp.com', 'yellowpages.com', 'whitepages.com', 'superpages.com',
-            'mapquest.com', 'angieslist.com', 'thumbtack.com', 'homeadvisor.com',
+            'mapquest.com', 'angieslist.com', 'thumbtack.com',
             'porch.com', 'houzz.com', 'bbb.org', 'manta.com',
 
             # Social media

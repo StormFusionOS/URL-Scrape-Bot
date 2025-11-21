@@ -238,14 +238,6 @@ def upsert_discovered(companies: list[dict]) -> tuple[int, int, int]:
                         existing.reviews_google = company_data["reviews_google"]
                         updated_fields.append("reviews_google")
 
-                    if company_data.get("rating_ha") is not None:
-                        existing.rating_ha = company_data["rating_ha"]
-                        updated_fields.append("rating_ha")
-
-                    if company_data.get("reviews_ha") is not None:
-                        existing.reviews_ha = company_data["reviews_ha"]
-                        updated_fields.append("reviews_ha")
-
                     # Update parse_metadata (merge with existing if present)
                     if parse_metadata:
                         if existing.parse_metadata:
@@ -283,8 +275,6 @@ def upsert_discovered(companies: list[dict]) -> tuple[int, int, int]:
                         reviews_yp=company_data.get("reviews_yp"),
                         rating_google=company_data.get("rating_google"),
                         reviews_google=company_data.get("reviews_google"),
-                        rating_ha=company_data.get("rating_ha"),
-                        reviews_ha=company_data.get("reviews_ha"),
                         parse_metadata=parse_metadata if parse_metadata else None,
                         active=True,
                     )
