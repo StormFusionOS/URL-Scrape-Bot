@@ -1,6 +1,10 @@
 -- Migration: Add SEO Intelligence System Tables
 -- This migration creates 12 tables for AI-powered SEO intelligence tracking
 --
+-- DOCUMENTATION: See ../docs/SCHEMA_REFERENCE.md for complete field descriptions
+-- PDF NOTICE: This schema supersedes Section 3.5 of the internal PDF guide
+--             See ../docs/PDF_DEPRECATION_NOTICE.md for details
+--
 -- Table Groups:
 -- 1. SERP Tracking: search_queries, serp_snapshots, serp_results
 -- 2. Competitor Analysis: competitors, competitor_pages

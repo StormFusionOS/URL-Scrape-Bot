@@ -9,6 +9,8 @@ This module contains core services:
 - user_agent_rotator: User agent rotation for anti-detection
 - proxy_manager: Proxy pool integration
 - las_calculator: Local Authority Score calculation
+- qdrant_manager: Vector database management for semantic search
+- embedding_service: Text chunking and embedding generation
 
 All services support ethical scraping with rate limiting and robots.txt compliance.
 """
@@ -21,6 +23,14 @@ from .user_agent_rotator import UserAgentRotator, get_user_agent_rotator, Device
 from .proxy_manager import ProxyManager, get_proxy_manager
 from .las_calculator import LASCalculator, LASResult, LASComponents, get_las_calculator
 from .change_manager import ChangeManager, ChangeStatus, ChangeType, get_change_manager
+from .qdrant_manager import QdrantManager, get_qdrant_manager
+from .embedding_service import (
+    ContentEmbedder,
+    get_content_embedder,
+    TextChunker,
+    EmbeddingGenerator,
+    extract_main_content
+)
 
 __all__ = [
     "TaskLogger",
@@ -45,4 +55,11 @@ __all__ = [
     "ChangeStatus",
     "ChangeType",
     "get_change_manager",
+    "QdrantManager",
+    "get_qdrant_manager",
+    "ContentEmbedder",
+    "get_content_embedder",
+    "TextChunker",
+    "EmbeddingGenerator",
+    "extract_main_content",
 ]

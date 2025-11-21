@@ -29,7 +29,12 @@ from sqlalchemy.orm import Session
 
 from seo_intelligence.scrapers.base_scraper import BaseScraper
 from seo_intelligence.scrapers.serp_parser import get_serp_parser, SerpSnapshot
-from seo_intelligence.services import get_task_logger, get_content_hasher
+from seo_intelligence.services import (
+    get_task_logger,
+    get_content_hasher,
+    get_content_embedder,
+    get_qdrant_manager
+)
 from runner.logging_setup import get_logger
 
 # Load environment
@@ -51,6 +56,7 @@ class SerpScraper(BaseScraper):
         headless: bool = True,
         use_proxy: bool = True,
         store_raw_html: bool = True,
+        enable_embeddings: bool = True,
     ):
         """
         Initialize SERP scraper.
@@ -59,6 +65,7 @@ class SerpScraper(BaseScraper):
             headless: Run browser in headless mode
             use_proxy: Use proxy pool
             store_raw_html: Store raw HTML in database
+            enable_embeddings: Generate embeddings for SERP snippets
         """
         super().__init__(
             name="serp_scraper",
@@ -73,6 +80,17 @@ class SerpScraper(BaseScraper):
         self.store_raw_html = store_raw_html
         self.parser = get_serp_parser()
         self.hasher = get_content_hasher()
+
+        # Initialize embedding services (per SCRAPER BOT.pdf)
+        self.enable_embeddings = enable_embeddings
+        if self.enable_embeddings:
+            try:
+                self.embedder = get_content_embedder()
+                self.qdrant = get_qdrant_manager()
+                logger.info("✓ Embedding services initialized")
+            except Exception as e:
+                logger.warning(f"Embedding services unavailable: {e}. Continuing without embeddings.")
+                self.enable_embeddings = False
 
         # Database connection
         database_url = os.getenv("DATABASE_URL")
@@ -243,7 +261,8 @@ class SerpScraper(BaseScraper):
             metadata["is_local"] = result.is_local
             metadata["is_ad"] = result.is_ad
 
-            session.execute(
+            # Insert result and get ID back
+            db_result = session.execute(
                 text("""
                     INSERT INTO serp_results (
                         snapshot_id, position, url, title, description,
@@ -252,6 +271,7 @@ class SerpScraper(BaseScraper):
                         :snapshot_id, :position, :url, :title, :description,
                         :domain, :is_our_company, :is_competitor, :competitor_id, :metadata::jsonb
                     )
+                    RETURNING result_id
                 """),
                 {
                     "snapshot_id": snapshot_id,
@@ -266,6 +286,43 @@ class SerpScraper(BaseScraper):
                     "metadata": json.dumps(metadata),
                 }
             )
+            result_id = db_result.fetchone()[0]
+
+            # Generate and store embeddings for snippet (per SCRAPER BOT.pdf)
+            if self.enable_embeddings and result.description:
+                try:
+                    # Embed the snippet text
+                    snippet_embedding = self.embedder.embed_single(result.description)
+
+                    if snippet_embedding:
+                        # Store in Qdrant
+                        self.qdrant.upsert_serp_snippet(
+                            result_id=result_id,
+                            query=snapshot.query,
+                            url=result.url,
+                            title=result.title,
+                            snippet=result.description,
+                            rank=result.position,
+                            vector=snippet_embedding
+                        )
+
+                        # Update database with embedding metadata
+                        session.execute(
+                            text("""
+                                UPDATE serp_results
+                                SET embedding_version = :version,
+                                    embedded_at = NOW()
+                                WHERE result_id = :result_id
+                            """),
+                            {
+                                "version": os.getenv("EMBEDDING_VERSION", "v1.0"),
+                                "result_id": result_id
+                            }
+                        )
+                        logger.debug(f"✓ Embedded SERP snippet for result {result_id}")
+                except Exception as e:
+                    logger.error(f"Failed to embed snippet for result {result_id}: {e}")
+                    # Continue without embeddings
 
         session.commit()
 

@@ -28,7 +28,13 @@ from sqlalchemy.orm import Session
 
 from seo_intelligence.scrapers.base_scraper import BaseScraper
 from seo_intelligence.scrapers.competitor_parser import get_competitor_parser, PageMetrics
-from seo_intelligence.services import get_task_logger, get_content_hasher
+from seo_intelligence.services import (
+    get_task_logger,
+    get_content_hasher,
+    get_content_embedder,
+    get_qdrant_manager,
+    extract_main_content
+)
 from runner.logging_setup import get_logger
 
 # Load environment
@@ -50,6 +56,7 @@ class CompetitorCrawler(BaseScraper):
         headless: bool = True,
         use_proxy: bool = True,
         max_pages_per_site: int = 10,
+        enable_embeddings: bool = True,
     ):
         """
         Initialize competitor crawler.
@@ -58,6 +65,7 @@ class CompetitorCrawler(BaseScraper):
             headless: Run browser in headless mode
             use_proxy: Use proxy pool
             max_pages_per_site: Maximum pages to crawl per competitor
+            enable_embeddings: Enable Qdrant embedding generation (per SCRAPER BOT.pdf)
         """
         super().__init__(
             name="competitor_crawler",
@@ -72,6 +80,17 @@ class CompetitorCrawler(BaseScraper):
         self.max_pages_per_site = max_pages_per_site
         self.parser = get_competitor_parser()
         self.hasher = get_content_hasher()
+        self.enable_embeddings = enable_embeddings
+
+        # Initialize embedding services if enabled
+        if self.enable_embeddings:
+            try:
+                self.embedder = get_content_embedder()
+                self.qdrant = get_qdrant_manager()
+                logger.info("✓ Embedding services initialized")
+            except Exception as e:
+                logger.warning(f"Embedding services unavailable: {e}. Continuing without embeddings.")
+                self.enable_embeddings = False
 
         # Database connection
         database_url = os.getenv("DATABASE_URL")
@@ -220,7 +239,53 @@ class CompetitorCrawler(BaseScraper):
         )
         session.commit()
 
-        return result.fetchone()[0]
+        page_id = result.fetchone()[0]
+
+        # Generate and store embeddings (per SCRAPER BOT.pdf)
+        if self.enable_embeddings:
+            try:
+                # Extract main content from HTML
+                main_text = extract_main_content(html)
+
+                if main_text and len(main_text.strip()) > 50:  # Only embed if substantial content
+                    # Generate embeddings
+                    chunks, embeddings = self.embedder.embed_content(main_text)
+
+                    if chunks and embeddings:
+                        # Store first chunk embedding in Qdrant (per spec)
+                        self.qdrant.upsert_competitor_page(
+                            page_id=page_id,
+                            site_id=competitor_id,
+                            url=metrics.url,
+                            title=metrics.title or "",
+                            page_type=metrics.page_type,
+                            vector=embeddings[0]
+                        )
+
+                        # Update database with embedding metadata
+                        session.execute(
+                            text("""
+                                UPDATE competitor_pages
+                                SET embedding_version = :version,
+                                    embedded_at = NOW(),
+                                    embedding_chunk_count = :chunk_count
+                                WHERE page_id = :page_id
+                            """),
+                            {
+                                "version": os.getenv("EMBEDDING_VERSION", "v1.0"),
+                                "chunk_count": len(chunks),
+                                "page_id": page_id
+                            }
+                        )
+                        session.commit()
+                        logger.info(f"✓ Embedded page {page_id} ({len(chunks)} chunks, {len(main_text)} chars)")
+                else:
+                    logger.debug(f"Skipping embedding for page {page_id} - insufficient content")
+            except Exception as e:
+                logger.error(f"Failed to generate embeddings for page {page_id}: {e}")
+                # Continue without embeddings - don't fail the entire save operation
+
+        return page_id
 
     def _discover_pages(self, base_url: str, html: str) -> List[str]:
         """
