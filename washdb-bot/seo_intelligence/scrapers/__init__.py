@@ -20,6 +20,7 @@ from .competitor_parser import CompetitorParser, PageMetrics, get_competitor_par
 from .competitor_crawler import CompetitorCrawler, get_competitor_crawler
 from .backlink_crawler import BacklinkCrawler, get_backlink_crawler
 from .citation_crawler import CitationCrawler, CitationResult, BusinessInfo, get_citation_crawler
+from .technical_auditor import TechnicalAuditor, AuditResult, AuditIssue, get_technical_auditor
 
 __all__ = [
     "BaseScraper",
@@ -40,4 +41,8 @@ __all__ = [
     "CitationResult",
     "BusinessInfo",
     "get_citation_crawler",
+    "TechnicalAuditor",
+    "AuditResult",
+    "AuditIssue",
+    "get_technical_auditor",
 ]
