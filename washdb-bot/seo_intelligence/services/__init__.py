@@ -20,6 +20,7 @@ from .content_hasher import ContentHasher, get_content_hasher
 from .user_agent_rotator import UserAgentRotator, get_user_agent_rotator, DeviceType
 from .proxy_manager import ProxyManager, get_proxy_manager
 from .las_calculator import LASCalculator, LASResult, LASComponents, get_las_calculator
+from .change_manager import ChangeManager, ChangeStatus, ChangeType, get_change_manager
 
 __all__ = [
     "TaskLogger",
@@ -40,4 +41,8 @@ __all__ = [
     "LASResult",
     "LASComponents",
     "get_las_calculator",
+    "ChangeManager",
+    "ChangeStatus",
+    "ChangeType",
+    "get_change_manager",
 ]
