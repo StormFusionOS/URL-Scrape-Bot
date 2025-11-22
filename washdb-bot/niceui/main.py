@@ -53,6 +53,10 @@ def register_pages():
     router.register('local_competitors', pages.local_competitors_page)
     router.register('dev_tools', pages.dev_tools_page)
     router.register('testing', pages.testing_page)
+    router.register('scraper_review', pages.scraper_review_page)
+    router.register('serp_runner', pages.serp_runner_page)
+    router.register('citation_runner', pages.citation_runner_page)
+    router.register('backlink_runner', pages.backlink_runner_page)
 
 
 def create_app():

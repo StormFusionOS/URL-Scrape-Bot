@@ -136,8 +136,8 @@ class DomainQuarantine:
         # Used to detect repeated 429s or 5xxs
         self._error_events: Dict[str, List[tuple[datetime, str]]] = {}
 
-        # Thread lock for concurrent access
-        self._lock = threading.Lock()
+        # Thread lock for concurrent access (reentrant to allow nested calls)
+        self._lock = threading.RLock()
 
         self.logger.info("DomainQuarantine initialized")
 

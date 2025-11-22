@@ -78,9 +78,9 @@ def url_canonicalizer():
 @pytest.fixture(scope="function")
 def domain_quarantine():
     """Provide domain quarantine service with clean state."""
-    quar = get_domain_quarantine()
-    # Clear all quarantines for clean test state
-    quar.clear_all()
+    # Create a fresh instance for each test to avoid singleton lock contention
+    from seo_intelligence.services.domain_quarantine import DomainQuarantine
+    quar = DomainQuarantine()
     return quar
 
 

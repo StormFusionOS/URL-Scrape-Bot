@@ -28,7 +28,7 @@ from sqlalchemy import create_engine, text, select
 from sqlalchemy.orm import Session
 
 from seo_intelligence.scrapers.base_scraper import BaseScraper
-from seo_intelligence.services import get_task_logger
+from seo_intelligence.services import get_task_logger, get_change_manager
 from runner.logging_setup import get_logger
 from db.models import Company, BusinessSource
 
@@ -631,6 +631,44 @@ class CitationCrawler(BaseScraper):
                 except Exception as bs_error:
                     logger.warning(f"Failed to create BusinessSource for {business.name}: {bs_error}")
 
+            # Propose change for NAP mismatches (governance integration)
+            if result.nap_score < 0.5 and result.is_listed:
+                try:
+                    change_manager = get_change_manager()
+                    change_manager.propose_change(
+                        change_type='citation_update',
+                        entity_type='directory',
+                        entity_id=f"{result.directory}:{business.name}",
+                        proposed_value={
+                            'listing_url': result.listing_url,
+                            'directory': result.directory,
+                        },
+                        current_value={
+                            'nap_score': result.nap_score,
+                            'name_match': result.name_match,
+                            'address_match': result.address_match,
+                            'phone_match': result.phone_match,
+                        },
+                        reason=f"NAP inconsistency detected on {result.directory} (score: {result.nap_score:.2f})",
+                        priority='medium',
+                        source='citation_crawler',
+                        metadata={
+                            'citation_id': row[0],
+                            'business_name': business.name,
+                            'directory_name': result.directory,
+                            'listing_url': result.listing_url,
+                            'nap_score': result.nap_score,
+                            'mismatches': {
+                                'name': not result.name_match,
+                                'address': not result.address_match,
+                                'phone': not result.phone_match,
+                            }
+                        }
+                    )
+                    logger.info(f"Proposed NAP fix for {business.name} on {result.directory} (score: {result.nap_score:.2f})")
+                except Exception as e:
+                    logger.error(f"Error proposing citation change for {business.name}: {e}")
+
             session.commit()
             return row[0]
 
@@ -673,9 +711,50 @@ class CitationCrawler(BaseScraper):
             except Exception as bs_error:
                 logger.warning(f"Failed to create BusinessSource for {business.name}: {bs_error}")
 
+        # Get the new citation_id before commit (for change proposal)
+        citation_id = new_result.fetchone()[0]
+
+        # Propose change for NAP mismatches (governance integration)
+        if result.nap_score < 0.5 and result.is_listed:
+            try:
+                change_manager = get_change_manager()
+                change_manager.propose_change(
+                    change_type='citation_update',
+                    entity_type='directory',
+                    entity_id=f"{result.directory}:{business.name}",
+                    proposed_value={
+                        'listing_url': result.listing_url,
+                        'directory': result.directory,
+                    },
+                    current_value={
+                        'nap_score': result.nap_score,
+                        'name_match': result.name_match,
+                        'address_match': result.address_match,
+                        'phone_match': result.phone_match,
+                    },
+                    reason=f"NAP inconsistency detected on {result.directory} (score: {result.nap_score:.2f})",
+                    priority='medium',
+                    source='citation_crawler',
+                    metadata={
+                        'citation_id': citation_id,
+                        'business_name': business.name,
+                        'directory_name': result.directory,
+                        'listing_url': result.listing_url,
+                        'nap_score': result.nap_score,
+                        'mismatches': {
+                            'name': not result.name_match,
+                            'address': not result.address_match,
+                            'phone': not result.phone_match,
+                        }
+                    }
+                )
+                logger.info(f"Proposed NAP fix for {business.name} on {result.directory} (score: {result.nap_score:.2f})")
+            except Exception as e:
+                logger.error(f"Error proposing citation change for {business.name}: {e}")
+
         session.commit()
 
-        return new_result.fetchone()[0]
+        return citation_id
 
     def check_directory(
         self,
