@@ -33,6 +33,7 @@ class TestingPageState:
         self.running = False
         self.current_suite: Optional[str] = None
         self.current_filter: str = 'All Tests'
+        self.active_tab_suite: str = 'environment'  # Track which tab is active
 
         # Parser
         self.parser = PytestOutputParser()
@@ -541,11 +542,8 @@ def testing_page():
                 'Verify database schema, service imports, connectivity, and configuration'
             )
 
-            # Update run button for this suite
-            def set_env_suite():
-                state.run_button.on('click', lambda: asyncio.create_task(run_test_suite('environment')))
-
-            tab_env.on('click', set_env_suite)
+            # Update active suite when tab is clicked
+            tab_env.on('click', lambda: setattr(state, 'active_tab_suite', 'environment'))
 
         # Safety Tests Tab
         with ui.tab_panel(tab_safety):
@@ -555,10 +553,8 @@ def testing_page():
                 'Robots.txt compliance, rate limiting, quarantine, CAPTCHA detection, ethical crawling'
             )
 
-            def set_safety_suite():
-                state.run_button.on('click', lambda: asyncio.create_task(run_test_suite('safety')))
-
-            tab_safety.on('click', set_safety_suite)
+            # Update active suite when tab is clicked
+            tab_safety.on('click', lambda: setattr(state, 'active_tab_suite', 'safety'))
 
         # Acceptance Tests Tab
         with ui.tab_panel(tab_acceptance):
@@ -568,10 +564,8 @@ def testing_page():
                 'SERP scraper, competitor crawler, citations, backlinks, review mode workflows'
             )
 
-            def set_acceptance_suite():
-                state.run_button.on('click', lambda: asyncio.create_task(run_test_suite('acceptance')))
-
-            tab_acceptance.on('click', set_acceptance_suite)
+            # Update active suite when tab is clicked
+            tab_acceptance.on('click', lambda: setattr(state, 'active_tab_suite', 'acceptance'))
 
         # Run All Tests Tab
         with ui.tab_panel(tab_all):
@@ -581,13 +575,11 @@ def testing_page():
                 'Run all test modules (environment, safety, acceptance)'
             )
 
-            def set_all_suite():
-                state.run_button.on('click', lambda: asyncio.create_task(run_test_suite('all')))
+            # Update active suite when tab is clicked
+            tab_all.on('click', lambda: setattr(state, 'active_tab_suite', 'all'))
 
-            tab_all.on('click', set_all_suite)
-
-    # Initialize default suite
-    state.run_button.on('click', lambda: asyncio.create_task(run_test_suite('environment')))
+    # Initialize run button with single handler that uses active_tab_suite
+    state.run_button.on('click', lambda: asyncio.create_task(run_test_suite(state.active_tab_suite)))
 
     # Live Log Viewer
     with ui.card().classes('w-full mb-4'):
