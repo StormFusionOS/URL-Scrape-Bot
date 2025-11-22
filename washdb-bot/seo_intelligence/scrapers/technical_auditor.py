@@ -34,7 +34,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from seo_intelligence.scrapers.base_scraper import BaseScraper
-from seo_intelligence.services import get_task_logger
+from seo_intelligence.services import get_task_logger, get_change_manager
 from runner.logging_setup import get_logger
 
 # Load environment
@@ -715,6 +715,57 @@ class TechnicalAuditor(BaseScraper):
                     "issue_metadata": json.dumps(issue.metadata),
                 }
             )
+
+        # Propose fixes for critical/high severity actionable issues
+        # Define issue types that can be automatically fixed or flagged for review
+        actionable_issue_types = [
+            'http_only',                # HTTP → HTTPS redirect
+            'missing_canonical',         # Add canonical tag
+            'missing_meta_description',  # Generate meta description
+            'missing_alt_text',          # Flag for content team
+            'broken_link',               # Update or remove link
+            'missing_viewport',          # Add viewport meta tag
+            'missing_h1',                # Add H1 tag
+            'duplicate_h1',              # Fix duplicate H1s
+        ]
+
+        critical_high_issues = [
+            issue for issue in result.issues
+            if issue.severity in ['critical', 'high'] and issue.issue_type in actionable_issue_types
+        ]
+
+        if critical_high_issues:
+            try:
+                change_manager = get_change_manager()
+                for issue in critical_high_issues:
+                    # Propose change for each actionable issue
+                    change_manager.propose_change(
+                        change_type='audit_fix',
+                        entity_type='page',
+                        entity_id=result.url,
+                        proposed_value={
+                            'fix': issue.issue_type,
+                            'element': issue.affected_element[:200] if issue.affected_element else None,
+                            'recommendation': issue.recommendation
+                        },
+                        current_value={
+                            'issue': issue.description,
+                            'severity': issue.severity,
+                            'category': issue.category
+                        },
+                        reason=f"{issue.severity.upper()}: {issue.description}",
+                        priority='high' if issue.severity == 'critical' else 'medium',
+                        source='technical_auditor',
+                        metadata={
+                            'audit_id': audit_id,
+                            'issue_type': issue.issue_type,
+                            'category': issue.category,
+                            'url': result.url
+                        }
+                    )
+                    logger.info(f"Proposed change for {issue.issue_type} on {result.url}")
+            except Exception as e:
+                logger.error(f"Error proposing changes for audit {audit_id}: {e}")
 
         session.commit()
         return audit_id

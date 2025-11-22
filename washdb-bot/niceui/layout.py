@@ -130,6 +130,10 @@ class AppLayout:
             ui.label('SEO INTELLIGENCE').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
             seo_items = [
                 {'name': 'SEO Intel', 'icon': 'insights', 'page': 'seo_intelligence'},
+                {'name': 'Scraper Review', 'icon': 'analytics', 'page': 'scraper_review'},
+                {'name': 'Run SERP', 'icon': 'search', 'page': 'serp_runner'},
+                {'name': 'Run Citations', 'icon': 'fact_check', 'page': 'citation_runner'},
+                {'name': 'Run Backlinks', 'icon': 'link', 'page': 'backlink_runner'},
                 {'name': 'Local Competitors', 'icon': 'groups', 'page': 'local_competitors'},
                 {'name': 'Database', 'icon': 'dns', 'page': 'seo_database'},
                 {'name': 'Dev Tools', 'icon': 'build', 'page': 'dev_tools'},
@@ -192,6 +196,10 @@ class AppLayout:
         ui.label('SEO INTELLIGENCE').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
         seo_items = [
             {'name': 'SEO Intel', 'icon': 'insights', 'page': 'seo_intelligence'},
+            {'name': 'Scraper Review', 'icon': 'analytics', 'page': 'scraper_review'},
+            {'name': 'Run SERP', 'icon': 'search', 'page': 'serp_runner'},
+            {'name': 'Run Citations', 'icon': 'fact_check', 'page': 'citation_runner'},
+            {'name': 'Run Backlinks', 'icon': 'link', 'page': 'backlink_runner'},
             {'name': 'Local Competitors', 'icon': 'groups', 'page': 'local_competitors'},
             {'name': 'Database', 'icon': 'dns', 'page': 'seo_database'},
             {'name': 'Dev Tools', 'icon': 'build', 'page': 'dev_tools'},
