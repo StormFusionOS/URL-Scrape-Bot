@@ -10,6 +10,8 @@ from .logs import logs_page
 from .status import status_page
 from .settings import settings_page
 from .scheduler import scheduler_page
+from .diagnostics import diagnostics_page
+from .run_history import run_history_page
 from .seo_intelligence import seo_intelligence_page
 from .seo_database import seo_database_page
 from .local_competitors import local_competitors_page
@@ -20,6 +22,7 @@ from .serp_runner import serp_runner_page
 from .citation_runner import citation_runner_page
 from .backlink_runner import backlink_runner_page
 from .yp_discover import yp_discover_page
+from .verification import verification_page
 
 __all__ = [
     'dashboard_page',
@@ -29,6 +32,8 @@ __all__ = [
     'status_page',
     'settings_page',
     'scheduler_page',
+    'diagnostics_page',
+    'run_history_page',
     'seo_intelligence_page',
     'seo_database_page',
     'local_competitors_page',
@@ -39,4 +44,5 @@ __all__ = [
     'citation_runner_page',
     'backlink_runner_page',
     'yp_discover_page',
+    'verification_page',
 ]

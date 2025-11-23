@@ -1,10 +1,16 @@
-# 🚀 START HERE: Yellow Pages City-First Scraper
+# 🚀 START HERE
 
 **Status**: ✅ **DEPLOYED AND READY TO USE**
 
+## Quick Navigation
+
+- **New to the project?** → See **[docs/QUICKSTART-dev.md](docs/QUICKSTART-dev.md)** for complete setup
+- **Want the dashboard?** → Run `./scripts/dev/run-gui.sh` or `python niceui/main.py`
+- **Just want to scrape?** → Follow the 2-step guide below
+
 ---
 
-## Getting Started in 2 Steps
+## Yellow Pages Scraper: Getting Started in 2 Steps
 
 ### Step 1: Generate Targets
 

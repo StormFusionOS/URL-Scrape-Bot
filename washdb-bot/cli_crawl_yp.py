@@ -29,6 +29,7 @@ from sqlalchemy.orm import sessionmaker
 
 from db.save_discoveries import upsert_discovered
 from runner.logging_setup import get_logger
+from runner.safety import create_safety_limits_from_env, create_rate_limiter_from_env
 from scrape_yp.yp_crawl_city_first import crawl_city_targets
 
 # Load environment variables
@@ -173,6 +174,10 @@ Note: City-first is now the DEFAULT approach. For old state-first behavior,
             print(f"  (will process {args.max_targets} of {target_count})")
         print()
 
+        # Initialize safety limits
+        safety = create_safety_limits_from_env()
+        limiter = create_rate_limiter_from_env()
+
         # Run crawler
         total_results_saved = 0
         total_targets_processed = 0
@@ -190,6 +195,18 @@ Note: City-first is now the DEFAULT approach. For old state-first behavior,
             use_monitoring=not args.disable_monitoring,
             use_adaptive_rate_limiting=not args.disable_adaptive_rate_limiting,
         ):
+            # Check safety limits before processing
+            if not safety.check_should_continue():
+                logger.warning("Safety limit reached, stopping crawler")
+                break
+
+            # Apply rate limiting
+            import time
+            delay = limiter.get_delay()
+            if delay > 0:
+                logger.debug(f"Rate limit delay: {delay:.1f}s")
+                time.sleep(delay)
+
             target = batch['target']
             results = batch['results']
             stats = batch['stats']
@@ -197,6 +214,9 @@ Note: City-first is now the DEFAULT approach. For old state-first behavior,
             total_targets_processed += 1
             if stats.get('early_exit'):
                 total_early_exits += 1
+
+            # Record page processed
+            safety.record_page_processed()
 
             if results and not args.dry_run:
                 # Save to database
@@ -207,11 +227,28 @@ Note: City-first is now the DEFAULT approach. For old state-first behavior,
                     logger.info(
                         f"Saved: {inserted} new, {updated} updated, {skipped} skipped"
                     )
+
+                    # Record success
+                    safety.record_success()
+                    limiter.record_success()
+
                 except Exception as e:
                     logger.error(f"Failed to save results: {e}")
                     total_errors += 1
+
+                    # Record failure
+                    safety.record_failure(str(e))
+                    limiter.record_failure()
+
             elif results:
                 logger.info(f"Dry run: would have saved {len(results)} results")
+                # Count dry run as success
+                safety.record_success()
+                limiter.record_success()
+            else:
+                # No results - record as failure
+                safety.record_failure("No results found for target")
+                limiter.record_failure()
 
         # Final summary
         print()
@@ -226,16 +263,32 @@ Note: City-first is now the DEFAULT approach. For old state-first behavior,
         print(f"Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("=" * 80)
 
+        # Log safety limits summary
+        print()
+        safety.log_summary()
+
         return 0
 
     except KeyboardInterrupt:
         print("\n\nCrawl interrupted by user (Ctrl+C)")
         logger.warning("Crawl interrupted by user")
+
+        # Log safety summary even on interruption
+        if 'safety' in locals():
+            print()
+            safety.log_summary()
+
         return 130
 
     except Exception as e:
         print(f"\n\nError: {e}")
         logger.error(f"Crawl failed: {e}", exc_info=True)
+
+        # Log safety summary even on error
+        if 'safety' in locals():
+            print()
+            safety.log_summary()
+
         return 1
 
     finally:
