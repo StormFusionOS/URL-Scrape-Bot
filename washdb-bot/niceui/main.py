@@ -52,6 +52,7 @@ def register_pages():
     router.register('settings', pages.settings_page)
     router.register('seo_intelligence', pages.seo_intelligence_page)
     router.register('seo_database', pages.seo_database_page)
+    router.register('seo_review_queue', pages.seo_review_queue_page)
     router.register('local_competitors', pages.local_competitors_page)
     router.register('dev_tools', pages.dev_tools_page)
     router.register('testing', pages.testing_page)

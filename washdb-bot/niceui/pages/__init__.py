@@ -14,6 +14,7 @@ from .diagnostics import diagnostics_page
 from .run_history import run_history_page
 from .seo_intelligence import seo_intelligence_page
 from .seo_database import seo_database_page
+from .seo_review_queue import seo_review_queue_page
 from .local_competitors import local_competitors_page
 from .dev_tools import dev_tools_page
 from .testing import testing_page
@@ -36,6 +37,7 @@ __all__ = [
     'run_history_page',
     'seo_intelligence_page',
     'seo_database_page',
+    'seo_review_queue_page',
     'local_competitors_page',
     'dev_tools_page',
     'testing_page',
