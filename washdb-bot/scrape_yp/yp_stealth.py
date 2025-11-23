@@ -150,17 +150,50 @@ def human_delay(min_seconds: float = 2.0, max_seconds: float = 5.0, jitter: floa
     time.sleep(delay)
 
 
+def get_enhanced_http_headers(user_agent: str = None) -> Dict[str, str]:
+    """
+    Generate enhanced HTTP headers with Sec-Ch-Ua (Google-level).
+
+    Args:
+        user_agent: Optional user agent (if None, generates random one)
+
+    Returns:
+        Dict of HTTP headers
+    """
+    if user_agent is None:
+        user_agent = get_random_user_agent()
+
+    return {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "max-age=0",
+        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "User-Agent": user_agent,
+    }
+
+
 def get_playwright_context_params() -> Dict[str, Any]:
     """
-    Get randomized Playwright context parameters for anti-detection.
+    Get randomized Playwright context parameters for anti-detection (Google-level).
+
+    Note: Headers and init scripts are applied separately via apply_stealth()
 
     Returns:
         Dict of parameters to pass to browser.new_context()
     """
     width, height = get_random_viewport()
+    user_agent = get_random_user_agent()
 
     return {
-        'user_agent': get_random_user_agent(),
+        'user_agent': user_agent,
         'viewport': {'width': width, 'height': height},
         'locale': 'en-US',
         'timezone_id': get_random_timezone(),
@@ -456,3 +489,224 @@ def randomize_operation_order(operations: list) -> list:
     random.shuffle(shuffled)
 
     return shuffled
+
+
+# ===== GOOGLE-LEVEL ANTI-DETECTION FUNCTIONS =====
+# Advanced human behavior simulation adapted from Google scraper
+
+
+def random_mouse_movement(page):
+    """
+    Simulate random mouse movements on the page (sync version).
+
+    Args:
+        page: Playwright page (sync)
+    """
+    try:
+        viewport = page.viewport_size
+        if not viewport:
+            return
+
+        # Move mouse to a few random positions
+        num_movements = random.randint(2, 5)
+        for _ in range(num_movements):
+            x = random.randint(100, viewport["width"] - 100)
+            y = random.randint(100, viewport["height"] - 100)
+
+            # Move mouse with human-like curve
+            page.mouse.move(x, y)
+            time.sleep(random.uniform(0.05, 0.2))
+    except Exception:
+        pass  # Silently fail if mouse movement fails
+
+
+def human_like_type(page, selector: str, text: str):
+    """
+    Type text in a human-like manner with variable delays (sync version).
+
+    Args:
+        page: Playwright page (sync)
+        selector: CSS selector for input element
+        text: Text to type
+    """
+    try:
+        element = page.query_selector(selector)
+        if not element:
+            return
+
+        element.click()
+        time.sleep(random.uniform(0.2, 0.5))
+
+        for char in text:
+            element.type(char, delay=random.uniform(80, 200))
+
+            # Occasionally add longer pauses (like thinking)
+            if random.random() < 0.1:
+                time.sleep(random.uniform(0.3, 0.8))
+    except Exception:
+        pass  # Silently fail
+
+
+def random_page_interactions(page):
+    """
+    Perform random human-like interactions on the page (sync version).
+
+    Args:
+        page: Playwright page (sync)
+    """
+    try:
+        # Random mouse movements
+        if random.random() < 0.7:
+            random_mouse_movement(page)
+
+        # Small random scroll
+        if random.random() < 0.5:
+            small_scroll = random.randint(50, 200)
+            page.evaluate(f"window.scrollBy(0, {small_scroll})")
+            time.sleep(random.uniform(0.1, 0.3))
+    except Exception:
+        pass  # Silently fail
+
+
+def check_for_captcha(page) -> bool:
+    """
+    Check if a CAPTCHA is present on the page (sync version).
+
+    Args:
+        page: Playwright page (sync)
+
+    Returns:
+        True if CAPTCHA detected, False otherwise
+    """
+    try:
+        # Check for common CAPTCHA indicators
+        captcha_selectors = [
+            'iframe[src*="recaptcha"]',
+            'iframe[src*="captcha"]',
+            '[class*="captcha"]',
+            '[id*="captcha"]',
+            '[class*="recaptcha"]',
+            '[id*="recaptcha"]',
+            'div[role="presentation"]',  # Google CAPTCHA
+        ]
+
+        for selector in captcha_selectors:
+            element = page.query_selector(selector)
+            if element:
+                return True
+
+        # Check page text for CAPTCHA-related text
+        page_text = page.text_content('body') or ""
+        captcha_keywords = [
+            "verify you're not a robot",
+            "prove you're not a robot",
+            "captcha",
+            "unusual traffic",
+            "automated requests",
+            "security check",
+        ]
+
+        for keyword in captcha_keywords:
+            if keyword.lower() in page_text.lower():
+                return True
+
+        return False
+    except Exception:
+        return False
+
+
+def human_like_scroll(page, distance: int = None):
+    """
+    Simulate human-like scrolling behavior (sync version).
+
+    Args:
+        page: Playwright page (sync)
+        distance: Distance to scroll (if None, scroll by random amount)
+    """
+    try:
+        if distance is None:
+            distance = random.randint(300, 800)
+
+        # Scroll in small increments with delays (like a human)
+        scroll_steps = random.randint(3, 8)
+        step_size = distance // scroll_steps
+
+        for _ in range(scroll_steps):
+            page.evaluate(f"window.scrollBy(0, {step_size})")
+            time.sleep(random.uniform(0.1, 0.3))
+
+        # Random pause after scrolling
+        time.sleep(random.uniform(0.5, 1.5))
+    except Exception:
+        pass  # Silently fail
+
+
+def human_like_delay(min_ms: int = 100, max_ms: int = 500):
+    """
+    Add human-like random delay for micro-interactions (sync version).
+
+    Args:
+        min_ms: Minimum delay in milliseconds
+        max_ms: Maximum delay in milliseconds
+    """
+    delay_ms = random.uniform(min_ms, max_ms)
+    time.sleep(delay_ms / 1000)
+
+
+def wait_with_jitter(seconds: int, jitter: float = 0.2):
+    """
+    Wait for specified seconds with random jitter (sync version).
+
+    Args:
+        seconds: Base wait time in seconds
+        jitter: Jitter factor (0.0 to 1.0)
+    """
+    jitter_amount = seconds * jitter * random.uniform(-1, 1)
+    actual_wait = seconds + jitter_amount
+    time.sleep(max(0.1, actual_wait))
+
+
+def random_delay_range(base_min: int, base_max: int, variance: float = 0.3) -> Tuple[int, int]:
+    """
+    Add randomness to delay ranges.
+
+    Args:
+        base_min: Base minimum delay
+        base_max: Base maximum delay
+        variance: Variance factor (0.0 to 1.0)
+
+    Returns:
+        Tuple of (min_delay, max_delay) with randomness applied
+    """
+    variance_min = base_min * variance
+    variance_max = base_max * variance
+
+    new_min = int(base_min + random.uniform(-variance_min, variance_min))
+    new_max = int(base_max + random.uniform(-variance_max, variance_max))
+
+    # Ensure min < max
+    return (min(new_min, new_max), max(new_min, new_max))
+
+
+def apply_stealth(context):
+    """
+    Apply stealth measures to browser context (sync version).
+
+    This is the CRITICAL function that actually injects anti-detection JavaScript.
+
+    Args:
+        context: Playwright browser context (sync)
+    """
+    try:
+        # Get enhanced headers
+        headers = get_enhanced_http_headers()
+        context.set_extra_http_headers(headers)
+
+        # Apply all init scripts
+        scripts = get_enhanced_playwright_init_scripts()
+        for script in scripts:
+            context.add_init_script(script)
+
+    except Exception as e:
+        # Don't fail the whole scraper if stealth fails
+        pass

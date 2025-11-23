@@ -86,6 +86,7 @@ class AppLayout:
             # Control buttons
             ui.button('Run', icon='play_arrow', color='positive', on_click=self._on_run).props('outline')
             ui.button('Stop', icon='stop', color='negative', on_click=self._on_stop).props('outline').classes('ml-2')
+            ui.button('Restart GUI', icon='refresh', color='warning', on_click=self._on_restart).props('outline').classes('ml-2')
 
             # Theme toggle (dark mode is default, but allow toggle)
             ui.button(icon='brightness_6', on_click=ui.dark_mode().toggle).props('flat color=white').classes('ml-2')
@@ -245,6 +246,34 @@ class AppLayout:
         """Handle stop button click - broadcast event."""
         event_bus.publish('request_stop')
         ui.notify('Stop requested', type='warning', position='top')
+
+    def _on_restart(self):
+        """Handle restart button click - restart the entire GUI."""
+        import subprocess
+        import sys
+
+        ui.notify('Restarting GUI...', type='info', position='top')
+
+        # Get the current process ID
+        current_pid = os.getpid()
+
+        # Start a new instance in the background
+        subprocess.Popen(
+            ['./venv/bin/python', '-m', 'niceui.main'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+
+        # Schedule the current process to exit after a short delay
+        # This gives time for the notification to show and the new process to start
+        def delayed_exit():
+            import time
+            time.sleep(2)
+            os.kill(current_pid, 9)
+
+        import threading
+        threading.Thread(target=delayed_exit, daemon=True).start()
 
     def create_busy_overlay(self):
         """Create busy overlay (initially hidden)."""

@@ -57,6 +57,7 @@ def register_pages():
     router.register('serp_runner', pages.serp_runner_page)
     router.register('citation_runner', pages.citation_runner_page)
     router.register('backlink_runner', pages.backlink_runner_page)
+    router.register('yp_discover', pages.yp_discover_page)
 
 
 def create_app():

@@ -1,5 +1,5 @@
 """
-Discovery page - configure and run URL discovery from multiple sources with real-time progress.
+Yellow Pages Discovery page - configure and run YP discovery with 5-worker system and real-time progress.
 """
 
 from nicegui import ui, run
@@ -11,7 +11,7 @@ from datetime import datetime
 import asyncio
 import sys
 import os
-from scrape_yp.state_assignments import get_states_for_worker, get_proxy_assignments
+from scrape_yp.state_assignments_5worker import get_states_for_worker, get_proxy_assignments
 from typing import Dict, Optional
 
 
@@ -91,7 +91,7 @@ class WorkerState:
 
 class MultiWorkerState:
     """Global state for multi-worker system."""
-    def __init__(self, num_workers: int = 10):
+    def __init__(self, num_workers: int = 5):
         self.num_workers = num_workers
         self.workers: Dict[int, WorkerState] = {}
         self.running = False
@@ -460,349 +460,7 @@ async def run_yellow_pages_discovery(
 
 
 
-async def run_google_maps_discovery(
-    query,
-    location,
-    max_results,
-    scrape_details,
-    stats_card,
-    progress_bar,
-    run_button,
-    stop_button
-):
-    """Run Google Maps discovery in background with progress updates."""
-    discovery_state.running = True
-    discovery_state.reset()
-    discovery_state.start_time = datetime.now()
-
-    # Register job in process manager
-    job_id = 'discovery_google'
-    process_manager.register(job_id, 'Google Discovery', log_file='logs/google_scrape.log')
-
-    # Disable run button, enable stop button
-    run_button.disable()
-    stop_button.enable()
-
-    # Start tailing log file
-    if discovery_state.log_viewer:
-        discovery_state.log_viewer.load_last_n_lines(50)
-        discovery_state.log_viewer.start_tailing()
-
-    # Add initial log messages
-    discovery_state.add_log('=' * 60, 'info')
-    discovery_state.add_log('GOOGLE MAPS DISCOVERY STARTED', 'success')
-    discovery_state.add_log('=' * 60, 'info')
-    discovery_state.add_log(f'Query: {query}', 'info')
-    discovery_state.add_log(f'Location: {location or "Not specified"}', 'info')
-    discovery_state.add_log(f'Max Results: {max_results}', 'info')
-    discovery_state.add_log(f'Scrape Details: {scrape_details}', 'info')
-    discovery_state.add_log('-' * 60, 'info')
-
-    # Clear stats
-    stats_card.clear()
-    with stats_card:
-        ui.label('Running discovery...').classes('text-lg font-bold')
-        stat_labels = {
-            'found': ui.label('Found: 0'),
-            'saved': ui.label('Saved: 0'),
-            'duplicates': ui.label('Duplicates: 0')
-        }
-
-    try:
-        ui.notify('Starting Google Maps scraper as subprocess...', type='info')
-
-        # Build command for subprocess
-        cmd = [
-            sys.executable,
-            'cli_crawl_google.py',
-            '--query', query,
-            '--location', location,
-            '--max-results', str(max_results)
-        ]
-
-        if scrape_details:
-            cmd.append('--scrape-details')
-
-        # Create subprocess runner
-        runner = SubprocessRunner(job_id, 'logs/google_scrape.log')
-        discovery_state.subprocess_runner = runner
-
-        # Start subprocess
-        pid = runner.start(cmd, cwd=os.getcwd())
-        ui.notify(f'Google scraper started with PID {pid}', type='positive')
-
-        # Update process manager with actual PID
-        process_manager.update_pid(job_id, pid)
-
-        # Wait for subprocess to complete (check every second)
-        while runner.is_running():
-            await asyncio.sleep(1.0)
-
-            # Update progress bar (rough estimate based on time)
-            elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
-            # Google is slow: ~60 seconds per result
-            estimated_done = min(int(elapsed / 60), max_results)
-            progress_bar.value = estimated_done / max_results if max_results > 0 else 0
-
-            # Check for cancellation
-            if discovery_state.is_cancelled():
-                ui.notify('Killing scraper process...', type='warning')
-                runner.kill()
-                break
-
-        # Get final status
-        status = runner.get_status()
-        return_code = status['return_code']
-
-        if return_code == 0:
-            ui.notify('Google scraper completed successfully!', type='positive')
-        elif return_code == -9:
-            ui.notify('Google scraper was killed by user', type='warning')
-        else:
-            ui.notify(f'Google scraper exited with code {return_code}', type='negative')
-
-        # Parse results from database (scraper saves directly to DB)
-        result = await run.io_bound(backend.kpis)
-        result = {
-            'found': result.get('total_companies', 0),
-            'saved': result.get('new_7d', 0),
-            'duplicates': 0  # Don't have this info from subprocess
-        }
-
-        # Calculate elapsed time
-        elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
-
-        # Log final results
-        discovery_state.add_log('-' * 60, 'info')
-        discovery_state.add_log('GOOGLE DISCOVERY COMPLETED SUCCESSFULLY!', 'success')
-        discovery_state.add_log(f'Duration: {elapsed:.1f}s', 'info')
-        discovery_state.add_log(f'Found: {result["found"]} businesses', 'success')
-        discovery_state.add_log(f'Saved: {result["saved"]} new businesses', 'success')
-        discovery_state.add_log('=' * 60, 'info')
-
-        # Update final stats card
-        stats_card.clear()
-        with stats_card:
-            ui.label('Discovery Complete!').classes('text-lg font-bold text-green-500')
-            ui.label(f'Elapsed: {elapsed:.1f}s').classes('text-sm text-gray-400')
-            ui.separator()
-            ui.label(f'Found: {result["found"]}').classes('text-lg')
-            ui.label(f'Saved: {result["saved"]}').classes('text-lg text-green-500')
-
-        # Progress bar to full
-        progress_bar.value = 1.0
-
-        # Store summary
-        discovery_state.last_run_summary = {
-            'source': 'google_maps',
-            'elapsed': elapsed,
-            'result': result,
-            'timestamp': discovery_state.start_time.isoformat()
-        }
-
-        # Show notification
-        if discovery_state.cancel_requested:
-            ui.notify('Google discovery cancelled', type='warning')
-        else:
-            ui.notify(
-                f'Google discovery complete! Found {result["found"]}, Saved {result["saved"]}',
-                type='positive'
-            )
-
-    except Exception as e:
-        discovery_state.add_log('-' * 60, 'error')
-        discovery_state.add_log('GOOGLE DISCOVERY FAILED!', 'error')
-        discovery_state.add_log(f'Error: {str(e)}', 'error')
-        discovery_state.add_log('=' * 60, 'error')
-
-        stats_card.clear()
-        with stats_card:
-            ui.label('Discovery Failed').classes('text-lg font-bold text-red-500')
-            ui.label(f'Error: {str(e)}').classes('text-sm text-red-400')
-
-        ui.notify(f'Google discovery failed: {str(e)}', type='negative')
-
-    finally:
-        # Stop tailing log file
-        if discovery_state.log_viewer:
-            discovery_state.log_viewer.stop_tailing()
-
-        # Mark job as completed in process manager
-        process_manager.mark_completed('discovery_google', success=not discovery_state.cancel_requested)
-
-        # Re-enable run button, disable stop button
-        discovery_state.running = False
-        run_button.enable()
-        stop_button.disable()
-        progress_bar.value = 0
-
-
-async def run_google_maps_city_first_discovery(
-    state_ids,
-    max_targets,
-    scrape_details,
-    stats_card,
-    progress_bar,
-    run_button,
-    stop_button
-):
-    """Run Google Maps city-first discovery in background with progress updates."""
-    discovery_state.running = True
-    discovery_state.reset()
-    discovery_state.start_time = datetime.now()
-
-    # Register job in process manager
-    job_id = 'discovery_google_city_first'
-    process_manager.register(job_id, 'Google 5-Worker City-First System', log_file='logs/google_worker_1.log')
-
-    # Disable run button, enable stop button
-    run_button.disable()
-    stop_button.enable()
-
-    # Start tailing log file (monitor worker 1's log as primary)
-    if discovery_state.log_viewer:
-        discovery_state.log_viewer.set_log_file('logs/google_worker_1.log')
-        discovery_state.log_viewer.load_last_n_lines(50)
-        discovery_state.log_viewer.start_tailing()
-
-    # Add initial log messages
-    discovery_state.add_log('=' * 60, 'info')
-    discovery_state.add_log('GOOGLE MAPS 5-WORKER CITY-FIRST SYSTEM STARTED', 'success')
-    discovery_state.add_log('=' * 60, 'info')
-    discovery_state.add_log('Workers: 5 parallel workers with state partitioning', 'info')
-    discovery_state.add_log('Coverage: All 50 US states', 'info')
-    discovery_state.add_log(f'Scrape Details: {scrape_details}', 'info')
-    discovery_state.add_log('Log shown: Worker 1 (see logs/google_worker_*.log for others)', 'info')
-    discovery_state.add_log('-' * 60, 'info')
-
-    # Clear stats
-    stats_card.clear()
-    with stats_card:
-        ui.label('Running city-first discovery...').classes('text-lg font-bold')
-        stat_labels = {
-            'targets': ui.label('Targets: 0'),
-            'businesses': ui.label('Businesses: 0'),
-            'saved': ui.label('Saved: 0'),
-            'captchas': ui.label('CAPTCHAs: 0')
-        }
-
-    try:
-        ui.notify('Starting 5-worker Google Maps city-first scraper system...', type='info')
-
-        # Call the 5-worker start script instead of single process
-        cmd = [
-            'bash',
-            'scripts/google_workers/start_google_workers.sh'
-        ]
-
-        # Note: The 5-worker system automatically handles all 50 states with partitioning
-        # Individual worker parameters (max_targets, scrape_details) are handled by the script
-
-        # Create subprocess runner (uses worker 1's log as primary)
-        runner = SubprocessRunner(job_id, 'logs/google_worker_1.log')
-        discovery_state.subprocess_runner = runner
-
-        # Start the 5-worker system
-        pid = runner.start(cmd, cwd=os.getcwd())
-        ui.notify(f'5-worker system started (script PID: {pid})', type='positive')
-        ui.notify('Workers deployed: 5 workers processing all 50 states', type='info')
-
-        # Update process manager with script PID
-        # Note: Individual worker PIDs are tracked in logs/google_workers.pid
-        process_manager.update_pid(job_id, pid)
-
-        # Wait for subprocess to complete
-        while runner.is_running():
-            await asyncio.sleep(1.0)
-
-            # Update progress bar (rough estimate based on time)
-            elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
-            # City-first: ~30 seconds per target average
-            if max_targets:
-                estimated_done = min(int(elapsed / 30), max_targets)
-                progress_bar.value = estimated_done / max_targets
-            else:
-                # Indeterminate progress
-                progress_bar.value = 0.5
-
-            # Check for cancellation
-            if discovery_state.is_cancelled():
-                ui.notify('Stopping 5-worker system...', type='warning')
-                # Call stop script to gracefully stop all 5 workers
-                import subprocess
-                subprocess.run(['bash', 'scripts/google_workers/stop_google_workers.sh'],
-                             cwd=os.getcwd(), capture_output=True)
-                runner.kill()  # Also kill the start script
-                break
-
-        # Get final status
-        status = runner.get_status()
-        return_code = status['return_code']
-
-        if return_code == 0:
-            ui.notify('City-first scraper completed successfully!', type='positive')
-        elif return_code == -9:
-            ui.notify('City-first scraper was killed by user', type='warning')
-        else:
-            ui.notify(f'City-first scraper failed with code {return_code}', type='negative')
-
-        # Parse final results from log (simplified - just show completion)
-        result = {
-            "targets_processed": max_targets or "all",
-            "success": return_code == 0
-        }
-
-        # Calculate elapsed time
-        elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
-
-        # Log final results
-        discovery_state.add_log('-' * 60, 'info')
-        discovery_state.add_log('CITY-FIRST DISCOVERY COMPLETED SUCCESSFULLY!', 'success')
-        discovery_state.add_log(f'Duration: {elapsed:.1f}s', 'info')
-        discovery_state.add_log('=' * 60, 'info')
-
-        # Update final stats card
-        stats_card.clear()
-        with stats_card:
-            ui.label('City-First Discovery Complete!').classes('text-lg font-bold text-green-500')
-            ui.label(f'Elapsed: {elapsed:.1f}s').classes('text-sm text-gray-400')
-            ui.label('Check logs for detailed results').classes('text-sm text-gray-400')
-
-        # Progress bar to full
-        progress_bar.value = 1.0
-
-        # Show notification
-        if discovery_state.cancel_requested:
-            ui.notify('City-first discovery cancelled', type='warning')
-        else:
-            ui.notify('City-first discovery complete!', type='positive')
-
-    except Exception as e:
-        discovery_state.add_log('-' * 60, 'error')
-        discovery_state.add_log('CITY-FIRST DISCOVERY FAILED!', 'error')
-        discovery_state.add_log(f'Error: {str(e)}', 'error')
-        discovery_state.add_log('=' * 60, 'error')
-
-        stats_card.clear()
-        with stats_card:
-            ui.label('Discovery Failed').classes('text-lg font-bold text-red-500')
-            ui.label(f'Error: {str(e)}').classes('text-sm text-red-400')
-
-        ui.notify(f'City-first discovery failed: {str(e)}', type='negative')
-
-    finally:
-        # Stop tailing log file
-        if discovery_state.log_viewer:
-            discovery_state.log_viewer.stop_tailing()
-
-        # Mark job as completed in process manager
-        process_manager.mark_completed(job_id, success=not discovery_state.cancel_requested)
-
-        # Re-enable run button, disable stop button
-        discovery_state.running = False
-        run_button.enable()
-        stop_button.disable()
-        progress_bar.value = 0
+# Google Maps functions removed - this is YP-specific page
 
 
 async def stop_discovery():
@@ -1158,28 +816,82 @@ def build_yellow_pages_ui(container):
         stop_button.on('click', stop_discovery)
 
 
+# Multi-worker, Google Maps, and Yelp UI functions removed - this is YP-specific single-page
+
+
 def build_multiworker_yp_ui(container):
     """
     Build the multi-worker Yellow Pages UI.
 
-    This creates a complete interface for launching and monitoring 10 workers.
+    This creates a complete interface for launching and monitoring 5 workers.
     """
 
     with container:
-        # Info banner
-        with ui.card().classes('w-full bg-purple-900/20 border-l-4 border-purple-500 mb-4'):
-            ui.label('🚀 Multi-Worker Discovery (10x Speed)').classes('text-xl font-bold mb-2')
-            ui.label('Launch 10 independent workers, each scraping specific states in parallel.').classes('text-sm text-gray-300')
+        # Info banner - YP city-first specific
+        with ui.card().classes('w-full bg-purple-900 border-l-4 border-purple-500 mb-4'):
+            ui.label('🎯 Yellow Pages City-First Scraper').classes('text-lg font-bold text-purple-200')
+            ui.label('• Scrapes 31,254 US cities with population-based prioritization').classes('text-sm text-purple-100')
+            ui.label('• Shallow pagination (1-3 pages per city) with early-exit optimization').classes('text-sm text-purple-100')
+            ui.label('• 85%+ precision filtering with 10 predefined categories').classes('text-sm text-purple-100')
+            ui.label('• Step 1: Generate targets → Step 2: Run crawler').classes('text-sm text-purple-100')
 
         # Configuration card
         with ui.card().classes('w-full mb-4'):
-            ui.label('Configuration').classes('text-xl font-bold mb-4')
+            ui.label('Yellow Pages Configuration').classes('text-xl font-bold mb-4')
+
+            # State selection
+            ui.label('US States').classes('font-semibold mb-2')
+            ui.label('Select states to scrape (generates targets for all cities in selected states):').classes('text-sm text-gray-400 mb-2')
+
+            state_checkboxes = {}
+            with ui.grid(columns=10).classes('w-full gap-1 mb-4'):
+                for state in ALL_STATES:
+                    # Rhode Island selected by default for testing
+                    state_checkboxes[state] = ui.checkbox(state, value=(state == 'RI')).classes('text-xs')
+
+            # Quick select buttons
+            with ui.row().classes('gap-2 mb-4'):
+                def select_all_states():
+                    for cb in state_checkboxes.values():
+                        cb.value = True
+
+                def deselect_all_states():
+                    for cb in state_checkboxes.values():
+                        cb.value = False
+
+                ui.button('Select All', icon='check_box', on_click=select_all_states).props('flat dense')
+                ui.button('Deselect All', icon='check_box_outline_blank', on_click=deselect_all_states).props('flat dense')
+
+            ui.separator()
+
+            # Target generation section
+            ui.label('Step 1: Generate Targets').classes('font-semibold mb-2 mt-4')
+            ui.label('Generate scraping targets (city × category combinations) before running the crawler').classes('text-sm text-gray-400 mb-2')
+
+            # Target stats display (dynamic)
+            target_stats_container = ui.column().classes('w-full mb-3')
+
+            with ui.row().classes('gap-2 mb-4 items-center'):
+                generate_button = ui.button(
+                    'GENERATE TARGETS',
+                    icon='add_circle',
+                    color='secondary'
+                ).props('size=md')
+
+                refresh_stats_button = ui.button(
+                    'Refresh Stats',
+                    icon='refresh',
+                    on_click=lambda: None  # Will be set below
+                ).props('flat dense')
+
+            ui.separator()
 
             # Worker count selector
+            ui.label('Step 2: Worker Configuration').classes('font-semibold mb-2 mt-4')
             with ui.row().classes('items-center gap-4 mb-4'):
                 ui.label('Number of Workers:').classes('font-semibold')
-                worker_count_slider = ui.slider(min=1, max=10, value=10, step=1).props('label-always').classes('w-64')
-                worker_count_label = ui.label('10 workers').classes('text-sm text-gray-400')
+                worker_count_slider = ui.slider(min=1, max=5, value=5, step=1).props('label-always').classes('w-64')
+                worker_count_label = ui.label('5 workers').classes('text-sm text-gray-400')
 
                 def update_worker_count(e):
                     count = int(e.value)
@@ -1189,11 +901,67 @@ def build_multiworker_yp_ui(container):
 
             ui.separator().classes('my-4')
 
+            # Crawler Settings
+            ui.label('Crawler Settings').classes('font-semibold mb-2 mt-4')
+
+            # Max targets
+            max_targets_input = ui.number(
+                label='Max Targets (leave empty for all)',
+                value=None,
+                min=1,
+                max=100000,
+                step=10
+            ).classes('w-64 mb-2')
+            ui.label('Limit number of targets to process (useful for testing)').classes('text-xs text-gray-400 mb-3')
+
+            # Minimum score slider
+            min_score_slider = ui.slider(
+                min=0,
+                max=100,
+                value=50,
+                step=5
+            ).classes('w-full mb-1').props('label-always')
+            ui.label('Minimum Confidence Score (lower = more results, higher = better precision)').classes('text-xs text-gray-400 mb-2')
+
+            # Include sponsored checkbox
+            include_sponsored_checkbox = ui.checkbox(
+                'Include Sponsored/Ad Listings',
+                value=False
+            ).classes('mb-1')
+            ui.label('Check to include paid ads (usually excluded for quality)').classes('text-xs text-gray-400')
+
+            ui.separator().classes('my-4')
+
+            # Monitoring & Anti-Detection Settings
+            ui.label('Anti-Detection & Monitoring').classes('font-semibold mb-2 mt-2')
+            ui.label('Enhanced monitoring and stealth features (recommended for production)').classes('text-xs text-gray-400 mb-2')
+
+            with ui.column().classes('gap-2'):
+                enable_monitoring_checkbox = ui.checkbox(
+                    '✓ Enable Monitoring & Health Checks',
+                    value=True
+                ).classes('text-sm')
+                ui.label('Real-time metrics, CAPTCHA detection, health monitoring').classes('text-xs text-gray-400 ml-6 -mt-2')
+
+                enable_adaptive_rate_limiting_checkbox = ui.checkbox(
+                    '✓ Enable Adaptive Rate Limiting',
+                    value=True
+                ).classes('text-sm')
+                ui.label('Automatically slows down on errors, speeds up on success').classes('text-xs text-gray-400 ml-6 -mt-2')
+
+                enable_session_breaks_checkbox = ui.checkbox(
+                    '✓ Enable Session Breaks',
+                    value=True
+                ).classes('text-sm')
+                ui.label('Takes 30-90s breaks every 50 requests for human-like behavior').classes('text-xs text-gray-400 ml-6 -mt-2')
+
+            ui.separator().classes('my-4')
+
             # Quick stats
             with ui.row().classes('gap-4'):
                 with ui.card().classes('p-3 bg-gray-800'):
                     ui.label('States per Worker').classes('text-xs text-gray-400')
-                    ui.label('5-6').classes('text-2xl font-bold text-purple-400')
+                    ui.label('10-11').classes('text-2xl font-bold text-purple-400')
 
                 with ui.card().classes('p-3 bg-gray-800'):
                     ui.label('Total Proxies').classes('text-xs text-gray-400')
@@ -1201,14 +969,14 @@ def build_multiworker_yp_ui(container):
 
                 with ui.card().classes('p-3 bg-gray-800'):
                     ui.label('Expected Speed').classes('text-xs text-gray-400')
-                    ui.label('30-40/min').classes('text-2xl font-bold text-green-400')
+                    ui.label('YP Targets').classes('text-2xl font-bold text-green-400')
 
         # Worker Status Grid
         with ui.card().classes('w-full mb-4'):
             ui.label('Worker Status').classes('text-xl font-bold mb-4')
 
             with ui.grid(columns=5).classes('w-full gap-3'):
-                for worker_id in range(10):
+                for worker_id in range(5):
                     worker = multi_worker_state.workers[worker_id]
 
                     with ui.card().classes('p-3 hover:shadow-lg transition-shadow'):
@@ -1235,7 +1003,7 @@ def build_multiworker_yp_ui(container):
             with ui.row().classes('gap-6 mb-4'):
                 with ui.column():
                     ui.label('Active Workers').classes('text-sm text-gray-400')
-                    active_workers_label = ui.label('0/10').classes('text-2xl font-bold')
+                    active_workers_label = ui.label('0/5').classes('text-2xl font-bold')
 
                 with ui.column():
                     ui.label('Targets Processed').classes('text-sm text-gray-400')
@@ -1262,7 +1030,7 @@ def build_multiworker_yp_ui(container):
             with ui.tabs().classes('w-full') as tabs:
                 tab_all = ui.tab('All Workers')
                 worker_tabs = []
-                for i in range(10):
+                for i in range(5):
                     worker_tabs.append(ui.tab(f'Worker {i}'))
 
             # Tab panels
@@ -1274,11 +1042,90 @@ def build_multiworker_yp_ui(container):
 
                 # Individual worker logs
                 worker_log_viewers = []
-                for i in range(10):
+                for i in range(5):
                     with ui.tab_panel(worker_tabs[i]):
                         log_viewer = LiveLogViewer(f'logs/state_worker_{i}.log', max_lines=200, auto_scroll=True)
                         log_viewer.create()
                         worker_log_viewers.append(log_viewer)
+
+        # ====================================================================
+        # TARGET GENERATION HANDLERS
+        # ====================================================================
+
+        # Helper function to update target stats display
+        async def update_target_stats():
+            selected_states = [state for state, cb in state_checkboxes.items() if cb.value]
+            if not selected_states:
+                target_stats_container.clear()
+                with target_stats_container:
+                    ui.label('No states selected').classes('text-gray-400 italic')
+                return
+
+            stats = await get_yp_target_stats(selected_states)
+
+            target_stats_container.clear()
+            if stats and stats['total'] > 0:
+                with target_stats_container:
+                    with ui.card().classes('w-full bg-slate-800 p-3'):
+                        ui.label('Target Statistics').classes('text-sm font-bold mb-2')
+                        with ui.grid(columns=5).classes('gap-2'):
+                            ui.label(f'Total: {stats["total"]}').classes('text-xs')
+                            ui.label(f'Planned: {stats["planned"]}').classes('text-xs text-blue-400')
+                            ui.label(f'In Progress: {stats["in_progress"]}').classes('text-xs text-yellow-400')
+                            ui.label(f'Done: {stats["done"]}').classes('text-xs text-green-400')
+                            ui.label(f'Failed: {stats["failed"]}').classes('text-xs text-red-400')
+            else:
+                with target_stats_container:
+                    ui.label('No targets generated yet for selected states').classes('text-yellow-400 italic text-sm')
+
+        # Generate targets button handler
+        async def handle_generate_targets():
+            selected_states = [state for state, cb in state_checkboxes.items() if cb.value]
+
+            if not selected_states:
+                ui.notify('Please select at least one state', type='warning')
+                return
+
+            # Confirm with user
+            with ui.dialog() as dialog, ui.card():
+                ui.label('Generate Targets?').classes('text-lg font-bold mb-2')
+                ui.label(f'This will generate targets for {len(selected_states)} state(s):').classes('text-sm mb-1')
+                ui.label(f'{", ".join(selected_states)}').classes('text-sm text-blue-400 mb-3')
+                ui.label('Existing targets for these states will be cleared.').classes('text-xs text-yellow-400 mb-3')
+
+                with ui.row().classes('gap-2'):
+                    ui.button('Cancel', on_click=dialog.close).props('flat')
+                    async def confirm_generate():
+                        dialog.close()
+
+                        # Launch target generation in detached background process
+                        success, message = generate_yp_targets_detached(selected_states, clear_existing=True)
+
+                        if success:
+                            # Calculate estimated time
+                            estimated_minutes = max(2, int(10 * len(selected_states) / 50))
+                            ui.notify(
+                                f'Target generation started for {len(selected_states)} state(s)! '
+                                f'Check logs/generate_targets.log for progress. Refresh in ~{estimated_minutes} minutes.',
+                                type='positive',
+                                timeout=10000
+                            )
+                        else:
+                            ui.notify(
+                                f'Failed to start target generation: {message}',
+                                type='negative',
+                                timeout=5000
+                            )
+
+                    ui.button('Generate', on_click=confirm_generate, color='positive')
+
+            dialog.open()
+
+        generate_button.on('click', handle_generate_targets)
+        refresh_stats_button.on('click', update_target_stats)
+
+        # Initialize stats display
+        asyncio.create_task(update_target_stats())
 
         # ====================================================================
         # EVENT HANDLERS
@@ -1293,7 +1140,7 @@ def build_multiworker_yp_ui(container):
                 # Build command to launch state worker pool
                 cmd = [
                     sys.executable,
-                    'scripts/run_state_workers.py',
+                    'scripts/run_state_workers_5.py',
                     '--workers', str(int(worker_count_slider.value)),
                     '--yes'  # Skip interactive confirmation prompt
                 ]
@@ -1398,7 +1245,7 @@ def build_multiworker_yp_ui(container):
                 # Count running worker processes
                 running_count = 0
                 for line in result.stdout.split('\n'):
-                    if 'run_state_workers.py' in line and 'grep' not in line:
+                    if 'run_state_workers_5.py' in line and 'grep' not in line:
                         running_count += 1
 
                 # If workers are running, update UI
@@ -1459,336 +1306,12 @@ def build_multiworker_yp_ui(container):
         check_workers_running()
 
 
-def build_google_maps_ui(container):
-    """Build Google Maps discovery UI in the given container."""
-    with container:
-        # Configuration card
-        with ui.card().classes('w-full mb-4'):
-            ui.label('Google Maps Configuration').classes('text-xl font-bold mb-4')
-
-            # City-First Crawl Controls
-            ui.label('States to Crawl').classes('font-semibold mb-2')
-
-            # All 50 US states
-            all_states = [
-                'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
-                'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
-                'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
-                'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
-                'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'
-            ]
-
-            # Store checkbox states in a dict
-            state_checkboxes = {}
-
-            with ui.card().classes('w-full bg-gray-800 p-4 mb-4'):
-                with ui.row().classes('w-full items-center mb-2'):
-                    ui.label('Select States').classes('text-sm font-bold text-blue-200')
-                    ui.space()
-                    select_all_btn = ui.button('Select All', icon='check_box', color='positive').props('size=sm outline')
-                    deselect_all_btn = ui.button('Deselect All', icon='check_box_outline_blank', color='warning').props('size=sm outline')
-
-                # Create checkbox grid (10 columns for 50 states = 5 rows)
-                with ui.grid(columns=10).classes('w-full gap-2'):
-                    for state in all_states:
-                        state_checkboxes[state] = ui.checkbox(state, value=True).classes('text-xs')
-
-                # Select/Deselect All functionality
-                def select_all():
-                    for checkbox in state_checkboxes.values():
-                        checkbox.value = True
-
-                def deselect_all():
-                    for checkbox in state_checkboxes.values():
-                        checkbox.value = False
-
-                select_all_btn.on('click', select_all)
-                deselect_all_btn.on('click', deselect_all)
-
-            ui.label('✓ All 50 states selected by default - will process ALL available targets').classes('text-xs text-green-400 mb-4')
-
-            ui.label('Max Targets').classes('font-semibold mb-2')
-            max_targets_input = ui.number(
-                label='Maximum targets to process (leave empty for all)',
-                value=None,
-                min=1,
-                max=10000,
-                step=1
-            ).classes('w-64 mb-4')
-            ui.label('✓ Set to process ALL targets in all selected states').classes('text-xs text-green-400 mb-4')
-
-            # Scrape details checkbox
-            scrape_details_checkbox = ui.checkbox(
-                'Scrape full business details',
-                value=True
-            ).classes('mb-2')
-            ui.label('Unchecking will only get basic info (faster but less data)').classes('text-xs text-gray-400')
-
-            # Target stats display
-            with ui.card().classes('w-full bg-gray-800 border-l-4 border-blue-500 mt-4'):
-                ui.label('Target Statistics').classes('text-md font-bold text-blue-200 mb-2')
-                stats_display = ui.column().classes('w-full')
-
-                def get_selected_states():
-                    """Helper function to get list of selected states from checkboxes."""
-                    return [state for state, checkbox in state_checkboxes.items() if checkbox.value]
-
-                def refresh_target_stats():
-                    """Refresh target statistics display."""
-                    from niceui.backend_facade import BackendFacade
-                    backend = BackendFacade()
-                    selected_states = get_selected_states()
-                    stats = backend.get_google_target_stats(selected_states)
-
-                    stats_display.clear()
-                    with stats_display:
-                        ui.label(f"Total targets: {stats['total']}").classes('text-sm text-gray-300')
-                        if stats['by_status']:
-                            for status, count in stats['by_status'].items():
-                                color = 'text-green-400' if status == 'DONE' else 'text-blue-400' if status == 'PLANNED' else 'text-yellow-400'
-                                ui.label(f"  {status}: {count}").classes(f'text-xs {color}')
-
-                ui.button('Refresh Stats', on_click=refresh_target_stats, icon='refresh').classes('mt-2')
-                refresh_target_stats()  # Initial load
-
-        # Stats and controls (same as before)
-        with ui.card().classes('w-full mb-4'):
-            ui.label('Discovery Status').classes('text-xl font-bold mb-4')
-
-            # Stats card
-            stats_card = ui.column().classes('w-full mb-4')
-            with stats_card:
-                ui.label('Ready to start').classes('text-lg')
-
-            # Progress bar
-            progress_bar = ui.linear_progress(value=0).classes('w-full mb-4')
-
-            # Control buttons
-            with ui.row().classes('gap-2'):
-                run_button = ui.button('START DISCOVERY', icon='play_arrow', color='positive')
-                stop_button = ui.button('STOP', icon='stop', color='negative')
-
-                # Set initial button states
-                if discovery_state.running:
-                    run_button.disable()
-                    stop_button.enable()
-                else:
-                    run_button.enable()
-                    stop_button.disable()
-
-        # ====================================================================
-        # MULTI-WORKER STATUS DISPLAY (5 Workers)
-        # ====================================================================
-
-        # Google Worker State Assignments (matches start_google_workers.sh)
-        google_worker_states = {
-            0: ['AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA'],
-            1: ['HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD'],
-            2: ['MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ'],
-            3: ['NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC'],
-            4: ['SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY']
-        }
-
-        # Worker Status Grid
-        with ui.card().classes('w-full mb-4'):
-            ui.label('5-Worker System Status').classes('text-xl font-bold mb-4')
-
-            with ui.grid(columns=5).classes('w-full gap-3'):
-                google_worker_badges = {}
-                google_worker_labels = {}
-
-                for worker_id in range(5):
-                    states = google_worker_states[worker_id]
-
-                    with ui.card().classes('p-3 hover:shadow-lg transition-shadow bg-gray-800'):
-                        # Header
-                        with ui.row().classes('items-center justify-between w-full mb-2'):
-                            ui.label(f'Worker {worker_id + 1}').classes('font-bold text-sm text-blue-200')
-                            google_worker_badges[worker_id] = ui.badge('CHECKING', color='grey').classes('text-xs')
-
-                        # Assigned states
-                        ui.label(f"{', '.join(states[:3])}...").classes('text-xs text-gray-400 mb-2')
-
-                        # Stats placeholder
-                        google_worker_labels[worker_id] = ui.label('Ready').classes('text-xs text-gray-300')
-
-        # Live output with tabbed multi-worker log viewers
-        with ui.card().classes('w-full'):
-            ui.label('Live Worker Output').classes('text-xl font-bold mb-2')
-
-            # Tab selector for workers
-            with ui.tabs().classes('w-full') as google_tabs:
-                google_tab_all = ui.tab('All Workers')
-                google_worker_tabs = []
-                for i in range(5):
-                    google_worker_tabs.append(ui.tab(f'Worker {i + 1}'))
-
-            # Tab panels
-            with ui.tab_panels(google_tabs, value=google_tab_all).classes('w-full'):
-                # All workers merged view - shows Worker 1 as primary
-                with ui.tab_panel(google_tab_all):
-                    ui.label('📊 Aggregate view - showing Worker 1 log as primary').classes('text-xs text-gray-400 mb-2')
-                    log_viewer_all = LiveLogViewer('logs/google_worker_1.log', max_lines=400, auto_scroll=True)
-                    log_viewer_all.create()
-                    log_viewer_all.load_last_n_lines(100)
-                    log_viewer_all.start_tailing()
-
-                # Individual worker logs
-                google_log_viewers = []
-                for i in range(5):
-                    with ui.tab_panel(google_worker_tabs[i]):
-                        states = google_worker_states[i]
-                        ui.label(f"🌎 States: {', '.join(states)}").classes('text-xs text-gray-400 mb-2')
-                        log_viewer = LiveLogViewer(f'logs/google_worker_{i + 1}.log', max_lines=300, auto_scroll=True)
-                        log_viewer.create()
-                        log_viewer.load_last_n_lines(100)
-                        log_viewer.start_tailing()
-                        google_log_viewers.append(log_viewer)
-
-        # Check worker status on page load
-        def check_google_workers_status():
-            """Check if Google workers are running and update badges."""
-            import subprocess
-            try:
-                # Check for running worker processes via PID file
-                pid_file = 'logs/google_workers.pid'
-                if os.path.exists(pid_file):
-                    with open(pid_file, 'r') as f:
-                        pids = [int(line.strip()) for line in f if line.strip()]
-
-                    # Check if PIDs are running
-                    for worker_id, pid in enumerate(pids[:5]):
-                        try:
-                            result = subprocess.run(['ps', '-p', str(pid)], capture_output=True)
-                            if result.returncode == 0:
-                                # Worker is running
-                                if worker_id in google_worker_badges:
-                                    google_worker_badges[worker_id].set_text('RUNNING')
-                                    google_worker_badges[worker_id].props('color=positive')
-                                if worker_id in google_worker_labels:
-                                    google_worker_labels[worker_id].set_text('Processing targets...')
-                            else:
-                                # Worker stopped
-                                if worker_id in google_worker_badges:
-                                    google_worker_badges[worker_id].set_text('STOPPED')
-                                    google_worker_badges[worker_id].props('color=warning')
-                        except Exception:
-                            pass
-                else:
-                    # No PID file, workers not running
-                    for worker_id in range(5):
-                        if worker_id in google_worker_badges:
-                            google_worker_badges[worker_id].set_text('IDLE')
-                            google_worker_badges[worker_id].props('color=grey')
-            except Exception as e:
-                print(f"Error checking worker status: {e}")
-
-        # Initial status check
-        check_google_workers_status()
-
-        # Periodic status updates
-        ui.timer(5.0, check_google_workers_status)
-
-        # Store references
-        discovery_state.log_viewer = log_viewer_all
-        discovery_state.log_element = None
-
-        # Run button click handler - City-First Discovery
-        async def start_discovery():
-            # Get selected states from checkboxes
-            selected_states = [state for state, checkbox in state_checkboxes.items() if checkbox.value]
-
-            # Validate city-first inputs
-            if not selected_states:
-                ui.notify('Please select at least one state', type='warning')
-                return
-
-            # Run city-first discovery
-            await run_google_maps_city_first_discovery(
-                selected_states,
-                int(max_targets_input.value) if max_targets_input.value else None,
-                scrape_details_checkbox.value,
-                stats_card,
-                progress_bar,
-                run_button,
-                stop_button
-            )
-
-        run_button.on('click', start_discovery)
-        stop_button.on('click', stop_discovery)
-
-
-def build_yelp_ui(container):
-    """Build Yelp discovery UI in the given container."""
-    with container:
-        # Configuration card
-        with ui.card().classes('w-full mb-4'):
-            ui.label('Yelp Discovery Configuration').classes('text-xl font-bold mb-4')
-
-            # Coming soon banner
-            with ui.card().classes('w-full bg-orange-900 border-l-4 border-orange-500 mb-4'):
-                ui.label('🚧 Yelp Discovery - Coming Soon').classes('text-lg font-bold text-orange-200')
-                ui.label('• Search businesses on Yelp with rich review data').classes('text-sm text-orange-100')
-                ui.label('• Includes ratings, reviews, and business hours').classes('text-sm text-orange-100')
-                ui.label('• Category and location-based searches').classes('text-sm text-orange-100')
-
-            # Placeholder configuration
-            ui.label('Business Category').classes('font-semibold mb-2')
-            category_input = ui.input(
-                label='Category to search for',
-                placeholder='e.g., pressure washing, restaurants, plumbers',
-                value='pressure washing'
-            ).props('disable').classes('w-full mb-4')
-
-            ui.label('Location').classes('font-semibold mb-2')
-            location_input = ui.input(
-                label='City and state',
-                placeholder='e.g., Seattle, WA',
-                value='Seattle, WA'
-            ).props('disable').classes('w-full mb-4')
-
-        # Status message
-        with ui.card().classes('w-full'):
-            ui.label('Status').classes('text-xl font-bold mb-4')
-            ui.label('Yelp scraper implementation is planned. This will allow discovery of businesses with Yelp reviews and ratings.').classes('text-gray-400')
-
-
-
-def discover_page():
-    """Render unified discovery page with source selection."""
-    # Version badge to verify code updates
+def yp_discover_page():
+    """Render Yellow Pages Discovery page with 5-worker city-first approach."""
+    # Page header
     with ui.row().classes('gap-2 mb-2'):
-        ui.label('URL Discovery').classes('text-3xl font-bold')
-        ui.badge('v3.0-MULTI-WORKER', color='purple').classes('mt-2')
+        ui.label('Yellow Pages Discovery').classes('text-3xl font-bold')
+        ui.badge('v2.0-5-WORKER', color='purple').classes('mt-2')
 
-    # Source selection
-    with ui.card().classes('w-full mb-4'):
-        ui.label('Discovery Source').classes('text-xl font-bold mb-4')
-
-        source_select = ui.select(
-            options=['Google Maps', 'Yellow Pages', 'Yelp'],
-            value='Google Maps',
-            label='Choose discovery source'
-        ).classes('w-64')
-
-    # Main content container (will be rebuilt on source change)
-    main_content = ui.column().classes('w-full')
-
-    # Build initial content (Google Maps by default)
-    build_google_maps_ui(main_content)
-
-    # Handle source changes - completely rebuild the UI
-    def on_source_change(e):
-        main_content.clear()
-        source = source_select.value
-
-        if source == 'Google Maps':
-            build_google_maps_ui(main_content)
-        elif source == 'Yellow Pages':
-            # Import YP UI function
-            from .yp_discover import build_multiworker_yp_ui
-            build_multiworker_yp_ui(main_content)
-        elif source == 'Yelp':
-            build_yelp_ui(main_content)
-
-    source_select.on('update:model-value', on_source_change)
+    # Build multi-worker YP UI directly (no tabs)
+    build_multiworker_yp_ui(ui.column().classes('w-full'))

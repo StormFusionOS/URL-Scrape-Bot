@@ -16,8 +16,8 @@ class WorkerConfig:
 
     # ===== WORKER SETTINGS =====
 
-    # Number of parallel workers (30-35 recommended for balanced speed/safety)
-    WORKER_COUNT = int(os.getenv("WORKER_COUNT", "35"))
+    # Number of parallel workers (5 recommended for no-proxy mode with enhanced anti-detection)
+    WORKER_COUNT = int(os.getenv("WORKER_COUNT", "5"))
 
     # Maximum targets to process before restarting browser (prevents memory leaks)
     MAX_TARGETS_PER_BROWSER = int(os.getenv("MAX_TARGETS_PER_BROWSER", "100"))
@@ -33,10 +33,13 @@ class WorkerConfig:
 
     # ===== PROXY SETTINGS =====
 
+    # Enable/disable proxy usage (set to false for no-proxy mode with enhanced anti-detection)
+    USE_PROXIES = os.getenv("YP_USE_PROXIES", "false").lower() == "true"
+
     # Path to proxy file (Webshare format: host:port:username:password)
     PROXY_FILE = os.getenv("PROXY_FILE", "/home/rivercityscrape/Downloads/Webshare 50 proxies.txt")
 
-    # Enable proxy rotation on failures
+    # Enable proxy rotation on failures (only if USE_PROXIES=true)
     PROXY_ROTATION_ENABLED = os.getenv("PROXY_ROTATION_ENABLED", "true").lower() == "true"
 
     # Proxy selection strategy: 'round_robin' or 'health_based'
@@ -56,20 +59,21 @@ class WorkerConfig:
 
     # ===== DELAY & RATE LIMITING SETTINGS =====
 
-    # Minimum delay between targets per worker (seconds)
-    MIN_DELAY_SECONDS = float(os.getenv("MIN_DELAY_SECONDS", "5.0"))
+    # Minimum delay between targets per worker (seconds) - Google-level conservative delays
+    MIN_DELAY_SECONDS = float(os.getenv("MIN_DELAY_SECONDS", "45.0"))
 
-    # Maximum delay between targets per worker (seconds)
-    MAX_DELAY_SECONDS = float(os.getenv("MAX_DELAY_SECONDS", "15.0"))
+    # Maximum delay between targets per worker (seconds) - Google-level conservative delays
+    MAX_DELAY_SECONDS = float(os.getenv("MAX_DELAY_SECONDS", "90.0"))
 
-    # Add randomization to delays (prevents pattern detection)
+    # Add randomization to delays (prevents pattern detection) - with 20% jitter
     DELAY_RANDOMIZATION = os.getenv("DELAY_RANDOMIZATION", "true").lower() == "true"
+    DELAY_JITTER_PERCENT = float(os.getenv("DELAY_JITTER_PERCENT", "0.2"))  # 20% variance
 
-    # Session break settings (inherited from existing system)
+    # Session break settings (Google-level: more frequent breaks, longer duration)
     SESSION_BREAK_ENABLED = os.getenv("SESSION_BREAK_ENABLED", "true").lower() == "true"
-    SESSION_BREAK_REQUESTS_PER_SESSION = int(os.getenv("SESSION_BREAK_REQUESTS_PER_SESSION", "50"))
-    SESSION_BREAK_MIN_DURATION = int(os.getenv("SESSION_BREAK_MIN_DURATION", "30"))
-    SESSION_BREAK_MAX_DURATION = int(os.getenv("SESSION_BREAK_MAX_DURATION", "90"))
+    SESSION_BREAK_REQUESTS_PER_SESSION = int(os.getenv("SESSION_BREAK_REQUESTS_PER_SESSION", "20"))
+    SESSION_BREAK_MIN_DURATION = int(os.getenv("SESSION_BREAK_MIN_DURATION", "300"))  # 5 minutes
+    SESSION_BREAK_MAX_DURATION = int(os.getenv("SESSION_BREAK_MAX_DURATION", "600"))  # 10 minutes
 
     # ===== DATABASE SETTINGS =====
 
@@ -181,9 +185,9 @@ class WorkerConfig:
         if not cls.DATABASE_URL:
             errors.append("DATABASE_URL not set in environment")
 
-        # Check proxy file exists
-        if not os.path.exists(cls.PROXY_FILE):
-            errors.append(f"Proxy file not found: {cls.PROXY_FILE}")
+        # Check proxy file exists (only if proxies are enabled)
+        if cls.USE_PROXIES and not os.path.exists(cls.PROXY_FILE):
+            errors.append(f"Proxy file not found: {cls.PROXY_FILE} (USE_PROXIES=true but file missing)")
 
         # Check worker count
         if cls.WORKER_COUNT < 1:
@@ -218,9 +222,11 @@ class WorkerConfig:
         print("Worker Configuration Summary")
         print("=" * 60)
         print(f"Workers: {cls.WORKER_COUNT}")
-        print(f"Proxy file: {cls.PROXY_FILE}")
-        print(f"Proxy strategy: {cls.PROXY_SELECTION_STRATEGY}")
-        print(f"Delay range: {cls.MIN_DELAY_SECONDS}-{cls.MAX_DELAY_SECONDS}s")
+        print(f"Proxies: {'Enabled' if cls.USE_PROXIES else 'DISABLED (no-proxy mode)'}")
+        if cls.USE_PROXIES:
+            print(f"Proxy file: {cls.PROXY_FILE}")
+            print(f"Proxy strategy: {cls.PROXY_SELECTION_STRATEGY}")
+        print(f"Delay range: {cls.MIN_DELAY_SECONDS}-{cls.MAX_DELAY_SECONDS}s (jitter: {cls.DELAY_JITTER_PERCENT*100}%)")
         print(f"Database pool: {cls.DB_POOL_SIZE} connections")
         print(f"Target timeout: {cls.TARGET_TIMEOUT_MINUTES} minutes")
         print(f"Max retries per target: {cls.MAX_TARGET_RETRY_ATTEMPTS}")
