@@ -23,6 +23,7 @@ import os
 
 from scrape_google.google_crawl_city_first import crawl_city_targets
 from runner.logging_setup import get_logger
+from runner.safety import create_safety_limits_from_env, create_rate_limiter_from_env
 
 # Load environment variables
 load_dotenv()
@@ -147,6 +148,10 @@ async def main():
     session = Session()
 
     try:
+        # Initialize safety limits
+        safety = create_safety_limits_from_env()
+        limiter = create_rate_limiter_from_env()
+
         # Track overall stats
         total_targets = 0
         total_businesses = 0
@@ -165,6 +170,17 @@ async def main():
             checkpoint_interval=10,
             recover_orphans=True
         ):
+            # Check safety limits before processing
+            if not safety.check_should_continue():
+                logger.warning("Safety limit reached, stopping crawler")
+                break
+
+            # Apply rate limiting
+            delay = limiter.get_delay()
+            if delay > 0:
+                logger.debug(f"Rate limit delay: {delay:.1f}s")
+                await asyncio.sleep(delay)
+
             target = batch['target']
             results = batch['results']
             stats = batch['stats']
@@ -176,6 +192,22 @@ async def main():
             total_duplicates += stats['duplicates_skipped']
             if stats.get('captcha_detected'):
                 total_captchas += 1
+
+            # Record page processed
+            safety.record_page_processed()
+
+            # Record success/failure based on results
+            if stats['total_found'] > 0:
+                safety.record_success()
+                if not stats.get('captcha_detected'):
+                    limiter.record_success()
+                else:
+                    # CAPTCHA = failure for rate limiting
+                    limiter.record_failure()
+            else:
+                # No results = failure
+                safety.record_failure("No results found for target")
+                limiter.record_failure()
 
             # Log batch results
             logger.info("-" * 80)
@@ -201,10 +233,20 @@ async def main():
         if total_captchas > 0:
             logger.warning(f"CAPTCHA rate: {total_captchas}/{total_targets} = {total_captchas/total_targets*100:.1f}%")
 
+        # Log safety limits summary
+        logger.info("")
+        safety.log_summary()
+
     except Exception as e:
         logger.error(f"City-first crawler failed: {e}")
         import traceback
         traceback.print_exc()
+
+        # Log safety summary even on error
+        if 'safety' in locals():
+            logger.info("")
+            safety.log_summary()
+
         sys.exit(1)
     finally:
         session.close()

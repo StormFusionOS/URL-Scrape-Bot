@@ -452,6 +452,71 @@ def extract_reviews(soup: BeautifulSoup) -> Optional[dict]:
     return None
 
 
+def extract_about_text(soup: BeautifulSoup) -> Optional[str]:
+    """
+    Extract 'About Us' or general description text from the page.
+
+    Args:
+        soup: BeautifulSoup object
+
+    Returns:
+        About text or None
+    """
+    about_sections = []
+
+    # Look for sections with 'about' in class or id
+    for elem in soup.find_all(['section', 'div', 'article'], class_=lambda x: x and 'about' in x.lower()):
+        about_sections.append(elem.get_text(separator=' ', strip=True))
+
+    for elem in soup.find_all(['section', 'div', 'article'], id=lambda x: x and 'about' in x.lower()):
+        about_sections.append(elem.get_text(separator=' ', strip=True))
+
+    # Look for headings containing 'about' and get following content
+    for heading in soup.find_all(['h1', 'h2', 'h3'], string=re.compile(r'about', re.IGNORECASE)):
+        parent = heading.find_parent(['section', 'div', 'article'])
+        if parent:
+            about_sections.append(parent.get_text(separator=' ', strip=True))
+
+    # Return combined text, limited to reasonable length
+    combined = ' '.join(about_sections)
+    return combined[:5000] if combined else None
+
+
+def extract_homepage_text(soup: BeautifulSoup) -> Optional[str]:
+    """
+    Extract main body text from the homepage.
+
+    Args:
+        soup: BeautifulSoup object
+
+    Returns:
+        Homepage body text or None
+    """
+    # Remove script, style, and navigation elements
+    for element in soup(['script', 'style', 'nav', 'header', 'footer', 'aside']):
+        element.decompose()
+
+    # Get text from main content areas
+    main_text = []
+
+    # Try to find main content area
+    main_content = soup.find(['main', 'article', 'div'], class_=lambda x: x and any(
+        keyword in x.lower() for keyword in ['content', 'main', 'body']
+    ))
+
+    if main_content:
+        main_text.append(main_content.get_text(separator=' ', strip=True))
+    else:
+        # Fall back to body text
+        body = soup.find('body')
+        if body:
+            main_text.append(body.get_text(separator=' ', strip=True))
+
+    # Return combined text, limited to reasonable length
+    combined = ' '.join(main_text)
+    return combined[:10000] if combined else None
+
+
 def parse_site_content(html: str, base_url: str) -> dict:
     """
     Parse website HTML and extract business information.
@@ -469,6 +534,8 @@ def parse_site_content(html: str, base_url: str) -> dict:
         - service_area: Service area text
         - address: Physical address
         - reviews: Review information dict
+        - about: About us text
+        - homepage_text: Main homepage body text
     """
     logger.info(f"Parsing site content for {base_url}")
 
@@ -482,6 +549,8 @@ def parse_site_content(html: str, base_url: str) -> dict:
         "service_area": extract_service_area(soup),
         "address": extract_address(soup),
         "reviews": extract_reviews(soup),
+        "about": extract_about_text(soup),
+        "homepage_text": extract_homepage_text(soup),
     }
 
     # Log summary

@@ -46,10 +46,13 @@ def register_pages():
     router.register('database', pages.database_page)
     router.register('scheduler', pages.scheduler_page)
     router.register('logs', pages.logs_page)
+    router.register('diagnostics', pages.diagnostics_page)
+    router.register('run_history', pages.run_history_page)
     router.register('status', pages.status_page)
     router.register('settings', pages.settings_page)
     router.register('seo_intelligence', pages.seo_intelligence_page)
     router.register('seo_database', pages.seo_database_page)
+    router.register('seo_review_queue', pages.seo_review_queue_page)
     router.register('local_competitors', pages.local_competitors_page)
     router.register('dev_tools', pages.dev_tools_page)
     router.register('testing', pages.testing_page)
@@ -58,6 +61,7 @@ def register_pages():
     router.register('citation_runner', pages.citation_runner_page)
     router.register('backlink_runner', pages.backlink_runner_page)
     router.register('yp_discover', pages.yp_discover_page)
+    router.register('verification', pages.verification_page)
 
 
 def create_app():

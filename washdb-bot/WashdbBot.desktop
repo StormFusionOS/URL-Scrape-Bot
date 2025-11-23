@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Washdb-Bot Dashboard
+Comment=StormFusion OS URL Scraping & SEO Intelligence Platform
+Exec=xdg-open http://127.0.0.1:8080
+Icon=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/niceui/static/logo.svg
+Terminal=false
+Categories=Development;Network;WebDevelopment;
+Keywords=scraper;seo;dashboard;washbot;
+StartupNotify=true

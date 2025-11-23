@@ -1,0 +1,27 @@
+# Ensure Unix line endings for shell scripts
+*.sh text eol=lf
+
+# Ensure Unix line endings for Python files
+*.py text eol=lf
+
+# Ensure Unix line endings for config files
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.ini text eol=lf
+*.cfg text eol=lf
+
+# Ensure Unix line endings for documentation
+*.md text eol=lf
+*.txt text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.gz binary
+*.tar binary
+*.zip binary
