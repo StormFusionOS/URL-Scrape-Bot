@@ -1759,34 +1759,30 @@ def discover_page():
     # Version badge to verify code updates
     with ui.row().classes('gap-2 mb-2'):
         ui.label('URL Discovery').classes('text-3xl font-bold')
-        ui.badge('v2.0-CITY-FIRST', color='purple').classes('mt-2')
+        ui.badge('v3.0-MULTI-WORKER', color='purple').classes('mt-2')
 
-    # Source selection (stays at top)
+    # Source selection
     with ui.card().classes('w-full mb-4'):
         ui.label('Discovery Source').classes('text-xl font-bold mb-4')
 
         source_select = ui.select(
-            options=['Yellow Pages', 'Multi-Worker YP (10x)', 'Google Maps', 'Yelp'],
-            value='Yellow Pages',
+            options=['Google Maps', 'Yelp'],
+            value='Google Maps',
             label='Choose discovery source'
         ).classes('w-64')
 
     # Main content container (will be rebuilt on source change)
     main_content = ui.column().classes('w-full')
 
-    # Build initial content (Yellow Pages by default)
-    build_yellow_pages_ui(main_content)
+    # Build initial content (Google Maps by default)
+    build_google_maps_ui(main_content)
 
     # Handle source changes - completely rebuild the UI
     def on_source_change(e):
         main_content.clear()
         source = source_select.value
 
-        if source == 'Yellow Pages':
-            build_yellow_pages_ui(main_content)
-        elif source == 'Multi-Worker YP (10x)':
-            build_multiworker_yp_ui(main_content)
-        elif source == 'Google Maps':
+        if source == 'Google Maps':
             build_google_maps_ui(main_content)
         elif source == 'Yelp':
             build_yelp_ui(main_content)
