@@ -109,7 +109,6 @@ class AppLayout:
             nav_items = [
                 {'name': 'Dashboard', 'icon': 'dashboard', 'page': 'dashboard'},
                 {'name': 'Discover', 'icon': 'search', 'page': 'discover'},
-                {'name': 'YP Discover', 'icon': 'travel_explore', 'page': 'yp_discover'},
                 {'name': 'Database', 'icon': 'storage', 'page': 'database'},
                 {'name': 'Scheduler', 'icon': 'schedule', 'page': 'scheduler'},
                 {'name': 'Status', 'icon': 'timeline', 'page': 'status'},
@@ -175,7 +174,6 @@ class AppLayout:
         nav_items = [
             {'name': 'Dashboard', 'icon': 'dashboard', 'page': 'dashboard'},
             {'name': 'Discover', 'icon': 'search', 'page': 'discover'},
-            {'name': 'YP Discover', 'icon': 'travel_explore', 'page': 'yp_discover'},
             {'name': 'Database', 'icon': 'storage', 'page': 'database'},
             {'name': 'Scheduler', 'icon': 'schedule', 'page': 'scheduler'},
             {'name': 'Logs', 'icon': 'article', 'page': 'logs'},

@@ -1766,7 +1766,7 @@ def discover_page():
         ui.label('Discovery Source').classes('text-xl font-bold mb-4')
 
         source_select = ui.select(
-            options=['Google Maps', 'Yelp'],
+            options=['Google Maps', 'Yellow Pages', 'Yelp'],
             value='Google Maps',
             label='Choose discovery source'
         ).classes('w-64')
@@ -1784,6 +1784,10 @@ def discover_page():
 
         if source == 'Google Maps':
             build_google_maps_ui(main_content)
+        elif source == 'Yellow Pages':
+            # Import YP UI function
+            from .yp_discover import build_multiworker_yp_ui
+            build_multiworker_yp_ui(main_content)
         elif source == 'Yelp':
             build_yelp_ui(main_content)
 
