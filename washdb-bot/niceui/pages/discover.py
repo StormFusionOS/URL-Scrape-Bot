@@ -196,6 +196,37 @@ def generate_yp_targets_detached(states, clear_existing=True):
         return False, str(e)
 
 
+def generate_yelp_targets_detached(states, clear_existing=True):
+    """Launch Yelp target generation as a detached background process."""
+    import subprocess
+
+    cmd = [
+        sys.executable,
+        '-m', 'scrape_yelp.generate_city_targets',
+        '--states', ','.join(states)
+    ]
+
+    if clear_existing:
+        cmd.append('--clear')
+
+    try:
+        # Launch as completely detached background process
+        # Redirect output to log file
+        log_file = 'logs/generate_yelp_targets.log'
+        with open(log_file, 'w') as f:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=os.getcwd(),
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                start_new_session=True  # Detach from parent process
+            )
+
+        return True, f"Target generation started (PID: {proc.pid}). Check {log_file} for progress."
+    except Exception as e:
+        return False, str(e)
+
+
 async def get_yp_target_stats(states):
     """Get statistics about Yellow Pages targets for the selected states."""
     try:
@@ -226,6 +257,52 @@ async def get_yp_target_stats(states):
             failed = session.query(YPTarget).filter(
                 YPTarget.state_id.in_(states),
                 YPTarget.status == 'failed'
+            ).count()
+
+            return {
+                'total': total,
+                'planned': planned,
+                'in_progress': in_progress,
+                'done': done,
+                'failed': failed
+            }
+        finally:
+            session.close()
+
+    except Exception as e:
+        return None
+
+
+async def get_yelp_target_stats(states):
+    """Get statistics about Yelp targets for the selected states."""
+    try:
+        from db.models import YelpTarget
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from dotenv import load_dotenv
+        load_dotenv()
+
+        engine = create_engine(os.getenv('DATABASE_URL'))
+        Session = sessionmaker(bind=engine)
+        session = Session()
+
+        try:
+            total = session.query(YelpTarget).filter(YelpTarget.state_id.in_(states)).count()
+            planned = session.query(YelpTarget).filter(
+                YelpTarget.state_id.in_(states),
+                YelpTarget.status == 'PLANNED'
+            ).count()
+            in_progress = session.query(YelpTarget).filter(
+                YelpTarget.state_id.in_(states),
+                YelpTarget.status == 'IN_PROGRESS'
+            ).count()
+            done = session.query(YelpTarget).filter(
+                YelpTarget.state_id.in_(states),
+                YelpTarget.status == 'DONE'
+            ).count()
+            failed = session.query(YelpTarget).filter(
+                YelpTarget.state_id.in_(states),
+                YelpTarget.status == 'FAILED'
             ).count()
 
             return {
@@ -1718,39 +1795,513 @@ def build_google_maps_ui(container):
         stop_button.on('click', stop_discovery)
 
 
+async def run_yelp_city_first_discovery(
+    state_ids,
+    max_targets,
+    scrape_details,
+    stats_card,
+    progress_bar,
+    run_button,
+    stop_button
+):
+    """Run Yelp city-first discovery in background with progress updates."""
+    discovery_state.running = True
+    discovery_state.reset()
+    discovery_state.start_time = datetime.now()
+
+    # Register job in process manager
+    job_id = 'discovery_yelp_city_first'
+    process_manager.register(job_id, 'Yelp 5-Worker City-First System', log_file='logs/yelp_workers/worker_1.log')
+
+    # Disable run button, enable stop button
+    run_button.disable()
+    stop_button.enable()
+
+    # Start tailing log file (monitor worker 1's log as primary)
+    if discovery_state.log_viewer:
+        discovery_state.log_viewer.set_log_file('logs/yelp_workers/worker_1.log')
+        discovery_state.log_viewer.load_last_n_lines(50)
+        discovery_state.log_viewer.start_tailing()
+
+    # Add initial log messages
+    discovery_state.add_log('=' * 60, 'info')
+    discovery_state.add_log('YELP 5-WORKER CITY-FIRST SYSTEM STARTED', 'success')
+    discovery_state.add_log('=' * 60, 'info')
+    discovery_state.add_log('Workers: 5 parallel workers with state partitioning', 'info')
+    discovery_state.add_log('Coverage: All 50 US states', 'info')
+    discovery_state.add_log(f'Scrape Details: {scrape_details}', 'info')
+    discovery_state.add_log('Log shown: Worker 1 (see logs/yelp_workers/worker_*.log for others)', 'info')
+    discovery_state.add_log('-' * 60, 'info')
+
+    # Clear stats
+    stats_card.clear()
+    with stats_card:
+        ui.label('Running city-first discovery...').classes('text-lg font-bold')
+        stat_labels = {
+            'targets': ui.label('Targets: 0'),
+            'businesses': ui.label('Businesses: 0'),
+            'saved': ui.label('Saved: 0'),
+            'captchas': ui.label('CAPTCHAs: 0')
+        }
+
+    try:
+        ui.notify('Starting 5-worker Yelp city-first scraper system...', type='info')
+
+        # Call the 5-worker start script
+        cmd = [
+            'bash',
+            'scripts/yelp_workers/start_yelp_workers.sh'
+        ]
+
+        # Create subprocess runner (uses worker 1's log as primary)
+        runner = SubprocessRunner(job_id, 'logs/yelp_workers/worker_1.log')
+        discovery_state.subprocess_runner = runner
+
+        # Start the 5-worker system
+        pid = runner.start(cmd, cwd=os.getcwd())
+        ui.notify(f'5-worker system started (script PID: {pid})', type='positive')
+        ui.notify('Workers deployed: 5 workers processing all 50 states', type='info')
+
+        # Update process manager with script PID
+        process_manager.update_pid(job_id, pid)
+
+        # Wait for subprocess to complete
+        while runner.is_running():
+            await asyncio.sleep(1.0)
+
+            # Update progress bar (rough estimate based on time)
+            elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
+            # City-first: ~30 seconds per target average
+            if max_targets:
+                estimated_done = min(int(elapsed / 30), max_targets)
+                progress_bar.value = estimated_done / max_targets
+            else:
+                # Indeterminate progress
+                progress_bar.value = 0.5
+
+            # Check for cancellation
+            if discovery_state.is_cancelled():
+                ui.notify('Stopping 5-worker system...', type='warning')
+                # Call stop script to gracefully stop all 5 workers
+                import subprocess
+                subprocess.run(['bash', 'scripts/yelp_workers/stop_yelp_workers.sh'],
+                             cwd=os.getcwd(), capture_output=True)
+                runner.kill()  # Also kill the start script
+                break
+
+        # Get final status
+        status = runner.get_status()
+
+        if discovery_state.is_cancelled():
+            discovery_state.add_log('=' * 60, 'info')
+            discovery_state.add_log('YELP DISCOVERY CANCELLED BY USER', 'warning')
+            discovery_state.add_log('=' * 60, 'info')
+
+            stats_card.clear()
+            with stats_card:
+                ui.label('Discovery cancelled').classes('text-lg text-yellow-500')
+
+            run_button.enable()
+            stop_button.disable()
+            progress_bar.value = 0
+
+            ui.notify('Yelp discovery cancelled', type='warning')
+        elif status['exit_code'] == 0:
+            discovery_state.add_log('=' * 60, 'info')
+            discovery_state.add_log('YELP DISCOVERY COMPLETED SUCCESSFULLY!', 'success')
+            discovery_state.add_log('=' * 60, 'info')
+
+            stats_card.clear()
+            with stats_card:
+                ui.label('Discovery complete!').classes('text-lg text-green-500 font-bold')
+                ui.label('Check logs for detailed results').classes('text-sm')
+
+            run_button.enable()
+            stop_button.disable()
+            progress_bar.value = 1.0
+
+            ui.notify('Yelp discovery completed successfully!', type='positive')
+        else:
+            discovery_state.add_log('=' * 60, 'error')
+            discovery_state.add_log('YELP DISCOVERY FAILED!', 'error')
+            discovery_state.add_log(f'Exit code: {status["exit_code"]}', 'error')
+            discovery_state.add_log('=' * 60, 'error')
+
+            stats_card.clear()
+            with stats_card:
+                ui.label('Discovery failed').classes('text-lg text-red-500 font-bold')
+                ui.label(f'Exit code: {status["exit_code"]}').classes('text-sm')
+
+            run_button.enable()
+            stop_button.disable()
+            progress_bar.value = 0
+
+            ui.notify(f'Yelp discovery failed with exit code {status["exit_code"]}', type='negative')
+
+    except Exception as e:
+        discovery_state.add_log('=' * 60, 'error')
+        discovery_state.add_log(f'EXCEPTION: {str(e)}', 'error')
+        discovery_state.add_log('=' * 60, 'error')
+
+        stats_card.clear()
+        with stats_card:
+            ui.label('Discovery error').classes('text-lg text-red-500 font-bold')
+            ui.label(str(e)).classes('text-sm')
+
+        run_button.enable()
+        stop_button.disable()
+        progress_bar.value = 0
+
+        ui.notify(f'Yelp discovery failed: {str(e)}', type='negative')
+
+    finally:
+        discovery_state.running = False
+        discovery_state.subprocess_runner = None
+        process_manager.mark_completed('discovery_yelp', success=not discovery_state.cancel_requested)
+
+
 def build_yelp_ui(container):
     """Build Yelp discovery UI in the given container."""
     with container:
         # Configuration card
         with ui.card().classes('w-full mb-4'):
-            ui.label('Yelp Discovery Configuration').classes('text-xl font-bold mb-4')
+            ui.label('Yelp Configuration').classes('text-xl font-bold mb-4')
 
-            # Coming soon banner
-            with ui.card().classes('w-full bg-orange-900 border-l-4 border-orange-500 mb-4'):
-                ui.label('🚧 Yelp Discovery - Coming Soon').classes('text-lg font-bold text-orange-200')
-                ui.label('• Search businesses on Yelp with rich review data').classes('text-sm text-orange-100')
-                ui.label('• Includes ratings, reviews, and business hours').classes('text-sm text-orange-100')
-                ui.label('• Category and location-based searches').classes('text-sm text-orange-100')
+            # City-First Crawl Controls
+            ui.label('States to Crawl').classes('font-semibold mb-2')
 
-            # Placeholder configuration
-            ui.label('Business Category').classes('font-semibold mb-2')
-            category_input = ui.input(
-                label='Category to search for',
-                placeholder='e.g., pressure washing, restaurants, plumbers',
-                value='pressure washing'
-            ).props('disable').classes('w-full mb-4')
+            # All 50 US states
+            all_states = [
+                'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
+                'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
+                'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
+                'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
+                'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'
+            ]
 
-            ui.label('Location').classes('font-semibold mb-2')
-            location_input = ui.input(
-                label='City and state',
-                placeholder='e.g., Seattle, WA',
-                value='Seattle, WA'
-            ).props('disable').classes('w-full mb-4')
+            # Store checkbox states in a dict
+            state_checkboxes = {}
 
-        # Status message
+            with ui.card().classes('w-full bg-gray-800 p-4 mb-4'):
+                with ui.row().classes('w-full items-center mb-2'):
+                    ui.label('Select States').classes('text-sm font-bold text-blue-200')
+                    ui.space()
+                    select_all_btn = ui.button('Select All', icon='check_box', color='positive').props('size=sm outline')
+                    deselect_all_btn = ui.button('Deselect All', icon='check_box_outline_blank', color='warning').props('size=sm outline')
+
+                # Create checkbox grid (10 columns for 50 states = 5 rows)
+                with ui.grid(columns=10).classes('w-full gap-2'):
+                    for state in all_states:
+                        state_checkboxes[state] = ui.checkbox(state, value=True).classes('text-xs')
+
+                # Select/Deselect All functionality
+                def select_all():
+                    for checkbox in state_checkboxes.values():
+                        checkbox.value = True
+
+                def deselect_all():
+                    for checkbox in state_checkboxes.values():
+                        checkbox.value = False
+
+                select_all_btn.on('click', select_all)
+                deselect_all_btn.on('click', deselect_all)
+
+            ui.label('✓ All 50 states selected by default - will process ALL available targets').classes('text-xs text-green-400 mb-4')
+
+            ui.separator().classes('my-4')
+
+            # Step 1: Generate Targets
+            ui.label('Step 1: Generate Targets').classes('font-semibold mb-2 mt-4')
+            ui.label('Generate scraping targets (city × category combinations) before running the crawler').classes('text-sm text-gray-400 mb-2')
+
+            # Target stats display (dynamic)
+            target_stats_container = ui.column().classes('w-full mb-3')
+
+            with ui.row().classes('gap-2 mb-4 items-center'):
+                generate_button = ui.button(
+                    'GENERATE TARGETS',
+                    icon='add_circle',
+                    color='secondary'
+                ).props('size=md')
+
+                refresh_stats_button = ui.button(
+                    'Refresh Stats',
+                    icon='refresh',
+                    on_click=lambda: None  # Will be set below
+                ).props('flat dense')
+
+            ui.separator().classes('my-4')
+
+            # Step 2: Crawler Settings
+            ui.label('Step 2: Crawler Settings').classes('font-semibold mb-2 mt-4')
+
+            ui.label('Max Targets').classes('font-semibold mb-2')
+            max_targets_input = ui.number(
+                label='Maximum targets to process (leave empty for all)',
+                value=None,
+                min=1,
+                max=10000,
+                step=1
+            ).classes('w-64 mb-2')
+            ui.label('Limit number of targets to process (useful for testing)').classes('text-xs text-gray-400 mb-3')
+
+            # Scrape details checkbox
+            scrape_details_checkbox = ui.checkbox(
+                'Scrape full business details',
+                value=True
+            ).classes('mb-1')
+            ui.label('Unchecking will only get basic info (faster but less data)').classes('text-xs text-gray-400')
+
+        # Stats and controls
+        with ui.card().classes('w-full mb-4'):
+            ui.label('Discovery Status').classes('text-xl font-bold mb-4')
+
+            # Stats card
+            stats_card = ui.column().classes('w-full mb-4')
+            with stats_card:
+                ui.label('Ready to start').classes('text-lg')
+
+            # Progress bar
+            progress_bar = ui.linear_progress(value=0).classes('w-full mb-4')
+
+            # Control buttons
+            with ui.row().classes('gap-2'):
+                run_button = ui.button('START DISCOVERY', icon='play_arrow', color='positive')
+                stop_button = ui.button('STOP', icon='stop', color='negative')
+
+                # Set initial button states
+                if discovery_state.running:
+                    run_button.disable()
+                    stop_button.enable()
+                else:
+                    run_button.enable()
+                    stop_button.disable()
+
+        # ====================================================================
+        # MULTI-WORKER STATUS DISPLAY (5 Workers)
+        # ====================================================================
+
+        # Yelp Worker State Assignments (matches start_yelp_workers.sh)
+        yelp_worker_states = {
+            0: ['AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA'],
+            1: ['HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD'],
+            2: ['MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ'],
+            3: ['NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC'],
+            4: ['SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY']
+        }
+
+        # Worker Status Grid
+        with ui.card().classes('w-full mb-4'):
+            ui.label('5-Worker System Status').classes('text-xl font-bold mb-4')
+
+            with ui.grid(columns=5).classes('w-full gap-3'):
+                yelp_worker_badges = {}
+                yelp_worker_labels = {}
+
+                for worker_id in range(5):
+                    states = yelp_worker_states[worker_id]
+
+                    with ui.card().classes('p-3 hover:shadow-lg transition-shadow bg-gray-800'):
+                        # Header
+                        with ui.row().classes('items-center justify-between w-full mb-2'):
+                            ui.label(f'Worker {worker_id + 1}').classes('font-bold text-sm text-blue-200')
+                            yelp_worker_badges[worker_id] = ui.badge('CHECKING', color='grey').classes('text-xs')
+
+                        # Assigned states
+                        ui.label(f"{', '.join(states[:3])}...").classes('text-xs text-gray-400 mb-2')
+
+                        # Stats placeholder
+                        yelp_worker_labels[worker_id] = ui.label('Ready').classes('text-xs text-gray-300')
+
+        # Live output with tabbed multi-worker log viewers
         with ui.card().classes('w-full'):
-            ui.label('Status').classes('text-xl font-bold mb-4')
-            ui.label('Yelp scraper implementation is planned. This will allow discovery of businesses with Yelp reviews and ratings.').classes('text-gray-400')
+            ui.label('Live Worker Output').classes('text-xl font-bold mb-2')
+
+            # Tab selector for workers
+            with ui.tabs().classes('w-full') as yelp_tabs:
+                yelp_tab_all = ui.tab('All Workers')
+                yelp_worker_tabs = []
+                for i in range(5):
+                    yelp_worker_tabs.append(ui.tab(f'Worker {i + 1}'))
+
+            # Tab panels
+            with ui.tab_panels(yelp_tabs, value=yelp_tab_all).classes('w-full'):
+                # All workers merged view - shows Worker 1 as primary
+                with ui.tab_panel(yelp_tab_all):
+                    ui.label('📊 Aggregate view - showing Worker 1 log as primary').classes('text-xs text-gray-400 mb-2')
+                    log_viewer_all = LiveLogViewer('logs/yelp_workers/worker_0.log', max_lines=400, auto_scroll=True)
+                    log_viewer_all.create()
+                    log_viewer_all.load_last_n_lines(100)
+                    log_viewer_all.start_tailing()
+
+                # Individual worker logs
+                yelp_log_viewers = []
+                for i in range(5):
+                    with ui.tab_panel(yelp_worker_tabs[i]):
+                        states = yelp_worker_states[i]
+                        ui.label(f"🌎 States: {', '.join(states)}").classes('text-xs text-gray-400 mb-2')
+                        log_viewer = LiveLogViewer(f'logs/yelp_workers/worker_{i}.log', max_lines=300, auto_scroll=True)
+                        log_viewer.create()
+                        log_viewer.load_last_n_lines(100)
+                        log_viewer.start_tailing()
+                        yelp_log_viewers.append(log_viewer)
+
+        # Check worker status on page load
+        def check_yelp_workers_status():
+            """Check if Yelp workers are running and update badges."""
+            import subprocess
+            try:
+                # Check for running cli_crawl_yelp.py processes
+                result = subprocess.run(['pgrep', '-f', 'cli_crawl_yelp.py'], capture_output=True, text=True)
+
+                if result.returncode == 0 and result.stdout.strip():
+                    # Workers are running - count them
+                    pids = result.stdout.strip().split('\n')
+                    num_running = len(pids)
+
+                    # Update badges for running workers (assume sequential worker IDs)
+                    for worker_id in range(min(num_running, 5)):
+                        if worker_id in yelp_worker_badges:
+                            yelp_worker_badges[worker_id].set_text('RUNNING')
+                            yelp_worker_badges[worker_id].props('color=positive')
+                        if worker_id in yelp_worker_labels:
+                            yelp_worker_labels[worker_id].set_text('Processing targets...')
+
+                    # Mark remaining workers as idle
+                    for worker_id in range(num_running, 5):
+                        if worker_id in yelp_worker_badges:
+                            yelp_worker_badges[worker_id].set_text('IDLE')
+                            yelp_worker_badges[worker_id].props('color=grey')
+                else:
+                    # No workers running
+                    for worker_id in range(5):
+                        if worker_id in yelp_worker_badges:
+                            yelp_worker_badges[worker_id].set_text('IDLE')
+                            yelp_worker_badges[worker_id].props('color=grey')
+            except Exception as e:
+                print(f"Error checking Yelp worker status: {e}")
+
+        # Initial status check
+        check_yelp_workers_status()
+
+        # Periodic status updates
+        ui.timer(5.0, check_yelp_workers_status)
+
+        # Store references
+        discovery_state.log_viewer = log_viewer_all
+        discovery_state.log_element = None
+
+        # Helper function to get selected states
+        def get_selected_states():
+            """Helper function to get list of selected states from checkboxes."""
+            return [state for state, checkbox in state_checkboxes.items() if checkbox.value]
+
+        # Helper function to update target stats display
+        async def update_target_stats():
+            selected_states = get_selected_states()
+            if not selected_states:
+                target_stats_container.clear()
+                with target_stats_container:
+                    ui.label('No states selected').classes('text-gray-400 italic')
+                return
+
+            stats = await get_yelp_target_stats(selected_states)
+
+            target_stats_container.clear()
+            if stats and stats['total'] > 0:
+                with target_stats_container:
+                    with ui.card().classes('w-full bg-slate-800 p-3'):
+                        ui.label('Target Statistics').classes('text-sm font-bold mb-2')
+                        with ui.grid(columns=5).classes('gap-2'):
+                            ui.label(f'Total: {stats["total"]}').classes('text-xs')
+                            ui.label(f'Planned: {stats["planned"]}').classes('text-xs text-blue-400')
+                            ui.label(f'In Progress: {stats["in_progress"]}').classes('text-xs text-yellow-400')
+                            ui.label(f'Done: {stats["done"]}').classes('text-xs text-green-400')
+                            ui.label(f'Failed: {stats["failed"]}').classes('text-xs text-red-400')
+            else:
+                with target_stats_container:
+                    ui.label('No targets generated yet for selected states').classes('text-yellow-400 italic text-sm')
+
+        # Generate targets button handler
+        async def handle_generate_targets():
+            selected_states = get_selected_states()
+
+            if not selected_states:
+                ui.notify('Please select at least one state', type='warning')
+                return
+
+            # Confirm with user
+            with ui.dialog() as dialog, ui.card():
+                ui.label('Generate Targets?').classes('text-lg font-bold mb-2')
+                ui.label(f'This will generate targets for {len(selected_states)} state(s):').classes('text-sm mb-1')
+                ui.label(f'{", ".join(selected_states)}').classes('text-sm text-blue-400 mb-3')
+                ui.label('Existing targets for these states will be cleared.').classes('text-xs text-yellow-400 mb-3')
+
+                with ui.row().classes('gap-2'):
+                    ui.button('Cancel', on_click=dialog.close).props('flat')
+                    async def confirm_generate():
+                        dialog.close()
+
+                        # Launch target generation in detached background process
+                        success, message = generate_yelp_targets_detached(selected_states, clear_existing=True)
+
+                        if success:
+                            # Calculate estimated time
+                            estimated_minutes = max(2, int(10 * len(selected_states) / 50))
+                            ui.notify(
+                                f'Target generation started for {len(selected_states)} state(s)! '
+                                f'Check logs/generate_yelp_targets.log for progress. Refresh in ~{estimated_minutes} minutes.',
+                                type='positive',
+                                timeout=10000
+                            )
+                        else:
+                            ui.notify(
+                                f'Failed to start target generation: {message}',
+                                type='negative',
+                                timeout=5000
+                            )
+
+                    ui.button('Generate', on_click=confirm_generate, color='positive')
+
+            dialog.open()
+
+        generate_button.on('click', handle_generate_targets)
+        refresh_stats_button.on('click', update_target_stats)
+
+        # Initialize stats display
+        asyncio.create_task(update_target_stats())
+
+        # Run button click handler - City-First Discovery
+        async def start_discovery():
+            # Get selected states from checkboxes
+            selected_states = get_selected_states()
+
+            # Validate city-first inputs
+            if not selected_states:
+                ui.notify('Please select at least one state', type='warning')
+                return
+
+            # Run city-first discovery
+            await run_yelp_city_first_discovery(
+                selected_states,
+                int(max_targets_input.value) if max_targets_input.value else None,
+                scrape_details_checkbox.value,
+                stats_card,
+                progress_bar,
+                run_button,
+                stop_button
+            )
+
+        # Stop button click handler
+        def stop_discovery():
+            if discovery_state.running and discovery_state.subprocess_runner:
+                ui.notify('Stopping Yelp discovery...', type='warning')
+                discovery_state.cancel()
+            else:
+                ui.notify('No discovery is running', type='info')
+
+        run_button.on('click', start_discovery)
+        stop_button.on('click', stop_discovery)
 
 
 
