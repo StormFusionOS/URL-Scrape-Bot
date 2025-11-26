@@ -965,6 +965,163 @@ def domain_from_url(url: str) -> str:
     return domain.lower()
 
 
+class YelpTarget(Base):
+    """
+    Yelp scraping target (city × category).
+
+    Each row represents a city-category combination to be scraped from Yelp.
+    Generated from CityRegistry × allowed categories.
+
+    Attributes:
+        id: Primary key
+        provider: Source provider (always 'Yelp')
+        state_id: 2-letter state code
+        city: City name
+        city_slug: City-state slug (e.g., 'providence-ri')
+        lat: City latitude
+        lng: City longitude
+        category_label: Human-readable category name
+        category_keyword: Yelp search keyword
+        max_results: Maximum results to fetch (1-100)
+        priority: Scraping priority (1=high, 2=medium, 3=low)
+        status: Current status (PLANNED, IN_PROGRESS, DONE, FAILED, STUCK, PARKED)
+        last_attempt_ts: Last attempt timestamp
+        attempts: Number of scraping attempts
+        note: Optional note (e.g., reason for failure)
+        claimed_by: Worker ID that claimed this target
+        claimed_at: When target was claimed by worker
+        heartbeat_at: Last worker heartbeat timestamp
+        results_found: Number of businesses found
+        results_saved: Number of businesses saved to DB
+        duplicates_skipped: Number of duplicates skipped
+        last_error: Last error message encountered
+        captcha_detected: Whether CAPTCHA was encountered
+        finished_at: When target was completed
+        created_at: Record creation timestamp
+        updated_at: Last update timestamp
+    """
+
+    __tablename__ = "yelp_targets"
+
+    # Primary Key
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Provider & Location
+    provider: Mapped[str] = mapped_column(
+        String(10), nullable=False, default='Yelp', index=True
+    )
+    state_id: Mapped[str] = mapped_column(
+        String(2), nullable=False, index=True,
+        comment="2-letter state code"
+    )
+    city: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    city_slug: Mapped[str] = mapped_column(
+        String(255), nullable=False, index=True,
+        comment="City-state slug (e.g., 'providence-ri')"
+    )
+    lat: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment="City latitude"
+    )
+    lng: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment="City longitude"
+    )
+
+    # Category
+    category_label: Mapped[str] = mapped_column(
+        String(255), nullable=False, index=True,
+        comment="Human-readable category name (e.g., 'Window Cleaning')"
+    )
+    category_keyword: Mapped[str] = mapped_column(
+        String(255), nullable=False,
+        comment="Yelp search keyword (e.g., 'window cleaning')"
+    )
+
+    # Search Configuration
+    max_results: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=20,
+        comment="Maximum results to fetch (1-100)"
+    )
+    priority: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=2, index=True,
+        comment="Priority (1=high, 2=medium, 3=low)"
+    )
+
+    # Status Tracking
+    status: Mapped[str] = mapped_column(
+        String(50), nullable=False, default='PLANNED', index=True,
+        comment="PLANNED, IN_PROGRESS, DONE, FAILED, STUCK, PARKED"
+    )
+    last_attempt_ts: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Number of scraping attempts"
+    )
+    note: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Optional note (e.g., 'no results', 'blocked')"
+    )
+
+    # Worker Claim & Heartbeat (for crash recovery)
+    claimed_by: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True, index=True,
+        comment="Worker ID that claimed this target"
+    )
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+        comment="When target was claimed by worker"
+    )
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+        comment="Last worker heartbeat (for orphan detection)"
+    )
+
+    # Results Tracking
+    results_found: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Number of businesses found"
+    )
+    results_saved: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Number of businesses saved to DB"
+    )
+    duplicates_skipped: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Number of duplicates skipped"
+    )
+
+    # Error Tracking
+    last_error: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Last error message encountered"
+    )
+    captcha_detected: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False,
+        comment="Whether CAPTCHA was encountered"
+    )
+
+    # Completion Tracking
+    finished_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+        comment="When target was completed (status=DONE)"
+    )
+
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, onupdate=func.now(), nullable=True
+    )
+
+    def __repr__(self) -> str:
+        """String representation of YelpTarget."""
+        return f"<YelpTarget(id={self.id}, city='{self.city}', state='{self.state_id}', category='{self.category_label}', status='{self.status}', results={self.results_saved})>"
+
+
 class SiteCrawlState(Base):
     """
     Site crawler state for resumable crawling.

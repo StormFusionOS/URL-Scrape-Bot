@@ -530,6 +530,49 @@ class BackendFacade:
         finally:
             session.close()
 
+    def get_yelp_target_stats(self, state_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Get statistics about Yelp city-first targets.
+
+        Args:
+            state_ids: Optional list of state codes to filter by
+
+        Returns:
+            Dict with target statistics by status and priority
+        """
+        from db.models import YelpTarget
+
+        session = create_session()
+        try:
+            query = session.query(YelpTarget)
+            if state_ids:
+                query = query.filter(YelpTarget.state_id.in_(state_ids))
+
+            total = query.count()
+
+            # Get counts by status
+            by_status = {}
+            for status in ["PLANNED", "IN_PROGRESS", "DONE", "FAILED"]:
+                count = query.filter(YelpTarget.status == status).count()
+                if count > 0:
+                    by_status[status] = count
+
+            # Get counts by priority
+            by_priority = {}
+            for priority in [1, 2, 3]:
+                count = query.filter(YelpTarget.priority == priority).count()
+                if count > 0:
+                    by_priority[priority] = count
+
+            return {
+                "total": total,
+                "by_status": by_status,
+                "by_priority": by_priority,
+                "states": state_ids if state_ids else "all"
+            }
+        finally:
+            session.close()
+
     def get_discovery_source_statuses(self) -> Dict[str, Dict[str, Any]]:
         """
         Get comprehensive status for all discovery sources.
@@ -549,7 +592,7 @@ class BackendFacade:
                 'Site': {...}
             }
         """
-        from db.models import YPTarget, GoogleTarget
+        from db.models import YPTarget, GoogleTarget, YelpTarget
         from sqlalchemy import func, desc
         from datetime import datetime
 
@@ -628,6 +671,43 @@ class BackendFacade:
                     'category': google_last.category_label,
                     'results_saved': google_last.results_saved or 0
                 } if google_last else None
+            }
+
+            # ===== Yelp Status =====
+            yelp_in_progress = session.query(func.count(YelpTarget.id)).filter(
+                func.upper(YelpTarget.status) == 'IN_PROGRESS'
+            ).scalar() or 0
+
+            yelp_planned = session.query(func.count(YelpTarget.id)).filter(
+                func.upper(YelpTarget.status) == 'PLANNED'
+            ).scalar() or 0
+
+            yelp_done = session.query(func.count(YelpTarget.id)).filter(
+                func.upper(YelpTarget.status) == 'DONE'
+            ).scalar() or 0
+
+            yelp_failed = session.query(func.count(YelpTarget.id)).filter(
+                func.upper(YelpTarget.status) == 'FAILED'
+            ).scalar() or 0
+
+            # Get last completed Yelp target
+            yelp_last = session.query(YelpTarget).filter(
+                func.upper(YelpTarget.status) == 'DONE',
+                YelpTarget.finished_at.isnot(None)
+            ).order_by(desc(YelpTarget.finished_at)).first()
+
+            statuses['Yelp'] = {
+                'is_running': yelp_in_progress > 0,
+                'active_count': yelp_in_progress,
+                'pending_count': yelp_planned,
+                'done_count': yelp_done,
+                'failed_count': yelp_failed,
+                'last_run': {
+                    'timestamp': yelp_last.finished_at.isoformat() if yelp_last.finished_at else None,
+                    'city': yelp_last.city,
+                    'category': yelp_last.category_label,
+                    'results_saved': yelp_last.results_saved or 0
+                } if yelp_last else None
             }
 
             return statuses
