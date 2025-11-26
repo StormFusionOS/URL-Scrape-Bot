@@ -197,11 +197,10 @@ def calculate_combined_score(company: Dict, verification_result: Dict) -> float:
     """
     Calculate combined score using discovery signals + website verification.
 
-    Formula (when discovery score available):
-        combined_score = 0.4 * discovery_conf + 0.4 * web_conf + 0.2 * review_score
-
-    Formula (when no discovery score):
-        combined_score = 0.7 * web_conf + 0.3 * review_score
+    Enhanced formula with LLM legitimacy boost:
+    - When LLM confirms legitimacy: 0.9 * web_conf + 0.1 * review_score
+    - With discovery signals: 0.3 * discovery + 0.5 * web + 0.2 * reviews
+    - Without discovery: 0.8 * web_conf + 0.2 * review_score
     """
     parse_metadata = company.get('parse_metadata', {})
 
@@ -209,30 +208,37 @@ def calculate_combined_score(company: Dict, verification_result: Dict) -> float:
     google_conf = parse_metadata.get('google_filter', {}).get('confidence', 0.0)
     yp_conf = parse_metadata.get('yp_filter', {}).get('confidence', 0.0)
 
-    # Website verification score
+    # Website verification score (already LLM-weighted in service_verifier)
     web_conf = verification_result.get('score', 0.0)
+
+    # LLM legitimacy check
+    is_llm_legitimate = verification_result.get('is_legitimate', False)
+    llm_score = verification_result.get('llm_score', 0)
 
     # Review count (log-scaled)
     import math
     reviews_total = (company.get('reviews_google', 0) or 0) + (company.get('reviews_yp', 0) or 0)
     review_score = min(math.log1p(reviews_total) / 5.0, 1.0)  # Normalize to 0-1
 
-    # Weighted combination
     # Use whichever discovery signal is available (prefer Google > YP)
     discovery_conf = google_conf if google_conf > 0 else yp_conf
 
-    if discovery_conf > 0:
-        # Standard formula: discovery + website + reviews
+    # Enhanced scoring with LLM legitimacy
+    if is_llm_legitimate and llm_score >= 70:
+        # LLM confirms this is a legitimate service provider - trust web verification heavily
+        combined_score = 0.9 * web_conf + 0.1 * review_score
+    elif discovery_conf > 0:
+        # Have discovery signals - balanced approach
         combined_score = (
-            0.4 * discovery_conf +
-            0.4 * web_conf +
+            0.3 * discovery_conf +
+            0.5 * web_conf +
             0.2 * review_score
         )
     else:
-        # No discovery score available, rely more heavily on website verification
+        # No discovery, rely on web verification
         combined_score = (
-            0.7 * web_conf +
-            0.3 * review_score
+            0.8 * web_conf +
+            0.2 * review_score
         )
 
     return combined_score
@@ -257,20 +263,18 @@ def update_company_verification(
         min_score: Minimum score for auto-accept
         max_score: Maximum score for auto-reject
     """
-    # Determine active flag based on combined score
-    if combined_score >= min_score:
+    # LLM-based verification: trust is_legitimate flag
+    is_legitimate = verification_result.get('is_legitimate', False)
+
+    # Determine active flag based on LLM legitimacy check
+    if is_legitimate:
         active = True
         verification_result['status'] = 'passed'
         verification_result['needs_review'] = False
-    elif combined_score <= max_score:
+    else:
         active = False
         verification_result['status'] = 'failed'
         verification_result['needs_review'] = False
-    else:
-        # Keep current active status, but flag for review
-        active = None  # Don't change
-        verification_result['status'] = 'unknown'
-        verification_result['needs_review'] = True
 
     # Add combined score to result
     verification_result['combined_score'] = combined_score

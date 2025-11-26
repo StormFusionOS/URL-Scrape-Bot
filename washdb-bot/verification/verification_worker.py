@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Verification worker process.
+Verification worker process with prefetch buffer.
 
-Continuously processes unverified companies from the database:
-1. Acquires next company with row-level locking
-2. Fetches website content
-3. Runs verification logic
-4. Updates database with results
-5. Repeats until shutdown signal
+Uses a background thread to prefetch company websites while the main thread
+runs LLM verification, keeping the GPU queue fed continuously.
+
+Architecture:
+1. Background prefetch thread acquires companies and fetches HTML
+2. Prefetch buffer holds N ready-to-verify companies
+3. Main thread pulls from buffer and runs verification
+4. GPU stays busy because work is always ready
 """
 
 import os
@@ -15,9 +17,12 @@ import sys
 import time
 import signal
 import json
+import threading
+import queue
 from datetime import datetime
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 from pathlib import Path
+from dataclasses import dataclass
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text, or_
@@ -41,9 +46,200 @@ EMPTY_QUEUE_DELAY = 60  # Seconds to wait when queue is empty
 MAX_EMPTY_QUEUE_DELAY = 300  # Max backoff delay
 MIN_SCORE = float(os.getenv('VERIFY_MIN_SCORE', '0.75'))
 MAX_SCORE = float(os.getenv('VERIFY_MAX_SCORE', '0.25'))  # Lowered from 0.35
+PREFETCH_BUFFER_SIZE = int(os.getenv('VERIFY_PREFETCH_SIZE', '3'))  # Companies to prefetch
 
 # Shutdown flag
 shutdown_requested = False
+
+
+@dataclass
+class PrefetchedCompany:
+    """A company with its pre-fetched website HTML."""
+    company: Dict
+    html: Optional[str]
+    metadata: Optional[Dict]
+    fetch_error: Optional[str] = None
+
+
+class PrefetchBuffer:
+    """
+    Buffer that prefetches company websites in background.
+
+    Keeps N companies ready with their HTML already fetched,
+    so verification can proceed immediately without waiting for network I/O.
+    """
+
+    def __init__(self, worker_id: int, session_factory, logger, buffer_size: int = 3):
+        self.worker_id = worker_id
+        self.session_factory = session_factory
+        self.logger = logger
+        self.buffer_size = buffer_size
+
+        self._buffer: queue.Queue[PrefetchedCompany] = queue.Queue(maxsize=buffer_size)
+        self._prefetch_thread: Optional[threading.Thread] = None
+        self._running = False
+
+    def start(self):
+        """Start the prefetch background thread."""
+        self._running = True
+        self._prefetch_thread = threading.Thread(
+            target=self._prefetch_loop,
+            name=f"Prefetch-{self.worker_id}",
+            daemon=True
+        )
+        self._prefetch_thread.start()
+        self.logger.info(f"Prefetch buffer started (size={self.buffer_size})")
+
+    def stop(self):
+        """Stop the prefetch thread."""
+        self._running = False
+        if self._prefetch_thread:
+            self._prefetch_thread.join(timeout=5.0)
+
+    def get(self, timeout: float = 30.0) -> Optional[PrefetchedCompany]:
+        """Get next prefetched company (blocks until available)."""
+        try:
+            return self._buffer.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def qsize(self) -> int:
+        """Current buffer size."""
+        return self._buffer.qsize()
+
+    def _prefetch_loop(self):
+        """Background loop that continuously prefetches companies."""
+        while self._running and not shutdown_requested:
+            # Only prefetch if buffer has room
+            if self._buffer.full():
+                time.sleep(0.1)
+                continue
+
+            session = self.session_factory()
+            try:
+                # Acquire company
+                company = self._acquire_company(session)
+
+                if not company:
+                    # Queue empty - wait before retrying
+                    session.close()
+                    time.sleep(5.0)
+                    continue
+
+                # Fetch website HTML (this is the slow part)
+                website = company.get('website')
+                html = None
+                metadata = None
+                fetch_error = None
+
+                if website:
+                    try:
+                        html = fetch_page(website, delay=MIN_DELAY_SECONDS)
+                        if html:
+                            metadata = parse_site_content(html, website)
+                        else:
+                            fetch_error = "Failed to fetch website"
+                    except Exception as e:
+                        fetch_error = str(e)
+                        self.logger.debug(f"Prefetch error for {company['name']}: {e}")
+
+                # Add to buffer
+                prefetched = PrefetchedCompany(
+                    company=company,
+                    html=html,
+                    metadata=metadata,
+                    fetch_error=fetch_error
+                )
+
+                try:
+                    self._buffer.put(prefetched, timeout=5.0)
+                    self.logger.debug(f"Prefetched: {company['name']} (buffer: {self._buffer.qsize()})")
+                except queue.Full:
+                    # Buffer full, mark company as not in_progress
+                    self.logger.warning(f"Buffer full, releasing {company['name']}")
+
+            except Exception as e:
+                self.logger.error(f"Prefetch loop error: {e}")
+                time.sleep(1.0)
+            finally:
+                session.close()
+
+    def _acquire_company(self, session) -> Optional[Dict]:
+        """Acquire a company for verification (same logic as main acquire)."""
+        try:
+            query = text("""
+                SELECT
+                    id, name, website, domain, phone, email,
+                    services, service_area, address, source,
+                    rating_yp, rating_google, reviews_yp, reviews_google,
+                    parse_metadata, active, created_at, last_updated
+                FROM companies
+                WHERE website IS NOT NULL
+                  AND (
+                      parse_metadata->'verification' IS NULL
+                      OR parse_metadata->'verification'->>'status' IS NULL
+                      OR parse_metadata->'verification'->>'status' = 'in_progress'
+                  )
+                ORDER BY created_at DESC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            """)
+
+            result = session.execute(query)
+            row = result.fetchone()
+
+            if not row:
+                return None
+
+            company = {
+                'id': row.id,
+                'name': row.name,
+                'website': row.website,
+                'domain': row.domain,
+                'phone': row.phone,
+                'email': row.email,
+                'services': row.services,
+                'service_area': row.service_area,
+                'address': row.address,
+                'source': row.source,
+                'rating_yp': row.rating_yp,
+                'rating_google': row.rating_google,
+                'reviews_yp': row.reviews_yp,
+                'reviews_google': row.reviews_google,
+                'parse_metadata': row.parse_metadata or {},
+                'active': row.active,
+                'created_at': row.created_at,
+                'last_updated': row.last_updated
+            }
+
+            # Mark as in_progress
+            mark_query = text("""
+                UPDATE companies
+                SET parse_metadata = jsonb_set(
+                    COALESCE(parse_metadata, '{}'::jsonb),
+                    '{verification}',
+                    jsonb_build_object(
+                        'status', 'in_progress'::text,
+                        'worker_id', CAST(:worker_id AS integer),
+                        'started_at', CAST(:started_at AS text)
+                    )
+                )
+                WHERE id = :company_id
+            """)
+
+            session.execute(mark_query, {
+                'company_id': company['id'],
+                'worker_id': self.worker_id,
+                'started_at': datetime.now().isoformat()
+            })
+            session.commit()
+
+            return company
+
+        except Exception as e:
+            self.logger.error(f"Error acquiring company: {e}")
+            session.rollback()
+            return None
 
 
 def signal_handler(signum, frame):
@@ -148,7 +344,7 @@ def acquire_company_for_verification(session, worker_id: int, logger) -> Optiona
 
 def verify_company(company: Dict, verifier, logger) -> Optional[Dict]:
     """
-    Verify a single company's website.
+    Verify a single company's website (fetches HTML).
 
     Args:
         company: Company data dict
@@ -211,6 +407,68 @@ def verify_company(company: Dict, verifier, logger) -> Optional[Dict]:
         }
 
 
+def verify_prefetched_company(prefetched: PrefetchedCompany, verifier, logger) -> Optional[Dict]:
+    """
+    Verify a company using pre-fetched HTML (no network I/O).
+
+    This is the fast path - HTML is already fetched by background thread.
+
+    Args:
+        prefetched: PrefetchedCompany with HTML already loaded
+        verifier: ServiceVerifier instance
+        logger: Logger instance
+
+    Returns:
+        Verification result dict or None on error
+    """
+    company = prefetched.company
+    website = company.get('website')
+
+    logger.info(f"Verifying (prefetched): {company['name']} ({website})")
+
+    # Handle fetch errors from prefetch
+    if prefetched.fetch_error or not prefetched.html:
+        logger.warning(f"Prefetch failed for {website}: {prefetched.fetch_error}")
+        return {
+            'status': 'failed',
+            'score': 0.0,
+            'reason': prefetched.fetch_error or 'Failed to fetch website',
+            'negative_signals': ['Website unreachable'],
+            'positive_signals': [],
+            'services_detected': {},
+            'tier': 'D'
+        }
+
+    try:
+        # Run verification with pre-fetched data (this is where LLM is called)
+        verification_result = verifier.verify_company(
+            company_data=company,
+            website_html=prefetched.html,
+            website_metadata=prefetched.metadata
+        )
+
+        logger.info(
+            f"Verified {company['name']}: "
+            f"Status={verification_result['status']}, "
+            f"Score={verification_result['score']:.2f}, "
+            f"Tier={verification_result['tier']}"
+        )
+
+        return verification_result
+
+    except Exception as e:
+        logger.error(f"Error verifying {company['name']}: {e}")
+        return {
+            'status': 'failed',
+            'score': 0.0,
+            'reason': f'Verification error: {str(e)}',
+            'negative_signals': [f'Error: {str(e)}'],
+            'positive_signals': [],
+            'services_detected': {},
+            'tier': 'D'
+        }
+
+
 def update_company_verification(
     session,
     company_id: int,
@@ -231,20 +489,20 @@ def update_company_verification(
         logger: Logger instance
     """
     try:
-        # Determine active flag based on combined score
-        if combined_score >= MIN_SCORE:
+        # LLM-based verification: trust is_legitimate flag
+        is_legitimate = verification_result.get('is_legitimate', False)
+
+        # Determine active flag based on LLM legitimacy check
+        if is_legitimate:
             active = True
             verification_result['status'] = 'passed'
             verification_result['needs_review'] = False
-        elif combined_score <= MAX_SCORE:
+            logger.info(f"LLM verified as legitimate")
+        else:
             active = False
             verification_result['status'] = 'failed'
             verification_result['needs_review'] = False
-        else:
-            # Keep current active status, but flag for review
-            active = None  # Don't change
-            verification_result['status'] = 'unknown'
-            verification_result['needs_review'] = True
+            logger.info(f"LLM marked as not legitimate")
 
         # Add metadata
         verification_result['combined_score'] = combined_score
@@ -304,6 +562,11 @@ def run_worker(worker_id: int, config: Dict):
     """
     Main worker function - runs continuously until shutdown.
 
+    When USE_LLM_QUEUE is enabled, uses prefetch buffer to keep GPU busy:
+    - Background thread fetches websites into buffer
+    - Main thread pulls from buffer and runs verification (LLM)
+    - No network I/O wait in main thread = GPU always has work
+
     Args:
         worker_id: Worker ID (0-4 for 5 workers)
         config: Configuration dict
@@ -318,6 +581,7 @@ def run_worker(worker_id: int, config: Dict):
     logger.info(f"Max delay: {MAX_DELAY_SECONDS}s")
     logger.info(f"Min score (auto-pass): {MIN_SCORE}")
     logger.info(f"Max score (auto-reject): {MAX_SCORE}")
+    logger.info(f"Prefetch buffer size: {PREFETCH_BUFFER_SIZE}")
     logger.info("-" * 70)
 
     # Register signal handlers
@@ -330,12 +594,28 @@ def run_worker(worker_id: int, config: Dict):
 
     # Create verifier with LLM mode (can be controlled via env var)
     use_llm = os.getenv('VERIFY_USE_LLM', 'true').lower() in ['true', '1', 'yes']
+    use_llm_queue = os.getenv('USE_LLM_QUEUE', 'true').lower() in ['true', '1', 'yes']
     verifier = create_verifier(use_llm=use_llm)
 
     if use_llm:
-        logger.info("🤖 LLM-enhanced verification ENABLED (Llama 3.2 3B)")
+        if use_llm_queue:
+            logger.info("🤖 LLM verification ENABLED with GPU Queue + Prefetch (steady GPU)")
+        else:
+            logger.info("🤖 LLM verification ENABLED (direct mode)")
     else:
         logger.info("📊 Rule-based verification only (LLM disabled)")
+
+    # Setup prefetch buffer if using LLM queue
+    prefetch_buffer = None
+    if use_llm_queue:
+        prefetch_buffer = PrefetchBuffer(
+            worker_id=worker_id,
+            session_factory=Session,
+            logger=logger,
+            buffer_size=PREFETCH_BUFFER_SIZE
+        )
+        prefetch_buffer.start()
+        logger.info("📦 Prefetch buffer STARTED")
 
     # Counters
     processed_count = 0
@@ -348,31 +628,45 @@ def run_worker(worker_id: int, config: Dict):
             session = Session()
 
             try:
-                # Acquire next company
-                company = acquire_company_for_verification(session, worker_id, logger)
+                if use_llm_queue and prefetch_buffer:
+                    # PREFETCH MODE: Pull from buffer (fast - no network wait)
+                    prefetched = prefetch_buffer.get(timeout=10.0)
 
-                if not company:
-                    # Queue is empty
-                    empty_queue_count += 1
-                    logger.info(f"Queue empty (count: {empty_queue_count}), sleeping {current_delay}s")
-                    time.sleep(current_delay)
+                    if not prefetched:
+                        # Buffer empty - wait for prefetch thread
+                        empty_queue_count += 1
+                        if empty_queue_count > 5:
+                            logger.info(f"Prefetch buffer empty, waiting...")
+                            time.sleep(2.0)
+                        continue
 
-                    # Exponential backoff
-                    current_delay = min(current_delay * 1.5, MAX_EMPTY_QUEUE_DELAY)
-                    continue
+                    # Reset empty count
+                    empty_queue_count = 0
 
-                # Reset empty queue tracking
-                empty_queue_count = 0
-                current_delay = EMPTY_QUEUE_DELAY
+                    # Verify using pre-fetched data (only LLM call, no network)
+                    company = prefetched.company
+                    verification_result = verify_prefetched_company(prefetched, verifier, logger)
 
-                # Verify company
-                verification_result = verify_company(company, verifier, logger)
+                else:
+                    # LEGACY MODE: Fetch and verify sequentially
+                    company = acquire_company_for_verification(session, worker_id, logger)
 
+                    if not company:
+                        empty_queue_count += 1
+                        logger.info(f"Queue empty (count: {empty_queue_count}), sleeping {current_delay}s")
+                        time.sleep(current_delay)
+                        current_delay = min(current_delay * 1.5, MAX_EMPTY_QUEUE_DELAY)
+                        continue
+
+                    empty_queue_count = 0
+                    current_delay = EMPTY_QUEUE_DELAY
+
+                    verification_result = verify_company(company, verifier, logger)
+
+                # Update database with results
                 if verification_result:
-                    # Calculate combined score
                     combined_score = calculate_combined_score(company, verification_result)
 
-                    # Update database
                     update_company_verification(
                         session,
                         company['id'],
@@ -386,15 +680,20 @@ def run_worker(worker_id: int, config: Dict):
                     if verification_result['status'] in ['passed', 'unknown']:
                         success_count += 1
 
+                    # Log progress with buffer status
+                    buffer_info = f", Buffer={prefetch_buffer.qsize()}" if prefetch_buffer else ""
                     logger.info(
                         f"Progress: Processed={processed_count}, "
                         f"Success={success_count}, "
-                        f"Rate={success_count/processed_count*100:.1f}%"
+                        f"Rate={success_count/processed_count*100:.1f}%{buffer_info}"
                     )
 
-                # Rate limiting
-                delay = MIN_DELAY_SECONDS + (MAX_DELAY_SECONDS - MIN_DELAY_SECONDS) * 0.5
-                time.sleep(delay)
+                # Minimal delay in prefetch mode (GPU should stay busy)
+                if use_llm_queue:
+                    pass  # No delay - next item already prefetched
+                else:
+                    delay = MIN_DELAY_SECONDS + (MAX_DELAY_SECONDS - MIN_DELAY_SECONDS) * 0.5
+                    time.sleep(delay)
 
             finally:
                 session.close()
@@ -410,6 +709,8 @@ def run_worker(worker_id: int, config: Dict):
         raise
 
     finally:
+        if prefetch_buffer:
+            prefetch_buffer.stop()
         engine.dispose()
 
 

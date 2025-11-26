@@ -535,7 +535,49 @@ def get_worker_pool_state() -> Dict:
 
 
 async def start_worker_pool(num_workers: int):
-    """Start verification worker pool."""
+    """Start all verification services (LLM service + workers)."""
+    import subprocess
+
+    ui.notify('Starting verification services...', type='info')
+
+    # First, check if LLM service is already running
+    llm_running = False
+    try:
+        result = subprocess.run(
+            ['pgrep', '-f', 'llm_service.py'],
+            capture_output=True,
+            timeout=5
+        )
+        llm_running = result.returncode == 0
+    except Exception:
+        pass
+
+    # Start LLM service if not running
+    if not llm_running:
+        ui.notify('Starting LLM service...', type='info')
+        try:
+            llm_cmd = [
+                sys.executable,
+                'verification/llm_service.py'
+            ]
+            # Start LLM service in background
+            subprocess.Popen(
+                llm_cmd,
+                cwd=os.getcwd(),
+                stdout=open('logs/llm_service.log', 'a'),
+                stderr=subprocess.STDOUT,
+                start_new_session=True
+            )
+            # Wait for LLM service to initialize
+            await asyncio.sleep(2)
+            ui.notify('LLM service started', type='positive')
+        except Exception as e:
+            ui.notify(f'Failed to start LLM service: {e}', type='negative')
+            return
+    else:
+        ui.notify('LLM service already running', type='info')
+
+    # Now start verification workers
     ui.notify(f'Starting {num_workers} verification workers...', type='info')
 
     # Build command
@@ -554,29 +596,75 @@ async def start_worker_pool(num_workers: int):
     try:
         pid = runner.start(cmd, cwd=os.getcwd())
         verification_state.worker_pool_running = True
-        ui.notify(f'Worker pool started with {num_workers} workers (PID {pid})', type='positive')
+        ui.notify(f'All verification services started ({num_workers} workers)', type='positive')
     except Exception as e:
         ui.notify(f'Failed to start worker pool: {e}', type='negative')
         verification_state.worker_pool_running = False
 
 
 async def stop_worker_pool():
-    """Stop verification worker pool gracefully."""
-    if not verification_state.worker_pool_subprocess:
-        ui.notify('No worker pool is running', type='warning')
-        return
+    """Stop all verification processes including background workers."""
+    import subprocess
 
-    ui.notify('Stopping worker pool (graceful shutdown)...', type='info')
+    ui.notify('Stopping all verification services...', type='info')
 
+    killed_count = 0
+
+    # Try to kill via subprocess runner first (if available)
+    if verification_state.worker_pool_subprocess:
+        try:
+            if verification_state.worker_pool_subprocess.kill():
+                killed_count += 1
+        except Exception:
+            pass
+
+    # Kill all verification workers and LLM service by pattern
+    patterns = [
+        'run_verification_workers.py',
+        'verification_worker.py',
+        'verification/llm_service.py',
+        'llm_service.py'
+    ]
+
+    for pattern in patterns:
+        try:
+            # Use pkill to find and kill processes matching pattern
+            result = subprocess.run(
+                ['pkill', '-f', pattern],
+                capture_output=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                killed_count += 1
+        except Exception:
+            pass
+
+    # Also try killing by process name patterns using pgrep + kill
     try:
-        killed = verification_state.worker_pool_subprocess.kill()
-        if killed:
-            verification_state.worker_pool_running = False
-            ui.notify('Worker pool stopped successfully', type='positive')
-        else:
-            ui.notify('Worker pool was not running', type='warning')
-    except Exception as e:
-        ui.notify(f'Error stopping worker pool: {e}', type='negative')
+        result = subprocess.run(
+            ['pgrep', '-f', 'verif.*worker'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.stdout.strip():
+            pids = result.stdout.strip().split('\n')
+            for pid in pids:
+                try:
+                    subprocess.run(['kill', pid], timeout=2)
+                    killed_count += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    verification_state.worker_pool_running = False
+    verification_state.worker_pool_subprocess = None
+
+    if killed_count > 0:
+        ui.notify(f'Stopped {killed_count} verification service(s)', type='positive')
+    else:
+        ui.notify('No verification services were running', type='warning')
 
 
 def verification_page():
