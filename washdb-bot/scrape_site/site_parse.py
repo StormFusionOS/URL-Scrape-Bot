@@ -517,6 +517,136 @@ def extract_homepage_text(soup: BeautifulSoup) -> Optional[str]:
     return combined[:10000] if combined else None
 
 
+def extract_content_metrics(soup: BeautifulSoup) -> dict:
+    """
+    Extract comprehensive content depth metrics from HTML.
+
+    Analyzes content for:
+    - Word count and unique words
+    - Content depth classification
+    - Paragraph statistics
+    - Header structure and hierarchy validation
+
+    Args:
+        soup: BeautifulSoup object (should be a copy to avoid mutation)
+
+    Returns:
+        Dict with content metrics:
+        - word_count: Total words in main content
+        - unique_words: Count of unique words
+        - content_depth: thin/moderate/comprehensive/in-depth
+        - paragraph_count: Number of paragraphs
+        - avg_paragraph_length: Average words per paragraph
+        - header_structure: H1/H2/H3 counts and hierarchy validation
+    """
+    # Work on a copy to avoid mutating original soup
+    from copy import copy
+    soup_copy = copy(soup)
+
+    # Remove non-content elements
+    for element in soup_copy(['script', 'style', 'nav', 'header', 'footer', 'aside', 'noscript']):
+        element.decompose()
+
+    # Extract all text
+    body = soup_copy.find('body')
+    if not body:
+        body = soup_copy
+
+    # Get all paragraphs for detailed analysis
+    paragraphs = body.find_all('p')
+    paragraph_texts = []
+    for p in paragraphs:
+        text = p.get_text(strip=True)
+        if text and len(text) > 20:  # Filter out very short paragraphs
+            paragraph_texts.append(text)
+
+    # Get full body text for word analysis
+    full_text = body.get_text(separator=' ', strip=True)
+
+    # Tokenize words (simple split, filter out short tokens)
+    words = [w.lower() for w in re.split(r'\s+', full_text) if len(w) > 2 and w.isalpha()]
+    word_count = len(words)
+    unique_words = len(set(words))
+
+    # Calculate paragraph stats
+    paragraph_count = len(paragraph_texts)
+    paragraph_word_counts = [len(p.split()) for p in paragraph_texts]
+    avg_paragraph_length = (
+        sum(paragraph_word_counts) / len(paragraph_word_counts)
+        if paragraph_word_counts else 0
+    )
+
+    # Classify content depth based on word count
+    if word_count < 300:
+        content_depth = "thin"
+    elif word_count < 800:
+        content_depth = "moderate"
+    elif word_count < 1500:
+        content_depth = "comprehensive"
+    else:
+        content_depth = "in-depth"
+
+    # Analyze header structure
+    h1_tags = soup_copy.find_all('h1')
+    h2_tags = soup_copy.find_all('h2')
+    h3_tags = soup_copy.find_all('h3')
+    h4_tags = soup_copy.find_all('h4')
+
+    h1_count = len(h1_tags)
+    h2_count = len(h2_tags)
+    h3_count = len(h3_tags)
+    h4_count = len(h4_tags)
+
+    # Validate hierarchy
+    hierarchy_issues = []
+    hierarchy_valid = True
+
+    # Check for exactly one H1
+    if h1_count == 0:
+        hierarchy_issues.append("Missing H1 tag")
+        hierarchy_valid = False
+    elif h1_count > 1:
+        hierarchy_issues.append(f"Multiple H1 tags ({h1_count})")
+        hierarchy_valid = False
+
+    # Check for H2s if content is substantial
+    if word_count > 500 and h2_count == 0:
+        hierarchy_issues.append("No H2 tags for long content")
+        hierarchy_valid = False
+
+    # Check for skipped heading levels (H1 -> H3 without H2)
+    if h3_count > 0 and h2_count == 0:
+        hierarchy_issues.append("H3 used without H2 (skipped level)")
+        hierarchy_valid = False
+
+    if h4_count > 0 and h3_count == 0:
+        hierarchy_issues.append("H4 used without H3 (skipped level)")
+        hierarchy_valid = False
+
+    metrics = {
+        "word_count": word_count,
+        "unique_words": unique_words,
+        "content_depth": content_depth,
+        "paragraph_count": paragraph_count,
+        "avg_paragraph_length": round(avg_paragraph_length, 1),
+        "header_structure": {
+            "h1_count": h1_count,
+            "h2_count": h2_count,
+            "h3_count": h3_count,
+            "h4_count": h4_count,
+            "hierarchy_valid": hierarchy_valid,
+            "issues": hierarchy_issues,
+        }
+    }
+
+    logger.debug(
+        f"Content metrics: {word_count} words, {content_depth} depth, "
+        f"H1:{h1_count} H2:{h2_count} H3:{h3_count}"
+    )
+
+    return metrics
+
+
 def parse_site_content(html: str, base_url: str) -> dict:
     """
     Parse website HTML and extract business information.
@@ -536,10 +666,14 @@ def parse_site_content(html: str, base_url: str) -> dict:
         - reviews: Review information dict
         - about: About us text
         - homepage_text: Main homepage body text
+        - content_metrics: Content depth analysis (word count, headers, etc.)
     """
     logger.info(f"Parsing site content for {base_url}")
 
     soup = BeautifulSoup(html, "lxml")
+
+    # Extract content metrics first (before any soup mutations)
+    content_metrics = extract_content_metrics(soup)
 
     result = {
         "name": extract_company_name(soup, base_url),
@@ -551,6 +685,7 @@ def parse_site_content(html: str, base_url: str) -> dict:
         "reviews": extract_reviews(soup),
         "about": extract_about_text(soup),
         "homepage_text": extract_homepage_text(soup),
+        "content_metrics": content_metrics,
     }
 
     # Log summary

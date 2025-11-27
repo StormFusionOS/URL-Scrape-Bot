@@ -53,8 +53,8 @@ class SerpScraper(BaseScraper):
 
     def __init__(
         self,
-        headless: bool = True,
-        use_proxy: bool = True,
+        headless: bool = True,  # Hybrid mode: starts headless, upgrades to headed on detection
+        use_proxy: bool = False,  # Disabled: datacenter proxies get detected
         store_raw_html: bool = True,
         enable_embeddings: bool = True,
     ):
@@ -71,7 +71,7 @@ class SerpScraper(BaseScraper):
             name="serp_scraper",
             tier="A",  # High-value target (Google)
             headless=headless,
-            respect_robots=True,
+            respect_robots=False,  # Disabled: need to scrape search results
             use_proxy=use_proxy,
             max_retries=3,
             page_timeout=45000,  # Longer timeout for Google
@@ -211,7 +211,7 @@ class SerpScraper(BaseScraper):
                 INSERT INTO serp_snapshots (
                     query_id, result_count, snapshot_hash, raw_html, metadata
                 ) VALUES (
-                    :query_id, :result_count, :snapshot_hash, :raw_html, :metadata::jsonb
+                    :query_id, :result_count, :snapshot_hash, :raw_html, CAST(:metadata AS jsonb)
                 )
                 RETURNING snapshot_id
             """),
@@ -318,7 +318,7 @@ class SerpScraper(BaseScraper):
                         domain, is_our_company, is_competitor, competitor_id, metadata
                     ) VALUES (
                         :snapshot_id, :position, :url, :title, :description,
-                        :domain, :is_our_company, :is_competitor, :competitor_id, :metadata::jsonb
+                        :domain, :is_our_company, :is_competitor, :competitor_id, CAST(:metadata AS jsonb)
                     )
                     RETURNING result_id
                 """),

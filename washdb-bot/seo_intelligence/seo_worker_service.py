@@ -465,7 +465,7 @@ class SEOWorkerService:
                 ) VALUES (
                     :url, :company_id, NOW(), :overall_score,
                     :performance_score, :seo_score, :accessibility_score,
-                    :security_score, :metrics::jsonb, :passed_checks, NOW()
+                    :security_score, CAST(:metrics AS jsonb), :passed_checks, NOW()
                 )
                 ON CONFLICT (url) DO UPDATE SET
                     audit_date = NOW(),
@@ -474,7 +474,7 @@ class SEOWorkerService:
                     seo_score = :seo_score,
                     accessibility_score = :accessibility_score,
                     security_score = :security_score,
-                    metrics = :metrics::jsonb,
+                    metrics = CAST(:metrics AS jsonb),
                     passed_checks = :passed_checks
             """)
 
@@ -508,12 +508,12 @@ class SEOWorkerService:
                     metrics, created_at
                 ) VALUES (
                     :url, :company_id, NOW(), :overall_score,
-                    :metrics::jsonb, NOW()
+                    CAST(:metrics AS jsonb), NOW()
                 )
                 ON CONFLICT (url) DO UPDATE SET
                     audit_date = NOW(),
                     overall_score = :overall_score,
-                    metrics = :metrics::jsonb
+                    metrics = CAST(:metrics AS jsonb)
             """)
 
             session.execute(query, {

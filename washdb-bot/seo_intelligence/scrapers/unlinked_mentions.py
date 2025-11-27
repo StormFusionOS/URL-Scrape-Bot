@@ -351,7 +351,7 @@ class UnlinkedMentionsFinder:
                     'seo_opportunities',
                     NULL,
                     NOW(),
-                    :metadata::jsonb
+                    CAST(:metadata AS jsonb)
                 )
                 ON CONFLICT DO NOTHING
                 RETURNING audit_id

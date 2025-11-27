@@ -91,7 +91,7 @@ class TaskLogger:
                         :task_type,
                         'running',
                         NOW(),
-                        :metadata::jsonb
+                        CAST(:metadata AS jsonb)
                     ) RETURNING task_id
                 """)
 
@@ -169,7 +169,7 @@ class TaskLogger:
 
                 if metadata:
                     import json
-                    updates.append("metadata = metadata || :metadata::jsonb")
+                    updates.append("metadata = metadata || CAST(:metadata AS jsonb)")
                     params["metadata"] = json.dumps(metadata)
 
                 if not updates:
@@ -249,7 +249,7 @@ class TaskLogger:
 
                 if metadata:
                     import json
-                    updates.append("metadata = metadata || :metadata::jsonb")
+                    updates.append("metadata = metadata || CAST(:metadata AS jsonb)")
                     params["metadata"] = json.dumps(metadata)
 
                 stmt = text(f"""

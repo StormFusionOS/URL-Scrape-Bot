@@ -18,6 +18,8 @@ Per SCRAPING_NOTES.md:
 import os
 import re
 import json
+import time
+import random
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 from urllib.parse import urlparse, quote_plus
@@ -137,8 +139,8 @@ class CitationCrawler(BaseScraper):
 
     def __init__(
         self,
-        headless: bool = True,
-        use_proxy: bool = True,
+        headless: bool = True,  # Hybrid mode: starts headless, upgrades to headed on detection
+        use_proxy: bool = False,  # Disabled: datacenter proxies get detected
     ):
         """
         Initialize citation crawler.
@@ -151,7 +153,7 @@ class CitationCrawler(BaseScraper):
             name="citation_crawler",
             tier="B",  # Default tier (individual checks may override)
             headless=headless,
-            respect_robots=True,
+            respect_robots=False,  # Disable robots.txt to scrape directories
             use_proxy=use_proxy,
             max_retries=2,
             page_timeout=30000,
@@ -593,29 +595,28 @@ class CitationCrawler(BaseScraper):
         row = existing.fetchone()
 
         if row:
-            # Update existing
+            # Update existing - store NAP match details in metadata
+            full_metadata = {
+                **metadata,
+                'is_present': result.is_listed,
+                'name_match': result.name_match,
+                'address_match': result.address_match,
+                'phone_match': result.phone_match,
+            }
             session.execute(
                 text("""
                     UPDATE citations SET
-                        is_present = :is_present,
                         listing_url = :listing_url,
                         nap_match_score = :nap_score,
-                        name_match = :name_match,
-                        address_match = :address_match,
-                        phone_match = :phone_match,
-                        last_checked_at = NOW(),
-                        metadata = :metadata::jsonb
+                        last_verified_at = NOW(),
+                        metadata = CAST(:metadata AS jsonb)
                     WHERE citation_id = :id
                 """),
                 {
                     "id": row[0],
-                    "is_present": result.is_listed,
                     "listing_url": result.listing_url,
                     "nap_score": result.nap_score,
-                    "name_match": result.name_match,
-                    "address_match": result.address_match,
-                    "phone_match": result.phone_match,
-                    "metadata": json.dumps(metadata),
+                    "metadata": json.dumps(full_metadata),
                 }
             )
 
@@ -673,29 +674,41 @@ class CitationCrawler(BaseScraper):
             return row[0]
 
         # Create new citation
+        # Store NAP match details in metadata
+        full_metadata = {
+            **metadata,
+            'is_present': result.is_listed,
+            'name_match': result.name_match,
+            'address_match': result.address_match,
+            'phone_match': result.phone_match,
+        }
         new_result = session.execute(
             text("""
                 INSERT INTO citations (
-                    business_name, directory_name, is_present, listing_url,
-                    nap_match_score, name_match, address_match, phone_match,
-                    last_checked_at, metadata
+                    business_name, directory_name, directory_url, listing_url,
+                    address, phone, nap_match_score, has_website_link,
+                    discovered_at, last_verified_at, metadata
                 ) VALUES (
-                    :name, :directory, :is_present, :listing_url,
-                    :nap_score, :name_match, :address_match, :phone_match,
-                    NOW(), :metadata::jsonb
+                    :name, :directory, :directory_url, :listing_url,
+                    :address, :phone, :nap_score, :has_website_link,
+                    NOW(), NOW(), CAST(:metadata AS jsonb)
                 )
+                ON CONFLICT (directory_name, listing_url) DO UPDATE SET
+                    nap_match_score = :nap_score,
+                    last_verified_at = NOW(),
+                    metadata = CAST(:metadata AS jsonb)
                 RETURNING citation_id
             """),
             {
                 "name": business.name,
                 "directory": result.directory,
-                "is_present": result.is_listed,
+                "directory_url": getattr(result, 'directory_url', f"https://{result.directory.lower().replace(' ', '')}.com"),
                 "listing_url": result.listing_url,
+                "address": business.address,
+                "phone": business.phone,
                 "nap_score": result.nap_score,
-                "name_match": result.name_match,
-                "address_match": result.address_match,
-                "phone_match": result.phone_match,
-                "metadata": json.dumps(metadata),
+                "has_website_link": bool(business.website),
+                "metadata": json.dumps(full_metadata),
             }
         )
 
@@ -867,8 +880,17 @@ class CitationCrawler(BaseScraper):
 
         with task_logger.log_task("citation_crawler", "scraper", {"business_count": len(businesses)}) as task:
             for business in businesses:
+                dir_count = 0
                 for directory in directories:
                     task.increment_processed()
+
+                    # Add random delay between directory checks to appear more human-like
+                    # First directory gets no delay, subsequent ones get 15-45 seconds
+                    if dir_count > 0:
+                        delay = random.uniform(15, 45)
+                        logger.debug(f"Waiting {delay:.1f}s before checking {directory}...")
+                        time.sleep(delay)
+                    dir_count += 1
 
                     result = self.check_directory(business, directory)
 

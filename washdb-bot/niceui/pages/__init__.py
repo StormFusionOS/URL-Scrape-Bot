@@ -19,11 +19,9 @@ from .local_competitors import local_competitors_page
 from .dev_tools import dev_tools_page
 from .testing import testing_page
 from .scraper_review import scraper_review_page
-from .serp_runner import serp_runner_page
-from .citation_runner import citation_runner_page
-from .backlink_runner import backlink_runner_page
 from .yp_discover import yp_discover_page
 from .verification import verification_page
+from .seo_dashboard import seo_dashboard_page
 
 __all__ = [
     'dashboard_page',
@@ -42,9 +40,7 @@ __all__ = [
     'dev_tools_page',
     'testing_page',
     'scraper_review_page',
-    'serp_runner_page',
-    'citation_runner_page',
-    'backlink_runner_page',
     'yp_discover_page',
     'verification_page',
+    'seo_dashboard_page',
 ]

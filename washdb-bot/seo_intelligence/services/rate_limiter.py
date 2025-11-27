@@ -49,30 +49,30 @@ class TierConfig:
         return f"TierConfig(delay={self.min_delay_seconds}-{self.max_delay_seconds}s, rate={self.tokens_per_minute}/min)"
 
 
-# Tier configurations - EXACT match to SCRAPING_NOTES.md specification
-# Per-domain RPS from spec: Tier A = 0.2-0.33, B = 0.1, C-G = 0.15-0.2
-# Converted to delays and tokens_per_minute
+# Tier configurations - SLOWED DOWN to avoid detection
+# Much more conservative delays to appear human-like
 TIER_CONFIGS = {
-    # Tier A: Maps & majors - 1 req / 3-5s = ~0.2-0.33 RPS = 12-20 req/min
-    'A': TierConfig(min_delay_seconds=3.0, max_delay_seconds=5.0, tokens_per_minute=15.0, bucket_size=5),
+    # Tier A: Maps & majors (Google, Yelp, BBB) - VERY SLOW to avoid detection
+    # 15-30s between requests, ~2-4 req/min
+    'A': TierConfig(min_delay_seconds=15.0, max_delay_seconds=30.0, tokens_per_minute=3.0, bucket_size=2),
 
-    # Tier B: Data aggregators - 1 req / 10s = ~0.1 RPS = 6 req/min
-    'B': TierConfig(min_delay_seconds=10.0, max_delay_seconds=10.0, tokens_per_minute=6.0, bucket_size=3),
+    # Tier B: Data aggregators (Angi, etc) - Slow: 20-40s
+    'B': TierConfig(min_delay_seconds=20.0, max_delay_seconds=40.0, tokens_per_minute=2.0, bucket_size=2),
 
-    # Tier C: Home-service marketplaces - ~0.15-0.2 RPS = 9-12 req/min (avg 5-6s)
-    'C': TierConfig(min_delay_seconds=5.0, max_delay_seconds=7.0, tokens_per_minute=10.0, bucket_size=5),
+    # Tier C: Home-service marketplaces - Moderate: 10-20s
+    'C': TierConfig(min_delay_seconds=10.0, max_delay_seconds=20.0, tokens_per_minute=4.0, bucket_size=3),
 
-    # Tier D: General directories - ~0.2 RPS = 12 req/min (5s)
-    'D': TierConfig(min_delay_seconds=5.0, max_delay_seconds=5.0, tokens_per_minute=12.0, bucket_size=5),
+    # Tier D: General directories (YP, etc) - 8-15s
+    'D': TierConfig(min_delay_seconds=8.0, max_delay_seconds=15.0, tokens_per_minute=5.0, bucket_size=3),
 
-    # Tier E: Social/reputation - ~0.2 RPS = 12 req/min (5s)
-    'E': TierConfig(min_delay_seconds=5.0, max_delay_seconds=5.0, tokens_per_minute=12.0, bucket_size=5),
+    # Tier E: Social/reputation - 10-20s
+    'E': TierConfig(min_delay_seconds=10.0, max_delay_seconds=20.0, tokens_per_minute=4.0, bucket_size=3),
 
-    # Tier F: Industry-specific - ~0.2 RPS = 12 req/min (5s)
-    'F': TierConfig(min_delay_seconds=5.0, max_delay_seconds=5.0, tokens_per_minute=12.0, bucket_size=5),
+    # Tier F: Industry-specific - 8-15s
+    'F': TierConfig(min_delay_seconds=8.0, max_delay_seconds=15.0, tokens_per_minute=5.0, bucket_size=3),
 
-    # Tier G: Local/Regional - ~0.2 RPS = 12 req/min (5s)
-    'G': TierConfig(min_delay_seconds=5.0, max_delay_seconds=5.0, tokens_per_minute=12.0, bucket_size=5),
+    # Tier G: Local/Regional - 8-15s
+    'G': TierConfig(min_delay_seconds=8.0, max_delay_seconds=15.0, tokens_per_minute=5.0, bucket_size=3),
 }
 
 

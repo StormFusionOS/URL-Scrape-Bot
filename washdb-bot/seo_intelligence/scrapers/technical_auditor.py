@@ -34,7 +34,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from seo_intelligence.scrapers.base_scraper import BaseScraper
-from seo_intelligence.services import get_task_logger, get_change_manager
+from seo_intelligence.services import get_task_logger, get_change_manager, get_cwv_metrics_service
+from seo_intelligence.scrapers.core_web_vitals import CoreWebVitalsCollector, get_cwv_collector
 from runner.logging_setup import get_logger
 
 # Load environment
@@ -127,7 +128,7 @@ class TechnicalAuditor(BaseScraper):
 
     def __init__(
         self,
-        headless: bool = True,
+        headless: bool = True,  # Hybrid mode: starts headless, upgrades to headed on detection
         use_proxy: bool = False,  # Don't use proxy for own site audits
     ):
         """
@@ -554,6 +555,119 @@ class TechnicalAuditor(BaseScraper):
 
         return issues, metrics
 
+    def _check_js_rendering(
+        self,
+        raw_html: str,
+        rendered_html: str,
+    ) -> Tuple[List[AuditIssue], Dict[str, Any]]:
+        """
+        Analyze JavaScript rendering by comparing raw HTML vs rendered HTML.
+
+        Detects how much content is JavaScript-dependent by measuring:
+        - Content change percentage between raw and rendered
+        - Ratio of text content (rendered/raw)
+        - Number of links added by JavaScript
+        - Whether the page is JS-dependent (>50% change)
+
+        Args:
+            raw_html: HTML content before JavaScript execution
+            rendered_html: HTML content after JavaScript execution
+
+        Returns:
+            Tuple of (issues, metrics) with JS rendering analysis
+        """
+        from bs4 import BeautifulSoup
+
+        issues = []
+        metrics = {}
+
+        try:
+            # Parse both versions
+            raw_soup = BeautifulSoup(raw_html, 'html.parser')
+            rendered_soup = BeautifulSoup(rendered_html, 'html.parser')
+
+            # Remove script/style tags for text comparison
+            for soup in [raw_soup, rendered_soup]:
+                for elem in soup(['script', 'style', 'noscript']):
+                    elem.decompose()
+
+            # Extract text content
+            raw_text = raw_soup.get_text(separator=' ', strip=True)
+            rendered_text = rendered_soup.get_text(separator=' ', strip=True)
+
+            raw_word_count = len(raw_text.split())
+            rendered_word_count = len(rendered_text.split())
+
+            # Calculate content ratio (rendered / raw)
+            if raw_word_count > 0:
+                js_content_ratio = round(rendered_word_count / raw_word_count, 2)
+            else:
+                js_content_ratio = float('inf') if rendered_word_count > 0 else 1.0
+
+            metrics["js_dependent_content_ratio"] = js_content_ratio
+            metrics["raw_word_count"] = raw_word_count
+            metrics["rendered_word_count"] = rendered_word_count
+
+            # Calculate content change percentage
+            if raw_word_count > 0:
+                content_change = abs(rendered_word_count - raw_word_count) / raw_word_count * 100
+            else:
+                content_change = 100.0 if rendered_word_count > 0 else 0.0
+
+            metrics["content_change_percent"] = round(content_change, 1)
+
+            # Count links in both versions (re-parse since we decomposed elements)
+            raw_soup_links = BeautifulSoup(raw_html, 'html.parser')
+            rendered_soup_links = BeautifulSoup(rendered_html, 'html.parser')
+
+            raw_links = len(raw_soup_links.find_all('a', href=True))
+            rendered_links = len(rendered_soup_links.find_all('a', href=True))
+            js_added_links = max(0, rendered_links - raw_links)
+
+            metrics["raw_links"] = raw_links
+            metrics["rendered_links"] = rendered_links
+            metrics["js_added_links"] = js_added_links
+
+            # Determine if page is JS-dependent
+            is_js_dependent = content_change > 50 or js_content_ratio > 1.5
+            metrics["is_js_dependent"] = is_js_dependent
+
+            # Generate issues based on findings
+            if is_js_dependent:
+                issues.append(AuditIssue(
+                    category=IssueCategory.SEO.value,
+                    severity=IssueSeverity.MEDIUM.value,
+                    issue_type="js_dependent_content",
+                    description=f"Page is JavaScript-dependent ({content_change:.0f}% content change)",
+                    recommendation="Ensure critical content is in initial HTML for SEO. Consider server-side rendering.",
+                    metadata={
+                        "content_change_percent": content_change,
+                        "js_content_ratio": js_content_ratio,
+                    }
+                ))
+
+            if js_added_links > 20:
+                issues.append(AuditIssue(
+                    category=IssueCategory.SEO.value,
+                    severity=IssueSeverity.LOW.value,
+                    issue_type="js_loaded_links",
+                    description=f"{js_added_links} links loaded via JavaScript",
+                    recommendation="Important navigation links should be in initial HTML",
+                    metadata={"js_added_links": js_added_links}
+                ))
+
+            logger.debug(
+                f"JS rendering analysis: ratio={js_content_ratio}, "
+                f"change={content_change:.1f}%, js_links={js_added_links}, "
+                f"dependent={is_js_dependent}"
+            )
+
+        except Exception as e:
+            logger.warning(f"Error in JS rendering analysis: {e}")
+            metrics["js_analysis_error"] = str(e)
+
+        return issues, metrics
+
     def _check_performance(
         self,
         page,
@@ -601,6 +715,108 @@ class TechnicalAuditor(BaseScraper):
                 description=f"Large HTML size ({page_size // 1000}KB)",
                 recommendation="Optimize and minify HTML content"
             ))
+
+        return issues, metrics
+
+    def _measure_core_web_vitals(
+        self,
+        url: str,
+        measure_cwv: bool = True,
+    ) -> Tuple[List[AuditIssue], Dict[str, Any]]:
+        """
+        Measure Core Web Vitals using Playwright Performance APIs.
+
+        Args:
+            url: URL to measure
+            measure_cwv: Whether to actually measure CWV (can be disabled)
+
+        Returns:
+            Tuple of (issues, metrics) with CWV data
+        """
+        issues = []
+        metrics = {}
+
+        if not measure_cwv:
+            return issues, metrics
+
+        try:
+            # Use dedicated CWV collector
+            cwv_collector = CoreWebVitalsCollector(
+                headless=self.headless,
+                page_timeout=self.page_timeout,
+                cwv_wait_time=5.0,
+            )
+
+            result = cwv_collector.measure_url(url)
+
+            if result.error:
+                logger.warning(f"CWV measurement error for {url}: {result.error}")
+                return issues, metrics
+
+            # Store metrics
+            if result.lcp_ms is not None:
+                metrics["lcp_ms"] = round(result.lcp_ms, 2)
+                metrics["lcp_rating"] = result.lcp_rating
+
+            if result.cls_value is not None:
+                metrics["cls_value"] = round(result.cls_value, 4)
+                metrics["cls_rating"] = result.cls_rating
+
+            if result.fid_ms is not None:
+                metrics["fid_ms"] = round(result.fid_ms, 2)
+                metrics["fid_rating"] = result.fid_rating
+
+            if result.fcp_ms is not None:
+                metrics["fcp_ms"] = round(result.fcp_ms, 2)
+
+            if result.tti_ms is not None:
+                metrics["tti_ms"] = round(result.tti_ms, 2)
+
+            if result.ttfb_ms is not None:
+                metrics["ttfb_ms"] = round(result.ttfb_ms, 2)
+
+            if result.lcp_element:
+                metrics["lcp_element"] = result.lcp_element
+
+            if result.cwv_score is not None:
+                metrics["cwv_score"] = result.cwv_score
+
+            if result.cwv_assessment:
+                metrics["cwv_assessment"] = result.cwv_assessment
+
+            # Generate issues from CWV metrics service
+            cwv_service = get_cwv_metrics_service()
+            cwv_issues = cwv_service.generate_issues(
+                lcp_ms=result.lcp_ms,
+                cls_value=result.cls_value,
+                fid_ms=result.fid_ms,
+                fcp_ms=result.fcp_ms,
+                tti_ms=result.tti_ms,
+                ttfb_ms=result.ttfb_ms,
+                lcp_element=result.lcp_element,
+            )
+
+            # Convert CWV issues to AuditIssue format
+            for cwv_issue in cwv_issues:
+                issues.append(AuditIssue(
+                    category=cwv_issue["category"],
+                    severity=cwv_issue["severity"],
+                    issue_type=cwv_issue["issue_type"],
+                    description=cwv_issue["description"],
+                    affected_element=cwv_issue.get("element", ""),
+                    recommendation=cwv_issue["recommendation"],
+                    metadata=cwv_issue.get("metadata", {}),
+                ))
+
+            logger.info(
+                f"CWV measured for {url}: "
+                f"LCP={result.lcp_ms}ms ({result.lcp_rating}), "
+                f"CLS={result.cls_value} ({result.cls_rating}), "
+                f"Score={result.cwv_score}"
+            )
+
+        except Exception as e:
+            logger.error(f"CWV measurement failed for {url}: {e}")
 
         return issues, metrics
 
@@ -669,15 +885,21 @@ class TechnicalAuditor(BaseScraper):
             "high_count": len(result.high_issues),
         }
 
-        # Insert page audit - using actual table schema
+        # Insert page audit - using actual table schema with CWV columns
         audit_result = session.execute(
             text("""
                 INSERT INTO page_audits (
                     url, audit_type, overall_score, page_load_time_ms,
-                    page_size_kb, total_requests, metadata
+                    page_size_kb, total_requests,
+                    lcp_ms, cls_value, fid_ms, tti_ms, fcp_ms, ttfb_ms,
+                    cwv_score, lcp_rating, cls_rating, fid_rating, cwv_element,
+                    metadata
                 ) VALUES (
                     :url, 'technical', :overall_score, :page_load_time_ms,
-                    :page_size_kb, :total_requests, CAST(:audit_metadata AS jsonb)
+                    :page_size_kb, :total_requests,
+                    :lcp_ms, :cls_value, :fid_ms, :tti_ms, :fcp_ms, :ttfb_ms,
+                    :cwv_score, :lcp_rating, :cls_rating, :fid_rating, :cwv_element,
+                    CAST(:audit_metadata AS jsonb)
                 )
                 RETURNING audit_id
             """),
@@ -687,6 +909,18 @@ class TechnicalAuditor(BaseScraper):
                 "page_load_time_ms": int(result.metrics.get("load_time_seconds", 0) * 1000),
                 "page_size_kb": result.metrics.get("html_size", 0) // 1024,
                 "total_requests": result.metrics.get("script_count", 0) + result.metrics.get("stylesheet_count", 0),
+                # CWV metrics
+                "lcp_ms": result.metrics.get("lcp_ms"),
+                "cls_value": result.metrics.get("cls_value"),
+                "fid_ms": result.metrics.get("fid_ms"),
+                "tti_ms": result.metrics.get("tti_ms"),
+                "fcp_ms": result.metrics.get("fcp_ms"),
+                "ttfb_ms": result.metrics.get("ttfb_ms"),
+                "cwv_score": result.metrics.get("cwv_score"),
+                "lcp_rating": result.metrics.get("lcp_rating"),
+                "cls_rating": result.metrics.get("cls_rating"),
+                "fid_rating": result.metrics.get("fid_rating"),
+                "cwv_element": result.metrics.get("lcp_element"),
                 "audit_metadata": json.dumps(extended_metadata),
             }
         )
@@ -770,12 +1004,13 @@ class TechnicalAuditor(BaseScraper):
         session.commit()
         return audit_id
 
-    def audit_page(self, url: str) -> AuditResult:
+    def audit_page(self, url: str, measure_cwv: bool = True) -> AuditResult:
         """
         Perform technical audit on a single page.
 
         Args:
             url: URL to audit
+            measure_cwv: Whether to measure Core Web Vitals (adds ~5s to audit)
 
         Returns:
             AuditResult with findings
@@ -884,6 +1119,34 @@ class TechnicalAuditor(BaseScraper):
             for issues, metrics in checks:
                 all_issues.extend(issues)
                 all_metrics.update(metrics)
+
+            # Measure Core Web Vitals (separate browser session)
+            if measure_cwv and not use_http_fallback:
+                cwv_issues, cwv_metrics = self._measure_core_web_vitals(url, measure_cwv=True)
+                all_issues.extend(cwv_issues)
+                all_metrics.update(cwv_metrics)
+
+            # JS Rendering Analysis: Compare raw HTML vs rendered HTML
+            # Only run if we have rendered HTML from Playwright (not HTTP fallback)
+            if not use_http_fallback and html:
+                try:
+                    # Fetch raw HTML without JavaScript execution
+                    raw_response = requests.get(
+                        url,
+                        timeout=10,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                        },
+                        verify=True,
+                        allow_redirects=True,
+                    )
+                    if raw_response.status_code == 200:
+                        raw_html = raw_response.text
+                        js_issues, js_metrics = self._check_js_rendering(raw_html, html)
+                        all_issues.extend(js_issues)
+                        all_metrics.update(js_metrics)
+                except Exception as js_err:
+                    logger.debug(f"JS rendering analysis skipped for {url}: {js_err}")
 
             # Calculate scores
             overall, perf, seo, access, security = self._calculate_scores(

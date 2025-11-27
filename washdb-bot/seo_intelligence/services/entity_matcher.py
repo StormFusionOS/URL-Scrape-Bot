@@ -395,9 +395,9 @@ class EntityMatcher:
                             last_checked_at = NOW(),
                             confidence_score = :confidence_score,
                             match_score = :match_score,
-                            matching_fields = :matching_fields::jsonb,
-                            conflicting_fields = :conflicting_fields::jsonb,
-                            evidence = :evidence::jsonb
+                            matching_fields = CAST(:matching_fields AS jsonb),
+                            conflicting_fields = CAST(:conflicting_fields AS jsonb),
+                            evidence = CAST(:evidence AS jsonb)
                         WHERE conflict_id = :conflict_id
                     """),
                     {
@@ -420,7 +420,7 @@ class EntityMatcher:
                         ) VALUES (
                             :company_id_1, :company_id_2, :conflict_type,
                             :confidence_score, :match_score,
-                            :matching_fields::jsonb, :conflicting_fields::jsonb, :evidence::jsonb
+                            CAST(:matching_fields AS jsonb), CAST(:conflicting_fields AS jsonb), CAST(:evidence AS jsonb)
                         )
                         RETURNING conflict_id
                     """),

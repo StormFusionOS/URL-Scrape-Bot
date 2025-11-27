@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeout
+from playwright_stealth import Stealth
 
 from seo_intelligence.services import (
     get_rate_limiter,
@@ -31,6 +32,7 @@ from seo_intelligence.services import (
     get_task_logger,
     get_content_hasher,
     get_domain_quarantine,
+    get_browser_profile_manager,
 )
 from runner.logging_setup import get_logger
 
@@ -52,9 +54,9 @@ class BaseScraper(ABC):
         self,
         name: str,
         tier: str = "C",
-        headless: bool = True,
+        headless: bool = True,  # Hybrid mode: start headless, upgrade to headed on detection
         respect_robots: bool = True,
-        use_proxy: bool = True,
+        use_proxy: bool = False,  # Disabled: datacenter proxies get detected
         max_retries: int = 3,
         page_timeout: int = 30000,
     ):
@@ -64,7 +66,7 @@ class BaseScraper(ABC):
         Args:
             name: Scraper name for logging
             tier: Rate limit tier (A-G, default: C)
-            headless: Run browser in headless mode
+            headless: Default browser mode (hybrid mode overrides per-domain)
             respect_robots: Check robots.txt before crawling
             use_proxy: Use proxy pool
             max_retries: Maximum retry attempts on failure
@@ -89,6 +91,11 @@ class BaseScraper(ABC):
         self.task_logger = get_task_logger()
         self.content_hasher = get_content_hasher()
         self.domain_quarantine = get_domain_quarantine()
+        self.browser_profile_manager = get_browser_profile_manager()
+
+        # Track current session's browser mode per domain
+        self._current_domain = None
+        self._current_headed_mode = False
 
         # Browser state
         self._playwright = None
@@ -126,14 +133,14 @@ class BaseScraper(ABC):
 
     def _apply_base_delay(self):
         """
-        Apply base delay (3-6s with ±20% jitter) before each request.
+        Apply base delay (5-12s with ±30% jitter) before each request.
 
-        Per SCRAPING_NOTES.md §3: "Per-request base delay: 3-6s with ±20% jitter"
+        Conservative delays to appear more human-like and avoid detection.
         This is in addition to tier-specific rate limiting.
         """
-        base_delay = random.uniform(3.0, 6.0)
-        jitter = base_delay * random.uniform(-0.20, 0.20)
-        final_delay = max(0.5, base_delay + jitter)  # Ensure minimum 0.5s
+        base_delay = random.uniform(5.0, 12.0)
+        jitter = base_delay * random.uniform(-0.30, 0.30)
+        final_delay = max(2.0, base_delay + jitter)  # Ensure minimum 2s
 
         self.logger.debug(f"Base delay: {base_delay:.2f}s + jitter {jitter:.2f}s = {final_delay:.2f}s")
         time.sleep(final_delay)
@@ -204,20 +211,468 @@ class BaseScraper(ABC):
             # Always release concurrency permits
             self.rate_limiter.release_concurrency(domain)
 
-    @contextmanager
-    def browser_session(self):
+    def _get_stealth_context_options(self) -> dict:
         """
-        Context manager for browser session.
+        Generate randomized browser context options for stealth.
+
+        Returns realistic fingerprints to avoid bot detection.
+        """
+        # Random screen resolutions (common desktop sizes)
+        screen_sizes = [
+            {"width": 1920, "height": 1080},
+            {"width": 1366, "height": 768},
+            {"width": 1536, "height": 864},
+            {"width": 1440, "height": 900},
+            {"width": 1280, "height": 720},
+            {"width": 2560, "height": 1440},
+        ]
+        viewport = random.choice(screen_sizes)
+
+        # Random timezones (US-based)
+        timezones = [
+            "America/New_York",
+            "America/Chicago",
+            "America/Denver",
+            "America/Los_Angeles",
+            "America/Phoenix",
+        ]
+        timezone = random.choice(timezones)
+
+        # Random locales
+        locales = ["en-US", "en-GB", "en-CA"]
+        locale = random.choice(locales)
+
+        # Random color schemes
+        color_schemes = ["light", "dark", "no-preference"]
+
+        return {
+            "viewport": viewport,
+            "screen": {"width": viewport["width"] + random.randint(0, 100),
+                       "height": viewport["height"] + random.randint(0, 100)},
+            "locale": locale,
+            "timezone_id": timezone,
+            "color_scheme": random.choice(color_schemes),
+            "has_touch": False,
+            "is_mobile": False,
+            "device_scale_factor": random.choice([1, 1.25, 1.5, 2]),
+            "java_script_enabled": True,
+            # Permissions that real browsers have
+            "permissions": ["geolocation"],
+            # Extra HTTP headers to appear more human
+            "extra_http_headers": {
+                "Accept-Language": f"{locale},en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Upgrade-Insecure-Requests": "1",
+            },
+        }
+
+    def _simulate_human_behavior(self, page: Page, intensity: str = "normal"):
+        """
+        Simulate human-like behavior on the page.
+
+        Includes random mouse movements, scrolling, reading pauses, and delays.
+
+        Args:
+            intensity: "light", "normal", or "thorough" - how much human simulation
+        """
+        try:
+            # Random initial delay (humans don't act instantly)
+            if intensity == "light":
+                time.sleep(random.uniform(0.5, 1.5))
+            elif intensity == "normal":
+                time.sleep(random.uniform(1.0, 3.0))
+            else:  # thorough
+                time.sleep(random.uniform(2.0, 5.0))
+
+            # Random mouse movement (like looking around the page)
+            move_count = {"light": 2, "normal": 4, "thorough": 8}.get(intensity, 4)
+            for _ in range(random.randint(2, move_count)):
+                x = random.randint(100, 1200)
+                y = random.randint(100, 800)
+                # Move in a more natural curve by using small steps
+                page.mouse.move(x, y, steps=random.randint(5, 15))
+                time.sleep(random.uniform(0.1, 0.4))
+
+            # Simulate reading the page (longer pause)
+            if intensity != "light":
+                reading_time = random.uniform(1.0, 4.0)
+                self.logger.debug(f"Simulating reading for {reading_time:.1f}s")
+                time.sleep(reading_time)
+
+            # Random scroll (humans often scroll to read content)
+            scroll_amount = random.randint(200, 600)
+            page.mouse.wheel(0, scroll_amount)
+            time.sleep(random.uniform(0.5, 1.5))
+
+            # Sometimes scroll more
+            if random.random() > 0.4:
+                page.mouse.wheel(0, random.randint(100, 300))
+                time.sleep(random.uniform(0.3, 0.8))
+
+            # Sometimes scroll back up (like re-reading something)
+            if random.random() > 0.5:
+                page.mouse.wheel(0, -scroll_amount // 2)
+                time.sleep(random.uniform(0.3, 0.8))
+
+            # Occasionally hover over elements (like reading links)
+            if intensity == "thorough" and random.random() > 0.6:
+                try:
+                    links = page.query_selector_all("a")[:5]
+                    if links:
+                        link = random.choice(links)
+                        link.hover()
+                        time.sleep(random.uniform(0.2, 0.6))
+                except Exception:
+                    pass
+
+            # Final reading pause
+            if intensity != "light":
+                time.sleep(random.uniform(0.5, 2.0))
+
+        except Exception as e:
+            # Don't fail if human simulation fails
+            self.logger.debug(f"Human simulation skipped: {e}")
+
+    def _simulate_typing(self, page: Page, selector: str, text: str):
+        """
+        Simulate human-like typing with variable speed and occasional pauses.
+
+        Args:
+            page: Playwright Page object
+            selector: CSS selector for the input field
+            text: Text to type
+        """
+        try:
+            element = page.query_selector(selector)
+            if not element:
+                self.logger.warning(f"Element not found: {selector}")
+                return
+
+            element.click()
+            time.sleep(random.uniform(0.2, 0.5))
+
+            # Type character by character with variable delays
+            for i, char in enumerate(text):
+                element.type(char)
+
+                # Variable delay between keystrokes (humans don't type uniformly)
+                if random.random() > 0.9:
+                    # Occasional longer pause (thinking)
+                    time.sleep(random.uniform(0.3, 0.8))
+                else:
+                    # Normal typing speed varies between 50-200ms per char
+                    time.sleep(random.uniform(0.05, 0.2))
+
+                # Occasionally make a small pause after words
+                if char == ' ' and random.random() > 0.7:
+                    time.sleep(random.uniform(0.1, 0.3))
+
+            # Pause after finishing typing
+            time.sleep(random.uniform(0.3, 1.0))
+
+        except Exception as e:
+            self.logger.debug(f"Typing simulation failed: {e}")
+            # Fallback to regular fill
+            try:
+                page.fill(selector, text)
+            except Exception:
+                pass
+
+    def _take_session_break(self):
+        """
+        Take a longer break between sessions to appear more human.
+        Used after multiple requests or when switching tasks.
+        """
+        break_duration = random.uniform(30, 90)  # 30-90 second break
+        self.logger.info(f"Taking session break for {break_duration:.1f}s to appear human")
+        time.sleep(break_duration)
+
+    def _is_honeypot_link(self, page: Page, element) -> bool:
+        """
+        Check if a link element is a honeypot trap.
+
+        Honeypots are invisible or hidden elements designed to catch bots.
+        Real users never click them, but bots following all links will.
+
+        Args:
+            page: Playwright Page object
+            element: Link element to check
+
+        Returns:
+            bool: True if element appears to be a honeypot
+        """
+        try:
+            # Get computed styles
+            box = element.bounding_box()
+
+            # Check 1: Element has no visible dimensions
+            if box is None:
+                self.logger.debug("Honeypot detected: no bounding box")
+                return True
+
+            # Check 2: Element is too small (1x1 pixel traps)
+            if box['width'] < 5 or box['height'] < 5:
+                self.logger.debug(f"Honeypot detected: tiny size ({box['width']}x{box['height']})")
+                return True
+
+            # Check 3: Element is positioned off-screen
+            viewport = page.viewport_size
+            if viewport:
+                if box['x'] < -100 or box['y'] < -100:
+                    self.logger.debug("Honeypot detected: off-screen position")
+                    return True
+                if box['x'] > viewport['width'] + 100 or box['y'] > viewport['height'] + 100:
+                    self.logger.debug("Honeypot detected: beyond viewport")
+                    return True
+
+            # Check 4: Check for honeypot classes/IDs
+            honeypot_keywords = [
+                'honeypot', 'honey-pot', 'honey_pot',
+                'trap', 'bot-trap', 'bot_trap', 'bottrap',
+                'hidden', 'invisible', 'offscreen', 'off-screen',
+                'hp-', 'ohnohoney', 'catch-bot', 'anti-bot',
+                'display-none', 'visibility-hidden',
+            ]
+
+            element_class = element.get_attribute('class') or ''
+            element_id = element.get_attribute('id') or ''
+            element_name = element.get_attribute('name') or ''
+
+            for keyword in honeypot_keywords:
+                if keyword in element_class.lower():
+                    self.logger.debug(f"Honeypot detected: class contains '{keyword}'")
+                    return True
+                if keyword in element_id.lower():
+                    self.logger.debug(f"Honeypot detected: id contains '{keyword}'")
+                    return True
+                if keyword in element_name.lower():
+                    self.logger.debug(f"Honeypot detected: name contains '{keyword}'")
+                    return True
+
+            # Check 5: Check computed visibility via JavaScript
+            is_visible = page.evaluate("""
+                (element) => {
+                    const style = window.getComputedStyle(element);
+                    return style.display !== 'none' &&
+                           style.visibility !== 'hidden' &&
+                           parseFloat(style.opacity) > 0.1 &&
+                           element.offsetParent !== null;
+                }
+            """, element)
+
+            if not is_visible:
+                self.logger.debug("Honeypot detected: CSS hidden")
+                return True
+
+            # Check 6: Check if link text is suspicious
+            link_text = element.text_content() or ''
+            suspicious_texts = [
+                'click here if you are not a robot',
+                'do not click', 'dont click', "don't click",
+                'bot test', 'verify human', 'are you human',
+            ]
+
+            for suspicious in suspicious_texts:
+                if suspicious in link_text.lower():
+                    self.logger.debug(f"Honeypot detected: suspicious text '{suspicious}'")
+                    return True
+
+            # Check 7: Check parent elements for hidden containers
+            parent_hidden = page.evaluate("""
+                (element) => {
+                    let parent = element.parentElement;
+                    while (parent && parent !== document.body) {
+                        const style = window.getComputedStyle(parent);
+                        if (style.display === 'none' ||
+                            style.visibility === 'hidden' ||
+                            parseFloat(style.opacity) < 0.1) {
+                            return true;
+                        }
+                        parent = parent.parentElement;
+                    }
+                    return false;
+                }
+            """, element)
+
+            if parent_hidden:
+                self.logger.debug("Honeypot detected: parent container hidden")
+                return True
+
+            return False
+
+        except Exception as e:
+            self.logger.debug(f"Honeypot check error: {e}")
+            # When in doubt, treat as suspicious
+            return True
+
+    def _is_honeypot_form_field(self, page: Page, field) -> bool:
+        """
+        Check if a form field is a honeypot.
+
+        Many sites add hidden form fields that should remain empty.
+        Bots that fill all fields get caught.
+
+        Args:
+            page: Playwright Page object
+            field: Form field element
+
+        Returns:
+            bool: True if field appears to be a honeypot
+        """
+        try:
+            # Check field type
+            field_type = field.get_attribute('type') or ''
+
+            # Hidden fields are often honeypots
+            if field_type == 'hidden':
+                field_name = field.get_attribute('name') or ''
+                # Some hidden fields are legitimate (csrf, etc)
+                legitimate_hidden = ['csrf', 'token', '_token', 'nonce', 'state']
+                if not any(leg in field_name.lower() for leg in legitimate_hidden):
+                    self.logger.debug(f"Potential honeypot: hidden field '{field_name}'")
+                    return True
+
+            # Check for honeypot naming patterns
+            honeypot_names = [
+                'honeypot', 'honey', 'pot', 'trap',
+                'email2', 'phone2', 'address2', 'name2',
+                'confirm_email', 'url', 'website', 'homepage',
+                'fax', 'company2', 'subject2',
+            ]
+
+            field_name = field.get_attribute('name') or ''
+            field_id = field.get_attribute('id') or ''
+
+            for hp_name in honeypot_names:
+                if hp_name in field_name.lower() or hp_name in field_id.lower():
+                    # Check if it's visually hidden
+                    box = field.bounding_box()
+                    if box is None or box['width'] < 2 or box['height'] < 2:
+                        self.logger.debug(f"Honeypot form field: '{field_name}'")
+                        return True
+
+            # Check autocomplete="off" + tabindex="-1" combo (common honeypot pattern)
+            autocomplete = field.get_attribute('autocomplete') or ''
+            tabindex = field.get_attribute('tabindex') or ''
+
+            if autocomplete == 'off' and tabindex == '-1':
+                box = field.bounding_box()
+                if box and (box['width'] < 5 or box['height'] < 5):
+                    self.logger.debug("Honeypot form field: autocomplete=off + tabindex=-1 + tiny")
+                    return True
+
+            return False
+
+        except Exception as e:
+            self.logger.debug(f"Form honeypot check error: {e}")
+            return True  # When in doubt, don't fill
+
+    def _filter_safe_links(self, page: Page, links: list) -> list:
+        """
+        Filter out honeypot links from a list of link elements.
+
+        Args:
+            page: Playwright Page object
+            links: List of link elements
+
+        Returns:
+            list: Filtered list of safe links
+        """
+        safe_links = []
+        for link in links:
+            if not self._is_honeypot_link(page, link):
+                safe_links.append(link)
+            else:
+                href = link.get_attribute('href') or 'unknown'
+                self.logger.info(f"Skipping honeypot link: {href[:50]}")
+
+        self.logger.debug(f"Filtered {len(links)} links -> {len(safe_links)} safe links")
+        return safe_links
+
+    def _avoid_honeypot_patterns(self, url: str) -> bool:
+        """
+        Check if a URL matches common honeypot patterns.
+
+        Args:
+            url: URL to check
+
+        Returns:
+            bool: True if URL should be avoided
+        """
+        url_lower = url.lower()
+
+        # Suspicious URL patterns
+        honeypot_url_patterns = [
+            '/trap', '/honeypot', '/honey-pot', '/bot-trap',
+            '/catch', '/gotcha', '/verify-human',
+            'trap=', 'honeypot=', 'bot=true',
+            '/wp-content/plugins/honeypot',
+            '/invisible-link', '/hidden-link',
+            '?hp=', '&hp=', '?trap=', '&trap=',
+        ]
+
+        for pattern in honeypot_url_patterns:
+            if pattern in url_lower:
+                self.logger.warning(f"Avoiding honeypot URL pattern: {pattern}")
+                return True
+
+        return False
+
+    @contextmanager
+    def browser_session(self, domain: Optional[str] = None):
+        """
+        Context manager for browser session with stealth capabilities.
+
+        Supports hybrid headless/headed mode:
+        - Starts in headless mode by default (faster, less resource intensive)
+        - Automatically uses headed mode for domains that have triggered detection
+        - Persists browser profiles (cookies, localStorage) for better stealth
 
         Usage:
-            with scraper.browser_session() as (browser, context, page):
-                page.goto("https://example.com")
+            with scraper.browser_session(domain="google.com") as (browser, context, page):
+                page.goto("https://google.com")
                 # ... scrape content ...
+
+        Args:
+            domain: Target domain (optional). If provided, enables hybrid mode
+                    and browser profile persistence for that domain.
+
+        Includes:
+        - Hybrid headless/headed mode based on domain detection history
+        - Persistent browser profiles with cookies and localStorage
+        - Playwright stealth mode (evades bot detection)
+        - Randomized fingerprints (screen, timezone, locale)
+        - Human-like browser headers
+        - Optional proxy support
         """
         playwright = None
         browser = None
         context = None
         page = None
+        profile_path = None
+
+        # Determine if we need headed mode for this domain
+        use_headed = False
+        if domain:
+            self._current_domain = domain
+            use_headed = self.browser_profile_manager.requires_headed(domain)
+            self._current_headed_mode = use_headed
+
+            # Get/create persistent profile path for this domain
+            profile_path = self.browser_profile_manager.get_profile_path(domain)
+
+            mode_str = "headed (required)" if use_headed else "headless (default)"
+            self.logger.info(f"Browser session for {domain}: {mode_str}")
+        else:
+            # No domain specified, use default headless setting
+            use_headed = not self.headless
+            self._current_headed_mode = use_headed
 
         try:
             # Start Playwright
@@ -231,20 +686,39 @@ class BaseScraper(ABC):
             # Get random user agent
             user_agent = self.ua_rotator.get_random()
 
-            # Launch browser
+            # Launch browser with stealth args
+            # Use headed mode if domain requires it, otherwise use headless
             browser = playwright.chromium.launch(
-                headless=self.headless,
+                headless=not use_headed,  # headless=False means headed
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-infobars",
+                    "--window-position=0,0",
+                    "--ignore-certificate-errors",
+                    "--ignore-certificate-errors-spki-list",
+                    f"--user-agent={user_agent}",
+                ],
             )
 
-            # Create context with user agent and optional proxy
-            context_options = {
-                "user_agent": user_agent,
-                "viewport": {"width": 1920, "height": 1080},
-            }
+            # Get stealth context options
+            context_options = self._get_stealth_context_options()
+            context_options["user_agent"] = user_agent
 
             if proxy_config:
                 context_options["proxy"] = proxy_config
                 self.logger.debug(f"Using proxy: {proxy_config.get('server', 'N/A')}")
+
+            # Add persistent storage path if domain profile exists
+            if profile_path:
+                context_options["storage_state"] = None  # Will load from profile if exists
+                # Check if we have saved state
+                storage_file = os.path.join(profile_path, "storage_state.json")
+                if os.path.exists(storage_file):
+                    context_options["storage_state"] = storage_file
+                    self.logger.debug(f"Loading saved browser state from {storage_file}")
 
             context = browser.new_context(**context_options)
             context.set_default_timeout(self.page_timeout)
@@ -252,7 +726,93 @@ class BaseScraper(ABC):
             # Create page
             page = context.new_page()
 
-            self.logger.debug(f"Browser session started (UA: {user_agent[:50]}...)")
+            # Apply playwright-stealth to evade bot detection
+            stealth = Stealth()
+            stealth.apply_stealth_sync(page)
+
+            # Add enhanced stealth scripts (matching google_stealth.py)
+            # Generate random hardware values for this session
+            hardware_concurrency = random.choice([2, 4, 8, 16])
+            device_memory = random.choice([4, 8, 16])
+
+            page.add_init_script(f"""
+                // Override navigator.webdriver
+                Object.defineProperty(navigator, 'webdriver', {{
+                    get: () => undefined
+                }});
+
+                // Override navigator.plugins with realistic values
+                Object.defineProperty(navigator, 'plugins', {{
+                    get: () => [
+                        {{
+                            name: 'Chrome PDF Plugin',
+                            filename: 'internal-pdf-viewer',
+                            description: 'Portable Document Format',
+                            length: 1
+                        }},
+                        {{
+                            name: 'Chrome PDF Viewer',
+                            filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai',
+                            description: '',
+                            length: 1
+                        }},
+                        {{
+                            name: 'Native Client',
+                            filename: 'internal-nacl-plugin',
+                            description: '',
+                            length: 2
+                        }}
+                    ]
+                }});
+
+                // Override navigator.languages
+                Object.defineProperty(navigator, 'languages', {{
+                    get: () => ['en-US', 'en']
+                }});
+
+                // Delete Chrome automation flags
+                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+
+                // Override chrome runtime with realistic properties
+                window.chrome = {{
+                    runtime: {{}},
+                    loadTimes: function() {{}},
+                    csi: function() {{}},
+                    app: {{}}
+                }};
+
+                // Override permissions
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({{ state: Notification.permission }}) :
+                        originalQuery(parameters)
+                );
+
+                // Add realistic hardware concurrency
+                Object.defineProperty(navigator, 'hardwareConcurrency', {{
+                    get: () => {hardware_concurrency}
+                }});
+
+                // Add realistic device memory
+                Object.defineProperty(navigator, 'deviceMemory', {{
+                    get: () => {device_memory}
+                }});
+
+                // Make toString return native code for modified functions
+                const oldToString = Function.prototype.toString;
+                Function.prototype.toString = function() {{
+                    if (this === window.navigator.permissions.query) {{
+                        return 'function query() {{ [native code] }}';
+                    }}
+                    return oldToString.call(this);
+                }};
+            """)
+
+            mode_label = "headed" if use_headed else "headless"
+            self.logger.debug(f"Stealth browser session started ({mode_label}, UA: {user_agent[:50]}...)")
 
             yield browser, context, page
 
@@ -261,6 +821,16 @@ class BaseScraper(ABC):
             raise
 
         finally:
+            # Save browser state before closing (for profile persistence)
+            if context and profile_path:
+                try:
+                    storage_file = os.path.join(profile_path, "storage_state.json")
+                    context.storage_state(path=storage_file)
+                    self.browser_profile_manager.mark_cookies_stored(domain)
+                    self.logger.debug(f"Saved browser state to {storage_file}")
+                except Exception as e:
+                    self.logger.debug(f"Could not save browser state: {e}")
+
             # Cleanup
             if page:
                 try:
@@ -285,6 +855,10 @@ class BaseScraper(ABC):
                     playwright.stop()
                 except Exception:
                     pass
+
+            # Reset current session tracking
+            self._current_domain = None
+            self._current_headed_mode = False
 
             self.logger.debug("Browser session closed")
 
@@ -411,6 +985,12 @@ class BaseScraper(ABC):
             self.stats["pages_skipped"] += 1
             return None
 
+        # Check for honeypot URL patterns
+        if self._avoid_honeypot_patterns(url):
+            self.logger.warning(f"Skipping honeypot URL: {url}")
+            self.stats["pages_skipped"] += 1
+            return None
+
         # Fetch page with retries and exponential backoff
         for attempt in range(self.max_retries):
             # Apply exponential backoff delay (Task 11)
@@ -437,7 +1017,7 @@ class BaseScraper(ABC):
                 if response.status >= 400:
                     self.logger.warning(f"HTTP {response.status} from {url}")
 
-                    # 403 Forbidden - Quarantine domain immediately (Task 11)
+                    # 403 Forbidden - Quarantine domain and flag for headed mode
                     if response.status == 403:
                         self.logger.error(f"403 Forbidden from {domain} - quarantining")
                         self.domain_quarantine.quarantine_domain(
@@ -445,6 +1025,9 @@ class BaseScraper(ABC):
                             reason="403_FORBIDDEN",
                             metadata={"url": url, "attempt": attempt}
                         )
+                        # Record detection for hybrid mode (may upgrade to headed)
+                        self.browser_profile_manager.record_detection(domain, "403_FORBIDDEN")
+                        self.browser_profile_manager.record_failure(domain, self._current_headed_mode, "403_FORBIDDEN")
                         self.stats["pages_failed"] += 1
                         return None
 
@@ -494,6 +1077,9 @@ class BaseScraper(ABC):
                 if extra_wait > 0:
                     time.sleep(extra_wait)
 
+                # Simulate human behavior after page load (looks more natural)
+                self._simulate_human_behavior(page, intensity="normal")
+
                 # Get page content
                 content = page.content()
 
@@ -515,12 +1101,18 @@ class BaseScraper(ABC):
                             duration_minutes=60,
                             metadata={"url": url, "validation_failure": reason_code}
                         )
+                        # Record detection for hybrid mode (upgrades to headed after threshold)
+                        self.browser_profile_manager.record_detection(domain, reason_code)
+                        self.browser_profile_manager.record_failure(domain, self._current_headed_mode, reason_code)
 
                     self.stats["pages_failed"] += 1
                     return None
 
                 # SUCCESS - Reset retry attempts (Task 11)
                 self.domain_quarantine.reset_retry_attempts(domain)
+
+                # Record success for hybrid mode statistics
+                self.browser_profile_manager.record_success(domain, self._current_headed_mode)
 
                 self.stats["pages_crawled"] += 1
                 self.logger.debug(f"Fetched {url} ({len(content)} chars) - validation passed")
@@ -545,6 +1137,7 @@ class BaseScraper(ABC):
 
         # All retries failed
         self.stats["pages_failed"] += 1
+        self.browser_profile_manager.record_failure(domain, self._current_headed_mode, "MAX_RETRIES_EXCEEDED")
         self.logger.error(f"Failed to fetch {url} after {self.max_retries} attempts")
         return None
 
