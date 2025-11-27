@@ -68,6 +68,34 @@ class SerpResult:
 
 
 @dataclass
+class Sitelink:
+    """Represents a sitelink from SERP results."""
+    anchor: str
+    url: str
+    description: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return asdict(self)
+
+
+@dataclass
+class SitelinkGroup:
+    """Represents sitelinks for a domain in SERP."""
+    domain: str
+    position: int
+    links: List[Sitelink] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "domain": self.domain,
+            "position": self.position,
+            "links": [sl.to_dict() for sl in self.links],
+        }
+
+
+@dataclass
 class SerpSnapshot:
     """Represents a complete SERP snapshot."""
     query: str
@@ -79,6 +107,7 @@ class SerpSnapshot:
     people_also_ask: List[PAAQuestion] = field(default_factory=list)
     related_searches: List[str] = field(default_factory=list)
     serp_features: List[str] = field(default_factory=list)  # Track detected SERP features
+    sitelinks: List[SitelinkGroup] = field(default_factory=list)  # NEW: Extracted sitelinks
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -93,6 +122,7 @@ class SerpSnapshot:
             "people_also_ask": [paa.to_dict() for paa in self.people_also_ask],
             "related_searches": self.related_searches,
             "serp_features": self.serp_features,
+            "sitelinks": [sg.to_dict() for sg in self.sitelinks],
             "metadata": self.metadata,
         }
 
@@ -458,6 +488,109 @@ class SerpParser:
 
         return related
 
+    def _parse_sitelinks(self, soup: BeautifulSoup, results: List[SerpResult]) -> List[SitelinkGroup]:
+        """
+        Parse sitelinks from SERP results.
+
+        Sitelinks appear beneath certain organic results as additional
+        navigational links to important pages on the domain.
+
+        Args:
+            soup: BeautifulSoup object of SERP
+            results: Parsed organic results (to get domain context)
+
+        Returns:
+            List of SitelinkGroup objects with domain, position, and links
+        """
+        sitelink_groups = []
+
+        # Multiple selectors for sitelinks (Google layout varies)
+        sitelink_selectors = [
+            "div.usJj9c",          # Standard sitelinks container
+            "table.jmjoTe",        # Table-based sitelinks
+            "div.HiHjCd",          # Inline sitelinks
+            "div[data-attrid='wa:/description'] + div a",  # Below description
+        ]
+
+        # Find all result containers with sitelinks
+        result_containers = soup.select("div.g")
+
+        for position, container in enumerate(result_containers, 1):
+            # First check if this result has sitelinks
+            sitelinks_container = None
+            for selector in sitelink_selectors:
+                sitelinks_container = container.select_one(selector)
+                if sitelinks_container:
+                    break
+
+            if not sitelinks_container:
+                # Also check for sitelinks in table format
+                sitelinks_container = container.select_one("table")
+                if sitelinks_container and not sitelinks_container.select("a[href]"):
+                    sitelinks_container = None
+
+            if not sitelinks_container:
+                continue
+
+            # Get the domain from the main result link
+            main_link = container.select_one("a[href]")
+            if not main_link:
+                continue
+
+            main_url = self._clean_url(main_link.get("href", ""))
+            if not main_url or "google.com" in main_url:
+                continue
+
+            try:
+                parsed = urlparse(main_url)
+                domain = parsed.netloc.lower()
+                if domain.startswith("www."):
+                    domain = domain[4:]
+            except Exception:
+                continue
+
+            # Extract individual sitelinks
+            sitelinks = []
+            sitelink_anchors = sitelinks_container.select("a[href]")
+
+            for anchor in sitelink_anchors:
+                href = anchor.get("href", "")
+                url = self._clean_url(href)
+
+                # Skip Google internal links and the main URL
+                if not url or "google.com" in url or url == main_url:
+                    continue
+
+                anchor_text = anchor.get_text(strip=True)
+                if not anchor_text or len(anchor_text) < 2:
+                    continue
+
+                # Try to get description (often in sibling or child element)
+                description = ""
+                parent = anchor.parent
+                if parent:
+                    desc_elem = parent.select_one("span, div.st")
+                    if desc_elem:
+                        description = desc_elem.get_text(strip=True)[:150]
+
+                sitelinks.append(Sitelink(
+                    anchor=anchor_text,
+                    url=url,
+                    description=description,
+                ))
+
+            if sitelinks:
+                sitelink_groups.append(SitelinkGroup(
+                    domain=domain,
+                    position=position,
+                    links=sitelinks,
+                ))
+                logger.debug(
+                    f"Found {len(sitelinks)} sitelinks for {domain} at position {position}"
+                )
+
+        return sitelink_groups
+
     def _extract_total_results(self, soup: BeautifulSoup) -> Optional[int]:
         """
         Extract total results count from SERP.
@@ -653,6 +786,9 @@ class SerpParser:
         snapshot.people_also_ask = self._parse_people_also_ask(soup)
         snapshot.related_searches = self._parse_related_searches(soup)
 
+        # Parse sitelinks (NEW)
+        snapshot.sitelinks = self._parse_sitelinks(soup, snapshot.results)
+
         # Detect SERP features
         snapshot.serp_features = self._detect_serp_features(soup)
 
@@ -661,6 +797,7 @@ class SerpParser:
             f"{len(snapshot.results)} organic, "
             f"{len(snapshot.local_pack)} local, "
             f"{len(snapshot.people_also_ask)} PAA, "
+            f"{len(snapshot.sitelinks)} sitelink groups, "
             f"{len(snapshot.serp_features)} features"
         )
 

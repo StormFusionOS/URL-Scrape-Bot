@@ -1413,3 +1413,101 @@ class BusinessSource(Base):
         return f"<BusinessSource(id={self.source_id}, company_id={self.company_id}, source='{self.source_type}', name='{self.name}')>"
 
 
+class DomainBrowserSettings(Base):
+    """
+    Domain-specific browser settings for hybrid headless/headed mode.
+
+    Tracks which domains require headed (visible) browser mode due to
+    bot detection. Starts with headless for efficiency, upgrades to
+    headed when detection is triggered.
+
+    Attributes:
+        id: Primary key
+        domain: Domain name (unique, e.g., 'google.com')
+        requires_headed: Whether domain requires headed browser
+        detection_count: Number of times bot detection was triggered
+        last_detection: Last detection timestamp
+        detection_reason: Reason for last detection (CAPTCHA, 403, etc.)
+        success_count_headed: Successful requests in headed mode
+        success_count_headless: Successful requests in headless mode
+        fail_count_headed: Failed requests in headed mode
+        fail_count_headless: Failed requests in headless mode
+        profile_path: Path to persistent browser profile for this domain
+        cookies_stored: Whether cookies are stored for this domain
+        created_at: Record creation timestamp
+        updated_at: Last update timestamp
+    """
+
+    __tablename__ = "domain_browser_settings"
+
+    # Primary Key
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Domain (unique index)
+    domain: Mapped[str] = mapped_column(
+        String(255), nullable=False, unique=True, index=True,
+        comment="Domain name (e.g., 'google.com', 'yelp.com')"
+    )
+
+    # Browser Mode Settings
+    requires_headed: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, index=True,
+        comment="Whether domain requires headed (visible) browser"
+    )
+
+    # Detection Tracking
+    detection_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False,
+        comment="Number of times bot detection was triggered"
+    )
+    last_detection: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True,
+        comment="Last detection timestamp"
+    )
+    detection_reason: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True,
+        comment="Reason for last detection (CAPTCHA, 403_FORBIDDEN, BOT_DETECTED)"
+    )
+
+    # Success/Failure Statistics
+    success_count_headed: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False,
+        comment="Successful requests in headed mode"
+    )
+    success_count_headless: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False,
+        comment="Successful requests in headless mode"
+    )
+    fail_count_headed: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False,
+        comment="Failed requests in headed mode"
+    )
+    fail_count_headless: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False,
+        comment="Failed requests in headless mode"
+    )
+
+    # Browser Profile Persistence
+    profile_path: Mapped[Optional[str]] = mapped_column(
+        String(500), nullable=True,
+        comment="Path to persistent browser profile for this domain"
+    )
+    cookies_stored: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False,
+        comment="Whether cookies/storage are persisted for this domain"
+    )
+
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, onupdate=func.now(), nullable=True
+    )
+
+    def __repr__(self) -> str:
+        """String representation of DomainBrowserSettings."""
+        mode = "headed" if self.requires_headed else "headless"
+        return f"<DomainBrowserSettings(domain='{self.domain}', mode='{mode}', detections={self.detection_count})>"
+
+

@@ -2,11 +2,12 @@
 """
 Service verification module for filtering and classifying businesses.
 
-This module implements multi-phase verification:
-- Phase 1: Rule-based service detection (pressure/window/wood)
-- Phase 2: Site structure analysis (navigation, headings, schema.org)
-- Phase 3: Combined scoring with discovery signals
-- Phase 5: ML classifier integration (optional)
+Enhanced multi-phase verification with LLM-first approach:
+- Phase 1: Hard negative filters (blocked domains)
+- Phase 2: LLM-powered classification (primary - uses GPU-accelerated Mistral 7B)
+- Phase 3: Rule-based service detection (supplementary)
+- Phase 4: Site structure analysis (navigation, headings, schema.org)
+- Phase 5: Combined scoring with weighted LLM + rule scores
 
 Target services:
 - Residential & commercial pressure washing
@@ -17,7 +18,7 @@ Filters out:
 - Directories (Yelp, HomeAdvisor, etc.)
 - Equipment sellers
 - Training sites / courses
-- Marketing agencies
+- Marketing agencies / lead gen
 - Blogs / informational content only
 - Auto detailing services
 """
@@ -49,7 +50,8 @@ class ServiceVerifier:
         self,
         config_file: str = 'data/verification_services.json',
         ml_model_path: Optional[str] = None,
-        use_llm: bool = False
+        use_llm: bool = True,
+        llm_weight: float = 0.7
     ):
         """
         Initialize verifier with configuration.
@@ -57,19 +59,21 @@ class ServiceVerifier:
         Args:
             config_file: Path to verification services config JSON
             ml_model_path: Optional path to trained ML model (Phase 5)
-            use_llm: Whether to use LLM for uncertain cases (hybrid mode)
+            use_llm: Whether to use LLM for classification (default: True - primary method)
+            llm_weight: Weight for LLM score vs rule score (default: 0.7 = 70% LLM, 30% rules)
         """
         self.config = self._load_config(config_file)
         self.ml_model = self._load_ml_model(ml_model_path) if ml_model_path else None
         self.use_llm = use_llm
+        self.llm_weight = llm_weight
         self.llm_verifier = None
 
-        # Initialize LLM if requested
+        # Initialize LLM (primary classification method)
         if use_llm:
             try:
                 from scrape_site.llm_verifier import get_llm_verifier
                 self.llm_verifier = get_llm_verifier()
-                logger.info("✓ LLM verifier loaded (Llama 3.2 3B)")
+                logger.info("✓ LLM verifier loaded (Mistral 7B on GPU)")
             except Exception as e:
                 logger.warning(f"Failed to load LLM verifier: {e}")
                 self.use_llm = False
@@ -174,61 +178,88 @@ class ServiceVerifier:
         if self._check_blocked_domain(domain, result):
             return result
 
-        # If we have website_metadata, use it for deep analysis
+        company_name = company_data.get('name', '')
+
+        # === PHASE 2: LLM-First Classification (Primary) ===
+        llm_result = None
+        llm_score = 0.0
+        if self.use_llm and self.llm_verifier and website_metadata:
+            llm_result = self._get_llm_classification(company_data, website_metadata)
+            if llm_result:
+                llm_score, llm_details = self.llm_verifier.calculate_llm_score(llm_result)
+                result['llm_classification'] = llm_result
+                result['llm_score'] = llm_score
+                result['llm_details'] = llm_details
+                result['is_legitimate'] = llm_result.get('is_legitimate', False)
+                result['red_flags'] = llm_result.get('red_flags', [])
+                result['quality_signals'] = llm_result.get('quality_signals', [])
+
+                # Add LLM-detected services to result
+                if llm_result.get('pressure_washing'):
+                    result['positive_signals'].append('LLM: Pressure washing service detected')
+                if llm_result.get('window_cleaning'):
+                    result['positive_signals'].append('LLM: Window cleaning service detected')
+                if llm_result.get('wood_restoration'):
+                    result['positive_signals'].append('LLM: Wood restoration service detected')
+
+                # Add red flags as negative signals
+                for flag in llm_result.get('red_flags', []):
+                    result['negative_signals'].append(f'LLM: {flag}')
+
+                logger.debug(f"LLM score: {llm_score:.0f}/100, legitimate={llm_result.get('is_legitimate')}")
+
+        # === PHASE 3: Rule-based Analysis (Supplementary) ===
         if website_metadata:
-            # Phase 1: Multi-label service detection (include company name!)
-            company_name = company_data.get('name', '')
+            # Multi-label service detection
             self._detect_services(website_metadata, result, company_name)
 
-            # Phase 1: Provider vs informational language
+            # Provider vs informational language
             self._analyze_language(website_metadata, result)
 
-            # Phase 1: Local business artifacts
+            # Local business artifacts
             self._validate_local_business(website_metadata, result)
 
-            # Phase 2: Site structure analysis
+            # Phase 4: Site structure analysis
             if website_html:
                 self._analyze_site_structure(website_html, result, company_name)
                 self._analyze_schema_org(website_metadata.get('json_ld', []), result)
 
-        # Phase 1: Classify into tiers
+        # Classify into tiers (based on rule detection)
         self._assign_tier(result)
 
         # Calculate rule-based score
         rule_score = self._calculate_rule_score(result)
 
-        # Hybrid LLM Enhancement for uncertain cases (0.30-0.80 rule score)
-        if self.use_llm and self.llm_verifier and website_metadata and 0.30 <= rule_score <= 0.80:
-            llm_result = self._get_llm_classification(company_data, website_metadata)
-            if llm_result:
-                llm_score, llm_details = self.llm_verifier.calculate_llm_score(llm_result)
-                # Blend rule score and LLM score for uncertain cases
-                result['score'] = (0.5 * rule_score + 0.5 * (llm_score / 100.0))  # Normalize LLM score to 0-1
-                result['llm_classification'] = llm_result
-                result['llm_score'] = llm_score
-                result['llm_details'] = llm_details
-                logger.debug(f"LLM enhanced score: rule={rule_score:.2f}, llm={llm_score:.0f}/100, final={result['score']:.2f}")
-            else:
-                # LLM failed, fall back to rule score
-                result['score'] = rule_score
-                logger.debug(f"LLM unavailable, using rule score: {rule_score:.2f}")
-        # Phase 5: Optionally enhance with ML score (if not using LLM)
+        # === PHASE 5: Combined Scoring ===
+        if llm_result:
+            # LLM-first: weight LLM score heavily (70% LLM, 30% rules by default)
+            result['score'] = (self.llm_weight * (llm_score / 100.0) +
+                             (1 - self.llm_weight) * rule_score)
+            result['rule_score'] = rule_score
+            logger.debug(f"Combined score: LLM={llm_score:.0f}, rule={rule_score:.2f}, "
+                        f"final={result['score']:.2f} (weight={self.llm_weight})")
         elif self.ml_model:
             ml_score = self._get_ml_score(company_data, result)
-            # Weighted average: 60% rules, 40% ML
             result['score'] = 0.6 * rule_score + 0.4 * ml_score
             result['ml_score'] = ml_score
         else:
-            # Fast path: use rule score only
             result['score'] = rule_score
 
-        # Determine status based on score
-        if result['score'] >= 0.75:
+        # Determine status based on score and LLM legitimacy
+        is_llm_legitimate = result.get('is_legitimate', False)
+
+        if result['score'] >= 0.70 and is_llm_legitimate:
+            result['status'] = 'passed'
+            result['reason'] = f'Verified legitimate service company (Tier {result["tier"]}, LLM-confirmed)'
+        elif result['score'] >= 0.75:
             result['status'] = 'passed'
             result['reason'] = f'Verified target service company (Tier {result["tier"]})'
-        elif result['score'] <= 0.35:
+        elif result['score'] <= 0.30 or (llm_result and not is_llm_legitimate and len(result.get('red_flags', [])) >= 2):
             result['status'] = 'failed'
-            result['reason'] = 'Does not meet target service criteria'
+            reason_parts = ['Does not meet target service criteria']
+            if result.get('red_flags'):
+                reason_parts.append(f"Red flags: {', '.join(result['red_flags'][:2])}")
+            result['reason'] = '. '.join(reason_parts)
         else:
             result['status'] = 'unknown'
             result['needs_review'] = True
@@ -605,16 +636,18 @@ class ServiceVerifier:
 
 def create_verifier(
     config_file: str = 'data/verification_services.json',
-    use_llm: bool = False
+    use_llm: bool = True,
+    llm_weight: float = 0.7
 ) -> ServiceVerifier:
     """
     Factory function to create a ServiceVerifier instance.
 
     Args:
         config_file: Path to verification services config JSON
-        use_llm: Whether to use LLM for uncertain cases (hybrid mode)
+        use_llm: Whether to use LLM for classification (default: True - primary method)
+        llm_weight: Weight for LLM score (0.0-1.0, default: 0.7)
 
     Returns:
-        Configured ServiceVerifier instance
+        Configured ServiceVerifier instance with GPU-accelerated LLM
     """
-    return ServiceVerifier(config_file=config_file, use_llm=use_llm)
+    return ServiceVerifier(config_file=config_file, use_llm=use_llm, llm_weight=llm_weight)

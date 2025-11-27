@@ -111,8 +111,8 @@ class ChangeManager:
                             priority, source, status, metadata
                         ) VALUES (
                             :change_type, :entity_type, :entity_id,
-                            :proposed_value::jsonb, :current_value::jsonb, :reason,
-                            :priority, :source, 'pending', :metadata::jsonb
+                            CAST(:proposed_value AS jsonb), CAST(:current_value AS jsonb), :reason,
+                            :priority, :source, 'pending', CAST(:metadata AS jsonb)
                         )
                         RETURNING change_id
                     """),

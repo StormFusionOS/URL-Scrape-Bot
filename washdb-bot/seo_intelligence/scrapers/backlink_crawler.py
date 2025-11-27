@@ -45,8 +45,8 @@ class BacklinkCrawler(BaseScraper):
 
     def __init__(
         self,
-        headless: bool = True,
-        use_proxy: bool = True,
+        headless: bool = True,  # Hybrid mode: starts headless, upgrades to headed on detection
+        use_proxy: bool = False,  # Disabled: datacenter proxies get detected
     ):
         """
         Initialize backlink crawler.
@@ -59,7 +59,7 @@ class BacklinkCrawler(BaseScraper):
             name="backlink_crawler",
             tier="C",  # Standard rate limits
             headless=headless,
-            respect_robots=True,
+            respect_robots=False,  # Disabled: need to crawl all sources
             use_proxy=use_proxy,
             max_retries=3,
             page_timeout=30000,
@@ -104,8 +104,8 @@ class BacklinkCrawler(BaseScraper):
             session.execute(
                 text("""
                     UPDATE referring_domains
-                    SET backlink_count = backlink_count + 1,
-                        last_seen_at = NOW()
+                    SET total_backlinks = total_backlinks + 1,
+                        last_updated_at = NOW()
                     WHERE domain_id = :id
                 """),
                 {"id": row[0]}
@@ -116,13 +116,13 @@ class BacklinkCrawler(BaseScraper):
         # Create new referring domain
         result = session.execute(
             text("""
-                INSERT INTO referring_domains (domain, domain_authority, backlink_count, first_seen_at, last_seen_at)
-                VALUES (:domain, :domain_authority, 1, NOW(), NOW())
+                INSERT INTO referring_domains (domain, local_authority_score, total_backlinks, first_seen_at, last_updated_at)
+                VALUES (:domain, :local_authority_score, 1, NOW(), NOW())
                 RETURNING domain_id
             """),
             {
                 "domain": domain,
-                "domain_authority": domain_authority,
+                "local_authority_score": domain_authority,
             }
         )
         session.commit()
@@ -135,7 +135,7 @@ class BacklinkCrawler(BaseScraper):
     def _save_backlink(
         self,
         session: Session,
-        domain_id: int,
+        source_domain: str,
         target_url: str,
         source_url: str,
         anchor_text: str = "",
@@ -147,7 +147,7 @@ class BacklinkCrawler(BaseScraper):
 
         Args:
             session: Database session
-            domain_id: Referring domain ID
+            source_domain: Domain of the page containing the link
             target_url: URL being linked to (our site)
             source_url: URL containing the link
             anchor_text: Link anchor text
@@ -157,6 +157,11 @@ class BacklinkCrawler(BaseScraper):
         Returns:
             int: Backlink ID
         """
+        # Extract target domain from target_url
+        target_domain = urlparse(target_url).netloc
+        if target_domain.startswith('www.'):
+            target_domain = target_domain[4:]
+
         # Check if backlink already exists
         result = session.execute(
             text("""
@@ -188,17 +193,21 @@ class BacklinkCrawler(BaseScraper):
         result = session.execute(
             text("""
                 INSERT INTO backlinks (
-                    domain_id, target_url, source_url, anchor_text,
-                    link_type, is_active, first_seen_at, last_seen_at, metadata
+                    target_domain, target_url, source_domain, source_url,
+                    anchor_text, link_type, is_active, discovered_at, last_seen_at, metadata
                 ) VALUES (
-                    :domain_id, :target_url, :source_url, :anchor_text,
-                    :link_type, TRUE, NOW(), NOW(), :metadata::jsonb
+                    :target_domain, :target_url, :source_domain, :source_url,
+                    :anchor_text, :link_type, TRUE, NOW(), NOW(), CAST(:metadata AS jsonb)
                 )
+                ON CONFLICT (target_url, source_url) DO UPDATE SET
+                    last_seen_at = NOW(),
+                    is_active = TRUE
                 RETURNING backlink_id
             """),
             {
-                "domain_id": domain_id,
+                "target_domain": target_domain,
                 "target_url": target_url,
+                "source_domain": source_domain,
                 "source_url": source_url,
                 "anchor_text": anchor_text[:500] if anchor_text else "",
                 "link_type": link_type,
@@ -208,6 +217,113 @@ class BacklinkCrawler(BaseScraper):
         session.commit()
 
         return result.fetchone()[0]
+
+    def _detect_link_placement(self, link, soup) -> Dict[str, Any]:
+        """
+        Detect where a link is placed on the page.
+
+        Analyzes link position to determine if it's in:
+        - navigation: Header nav, menu links
+        - footer: Footer section
+        - sidebar: Aside, sidebar widgets
+        - content: Main article body (editorial)
+        - comments: User-generated comments section
+        - author_bio: Author bio sections
+
+        Args:
+            link: BeautifulSoup link element
+            soup: Full page soup for context
+
+        Returns:
+            Dict with placement info:
+            - placement: navigation/footer/sidebar/content/comments/author_bio
+            - is_editorial: True if in main content body
+            - surrounding_word_count: Words in containing paragraph/block
+        """
+        placement = "content"  # Default
+        is_editorial = True
+
+        # Get all ancestors for analysis
+        ancestors = list(link.parents)
+        ancestor_tags = [a.name for a in ancestors if a.name]
+        ancestor_classes = []
+        ancestor_ids = []
+
+        for a in ancestors:
+            if hasattr(a, 'get'):
+                classes = a.get('class', [])
+                if classes:
+                    if isinstance(classes, list):
+                        ancestor_classes.extend([c.lower() for c in classes])
+                    else:
+                        ancestor_classes.append(classes.lower())
+                id_attr = a.get('id', '')
+                if id_attr:
+                    ancestor_ids.append(id_attr.lower())
+
+        # Convert to sets for faster lookup
+        ancestor_class_set = set(ancestor_classes)
+        ancestor_id_set = set(ancestor_ids)
+
+        # Check for navigation
+        nav_indicators = {'nav', 'navigation', 'menu', 'navbar', 'header-menu', 'main-menu', 'primary-nav'}
+        if 'nav' in ancestor_tags or 'header' in ancestor_tags:
+            placement = "navigation"
+            is_editorial = False
+        elif ancestor_class_set & nav_indicators or ancestor_id_set & nav_indicators:
+            placement = "navigation"
+            is_editorial = False
+
+        # Check for footer
+        footer_indicators = {'footer', 'foot', 'bottom', 'site-footer', 'page-footer'}
+        if 'footer' in ancestor_tags:
+            placement = "footer"
+            is_editorial = False
+        elif ancestor_class_set & footer_indicators or ancestor_id_set & footer_indicators:
+            placement = "footer"
+            is_editorial = False
+
+        # Check for sidebar
+        sidebar_indicators = {'sidebar', 'aside', 'widget', 'side-bar', 'right-col', 'left-col'}
+        if 'aside' in ancestor_tags:
+            placement = "sidebar"
+            is_editorial = False
+        elif ancestor_class_set & sidebar_indicators or ancestor_id_set & sidebar_indicators:
+            placement = "sidebar"
+            is_editorial = False
+
+        # Check for comments section
+        comment_indicators = {'comment', 'comments', 'discussion', 'respond', 'reply', 'user-content'}
+        if ancestor_class_set & comment_indicators or ancestor_id_set & comment_indicators:
+            placement = "comments"
+            is_editorial = False
+
+        # Check for author bio
+        author_indicators = {'author', 'bio', 'about-author', 'author-box', 'byline'}
+        if ancestor_class_set & author_indicators or ancestor_id_set & author_indicators:
+            placement = "author_bio"
+            is_editorial = False
+
+        # Calculate surrounding word count
+        surrounding_word_count = 0
+        parent = link.parent
+        if parent:
+            # Try to find the containing paragraph or content block
+            content_parent = None
+            for ancestor in [parent] + list(parent.parents)[:3]:
+                if ancestor.name in ['p', 'article', 'section', 'div']:
+                    content_parent = ancestor
+                    break
+
+            if content_parent:
+                text = content_parent.get_text(strip=True)
+                surrounding_word_count = len(text.split())
+
+        return {
+            "placement": placement,
+            "is_editorial": is_editorial,
+            "surrounding_word_count": surrounding_word_count,
+        }
 
     def _extract_backlinks_from_page(
         self,
@@ -224,7 +340,7 @@ class BacklinkCrawler(BaseScraper):
             target_domains: List of domains to look for links to
 
         Returns:
-            List of backlink dictionaries
+            List of backlink dictionaries with placement detection
         """
         from bs4 import BeautifulSoup
 
@@ -276,12 +392,19 @@ class BacklinkCrawler(BaseScraper):
                     if parent:
                         context = parent.get_text(strip=True)[:200]
 
+                    # Detect link placement (NEW)
+                    placement_info = self._detect_link_placement(link, soup)
+
                     backlinks.append({
                         "target_url": full_url,
                         "source_url": source_url,
                         "anchor_text": anchor_text,
                         "link_type": link_type,
                         "context": context,
+                        # New placement fields
+                        "placement": placement_info["placement"],
+                        "is_editorial": placement_info["is_editorial"],
+                        "surrounding_word_count": placement_info["surrounding_word_count"],
                     })
                     break
 
@@ -328,14 +451,13 @@ class BacklinkCrawler(BaseScraper):
                         source_domain = source_domain[4:]
 
                     with Session(self.engine) as session:
-                        domain_id = self._get_or_create_referring_domain(
-                            session, source_domain
-                        )
+                        # Also track in referring_domains table for analytics
+                        self._get_or_create_referring_domain(session, source_domain)
 
                         for bl in backlinks:
                             self._save_backlink(
                                 session,
-                                domain_id=domain_id,
+                                source_domain=source_domain,
                                 target_url=bl["target_url"],
                                 source_url=bl["source_url"],
                                 anchor_text=bl["anchor_text"],

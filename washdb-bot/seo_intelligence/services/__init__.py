@@ -16,6 +16,18 @@ This module contains core services:
 - nap_validator: NAP consistency validation
 - entity_matcher: Entity deduplication and matching
 - url_canonicalizer: URL normalization and tracking parameter removal
+- cwv_metrics: Core Web Vitals thresholds and scoring
+- readability_analyzer: Text readability scoring (Flesch-Kincaid, etc.)
+- volume_estimator: SERP-based search volume estimation
+- difficulty_calculator: Keyword difficulty from competition analysis
+- opportunity_analyzer: Keyword opportunity prioritization
+- topic_clusterer: Semantic keyword grouping and content pillar generation
+- content_gap_analyzer: Content opportunity detection vs competitors
+- backlink_gap_analyzer: Backlink opportunity identification
+- keyword_gap_analyzer: Competitor keyword gap analysis
+- engagement_analyzer: Page engagement metrics and UX signals
+- traffic_estimator: CTR-based organic traffic estimation
+- ranking_trends: Position change tracking and alerts
 
 All services support ethical scraping with rate limiting and robots.txt compliance.
 """
@@ -47,6 +59,86 @@ from .domain_quarantine import (
     QuarantineEntry,
     BackoffSchedule,
     get_domain_quarantine
+)
+from .browser_profile_manager import (
+    BrowserProfileManager,
+    get_browser_profile_manager
+)
+from .cwv_metrics import (
+    CWVMetricsService,
+    CWVRating,
+    CWV_THRESHOLDS,
+    get_cwv_metrics_service
+)
+from .readability_analyzer import (
+    ReadabilityAnalyzer,
+    ReadabilityResult,
+    get_readability_analyzer
+)
+from .volume_estimator import (
+    VolumeEstimator,
+    VolumeEstimate,
+    VolumeCategory,
+    get_volume_estimator
+)
+from .difficulty_calculator import (
+    DifficultyCalculator,
+    DifficultyResult,
+    DifficultyLevel,
+    get_difficulty_calculator
+)
+from .opportunity_analyzer import (
+    OpportunityAnalyzer,
+    KeywordOpportunity,
+    OpportunityTier,
+    SearchIntent,
+    get_opportunity_analyzer
+)
+from .topic_clusterer import (
+    TopicClusterer,
+    TopicCluster,
+    get_topic_clusterer
+)
+from .content_gap_analyzer import (
+    ContentGapAnalyzer,
+    ContentGap,
+    GapType,
+    get_content_gap_analyzer
+)
+from .backlink_gap_analyzer import (
+    BacklinkGapAnalyzer,
+    BacklinkOpportunity,
+    LinkType,
+    get_backlink_gap_analyzer
+)
+from .keyword_gap_analyzer import (
+    KeywordGapAnalyzer,
+    KeywordGap,
+    GapCategory,
+    get_keyword_gap_analyzer
+)
+from .engagement_analyzer import (
+    EngagementAnalyzer,
+    EngagementResult,
+    EngagementLevel,
+    EngagementSignals,
+    get_engagement_analyzer
+)
+from .traffic_estimator import (
+    TrafficEstimator,
+    KeywordTraffic,
+    DomainTraffic,
+    TrafficQuality,
+    get_traffic_estimator
+)
+from .ranking_trends import (
+    RankingTrends,
+    TrendAnalysis,
+    TrendDirection,
+    RankingAlert,
+    AlertType,
+    DomainTrendSummary,
+    get_ranking_trends
 )
 
 __all__ = [
@@ -98,4 +190,60 @@ __all__ = [
     "QuarantineEntry",
     "BackoffSchedule",
     "get_domain_quarantine",
+    "BrowserProfileManager",
+    "get_browser_profile_manager",
+    "CWVMetricsService",
+    "CWVRating",
+    "CWV_THRESHOLDS",
+    "get_cwv_metrics_service",
+    "ReadabilityAnalyzer",
+    "ReadabilityResult",
+    "get_readability_analyzer",
+    "VolumeEstimator",
+    "VolumeEstimate",
+    "VolumeCategory",
+    "get_volume_estimator",
+    "DifficultyCalculator",
+    "DifficultyResult",
+    "DifficultyLevel",
+    "get_difficulty_calculator",
+    "OpportunityAnalyzer",
+    "KeywordOpportunity",
+    "OpportunityTier",
+    "SearchIntent",
+    "get_opportunity_analyzer",
+    # Phase 3: Content & Competitive Analysis
+    "TopicClusterer",
+    "TopicCluster",
+    "get_topic_clusterer",
+    "ContentGapAnalyzer",
+    "ContentGap",
+    "GapType",
+    "get_content_gap_analyzer",
+    "BacklinkGapAnalyzer",
+    "BacklinkOpportunity",
+    "LinkType",
+    "get_backlink_gap_analyzer",
+    "KeywordGapAnalyzer",
+    "KeywordGap",
+    "GapCategory",
+    "get_keyword_gap_analyzer",
+    # Phase 4: Traffic & Trends
+    "EngagementAnalyzer",
+    "EngagementResult",
+    "EngagementLevel",
+    "EngagementSignals",
+    "get_engagement_analyzer",
+    "TrafficEstimator",
+    "KeywordTraffic",
+    "DomainTraffic",
+    "TrafficQuality",
+    "get_traffic_estimator",
+    "RankingTrends",
+    "TrendAnalysis",
+    "TrendDirection",
+    "RankingAlert",
+    "AlertType",
+    "DomainTrendSummary",
+    "get_ranking_trends",
 ]

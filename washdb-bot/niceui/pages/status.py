@@ -8,6 +8,8 @@ from nicegui import ui, run
 from ..router import event_bus
 from ..utils import job_state, history_manager
 from ..layout import layout
+from ..widgets.gpu_monitor import gpu_monitor_card
+from ..widgets.llm_service_control import llm_service_card
 import tempfile
 from pathlib import Path
 from collections import deque
@@ -512,95 +514,104 @@ def status_page():
             # ======================
             ui.label('Live Activity').classes('text-2xl font-bold mb-2')
 
-    with ui.card().classes('w-full mb-4'):
-        # Log viewer - displays discovery logs
-        ui.label('Live Output (Discovery Runs)').classes('text-lg font-bold mb-2')
+            # GPU Monitor, LLM Service, and Live Output side by side
+            with ui.row().classes('w-full gap-4 mb-4'):
+                # GPU Monitor and LLM Service (left side, stacked)
+                with ui.column().classes('w-80 gap-4'):
+                    gpu_monitor_card(refresh_interval=2.0)
+                    llm_service_card(refresh_interval=2.0)
 
-        with ui.row().classes('w-full gap-2 mb-2'):
-            ui.button('Clear Log', icon='delete', on_click=lambda: clear_discovery_log()).props('flat dense')
+                # Live Output (right side, fills remaining space)
+                with ui.column().classes('flex-1'):
+                    with ui.card().classes('w-full'):
+                        # Log viewer - displays discovery logs
+                        ui.label('Live Output (Discovery Runs)').classes('text-lg font-bold mb-2')
 
-        # Display discovery logs
-        log_container = ui.scroll_area().classes('w-full h-96 bg-gray-900 rounded p-2')
+                        with ui.row().classes('w-full gap-2 mb-2'):
+                            ui.button('Clear Log', icon='delete', on_click=lambda: clear_discovery_log()).props('flat dense')
 
-        with log_container:
-            # Import discovery state to show discovery logs
-            from .discover import discovery_state
-            if discovery_state.log_element:
-                # Reference the same log element from discovery
-                status_state.log_element = discovery_state.log_element
-            else:
-                # Create a placeholder
-                status_state.log_element = ui.column().classes('w-full gap-0 font-mono text-xs')
-                ui.label('No discovery runs yet. Start a discovery run from the Discover page.').classes('text-gray-400 italic text-sm')
+                        # Display discovery logs
+                        log_container = ui.scroll_area().classes('w-full h-80 bg-gray-900 rounded p-2')
 
-    # ======================
-    # HISTORY SECTION
-    # ======================
-    ui.label('Run History').classes('text-2xl font-bold mb-2 mt-6')
+                        with log_container:
+                            # Import discovery state to show discovery logs
+                            from .discover import discovery_state
+                            if discovery_state.log_element:
+                                # Reference the same log element from discovery
+                                status_state.log_element = discovery_state.log_element
+                            else:
+                                # Create a placeholder
+                                status_state.log_element = ui.column().classes('w-full gap-0 font-mono text-xs')
+                                ui.label('No discovery runs yet. Start a discovery run from the Discover page.').classes('text-gray-400 italic text-sm')
 
-    with ui.card().classes('w-full mb-4'):
-        # Summary stats
-        stats = history_manager.get_stats()
+            # ======================
+            # HISTORY SECTION
+            # ======================
+            ui.label('Run History').classes('text-2xl font-bold mb-2 mt-6')
 
-        with ui.row().classes('w-full gap-4 mb-4'):
-            with ui.card().classes('flex-1 bg-blue-900'):
-                ui.label('Total Runs').classes('text-sm text-gray-300')
-                ui.label(str(stats['total_runs'])).classes('text-2xl font-bold')
+            with ui.card().classes('w-full mb-4'):
+                # Summary stats
+                stats = history_manager.get_stats()
 
-            with ui.card().classes('flex-1 bg-green-900'):
-                ui.label('Successful').classes('text-sm text-gray-300')
-                ui.label(str(stats['success_count'])).classes('text-2xl font-bold')
+                with ui.row().classes('w-full gap-4 mb-4'):
+                    with ui.card().classes('flex-1 bg-blue-900'):
+                        ui.label('Total Runs').classes('text-sm text-gray-300')
+                        ui.label(str(stats['total_runs'])).classes('text-2xl font-bold')
 
-            with ui.card().classes('flex-1 bg-red-900'):
-                ui.label('Failed').classes('text-sm text-gray-300')
-                ui.label(str(stats['error_count'])).classes('text-2xl font-bold')
+                    with ui.card().classes('flex-1 bg-green-900'):
+                        ui.label('Successful').classes('text-sm text-gray-300')
+                        ui.label(str(stats['success_count'])).classes('text-2xl font-bold')
 
-            with ui.card().classes('flex-1 bg-purple-900'):
-                ui.label('Avg Duration').classes('text-sm text-gray-300')
-                ui.label(format_duration(stats['avg_duration'])).classes('text-2xl font-bold')
+                    with ui.card().classes('flex-1 bg-red-900'):
+                        ui.label('Failed').classes('text-sm text-gray-300')
+                        ui.label(str(stats['error_count'])).classes('text-2xl font-bold')
 
-        # Filters
-        with ui.row().classes('w-full gap-4 mb-4'):
-            job_filter = ui.select(
-                ['All', 'Discover', 'Scrape', 'Single URL'],
-                value='All',
-                label='Job Type'
-            ).classes('w-48')
+                    with ui.card().classes('flex-1 bg-purple-900'):
+                        ui.label('Avg Duration').classes('text-sm text-gray-300')
+                        ui.label(format_duration(stats['avg_duration'])).classes('text-2xl font-bold')
 
-            search_input = ui.input('Search', placeholder='Search args/notes...').classes('flex-1')
+                # Filters
+                with ui.row().classes('w-full gap-4 mb-4'):
+                    job_filter = ui.select(
+                        ['All', 'Discover', 'Scrape', 'Single URL'],
+                        value='All',
+                        label='Job Type'
+                    ).classes('w-48')
 
-            ui.button('Filter', icon='filter_list',
-                      on_click=lambda: load_history_table(
-                          None if job_filter.value == 'All' else job_filter.value,
-                          search_input.value if search_input.value else None
-                      )).props('outline')
+                    search_input = ui.input('Search', placeholder='Search args/notes...').classes('flex-1')
 
-            ui.button('Export CSV', icon='download', color='primary',
-                      on_click=export_history_csv).props('outline')
+                    ui.button('Filter', icon='filter_list',
+                              on_click=lambda: load_history_table(
+                                  None if job_filter.value == 'All' else job_filter.value,
+                                  search_input.value if search_input.value else None
+                              )).props('outline')
 
-            ui.button('Clear History', icon='delete_forever', color='negative',
-                      on_click=clear_history).props('outline')
+                    ui.button('Export CSV', icon='download', color='primary',
+                              on_click=export_history_csv).props('outline')
 
-        # History table
-        status_state.history_table = ui.aggrid({
-            'columnDefs': [
-                {'field': 'timestamp', 'headerName': 'Timestamp', 'sortable': True, 'width': 180},
-                {'field': 'job_type', 'headerName': 'Job Type', 'sortable': True, 'width': 120},
-                {'field': 'duration', 'headerName': 'Duration', 'sortable': True, 'width': 100},
-                {'field': 'exit_code', 'headerName': 'Exit Code', 'sortable': True, 'width': 100},
-                {'field': 'found', 'headerName': 'Found', 'sortable': True, 'width': 90},
-                {'field': 'updated', 'headerName': 'Updated', 'sortable': True, 'width': 90},
-                {'field': 'errors', 'headerName': 'Errors', 'sortable': True, 'width': 90},
-                {'field': 'args', 'headerName': 'Args', 'flex': 1},
-            ],
-            'rowData': [],
-            'rowSelection': 'single',
-            'pagination': True,
-            'paginationPageSize': 20,
-        }).classes('w-full').style('height: 400px;')
+                    ui.button('Clear History', icon='delete_forever', color='negative',
+                              on_click=clear_history).props('outline')
 
-        # Load initial data
-        load_history_table()
+                # History table
+                status_state.history_table = ui.aggrid({
+                    'columnDefs': [
+                        {'field': 'timestamp', 'headerName': 'Timestamp', 'sortable': True, 'width': 180},
+                        {'field': 'job_type', 'headerName': 'Job Type', 'sortable': True, 'width': 120},
+                        {'field': 'duration', 'headerName': 'Duration', 'sortable': True, 'width': 100},
+                        {'field': 'exit_code', 'headerName': 'Exit Code', 'sortable': True, 'width': 100},
+                        {'field': 'found', 'headerName': 'Found', 'sortable': True, 'width': 90},
+                        {'field': 'updated', 'headerName': 'Updated', 'sortable': True, 'width': 90},
+                        {'field': 'errors', 'headerName': 'Errors', 'sortable': True, 'width': 90},
+                        {'field': 'args', 'headerName': 'Args', 'flex': 1},
+                    ],
+                    'rowData': [],
+                    'rowSelection': 'single',
+                    'pagination': True,
+                    'paginationPageSize': 20,
+                }).classes('w-full').style('height: 400px;')
+
+                # Load initial data
+                load_history_table()
 
         # ======================
         # TAB 2: APPLICATION LOGS

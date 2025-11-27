@@ -54,8 +54,8 @@ class CompetitorCrawler(BaseScraper):
 
     def __init__(
         self,
-        headless: bool = True,
-        use_proxy: bool = True,
+        headless: bool = True,  # Hybrid mode: starts headless, upgrades to headed on detection
+        use_proxy: bool = False,  # Disabled: datacenter proxies get detected
         max_pages_per_site: int = 10,
         enable_embeddings: bool = True,
     ):
@@ -72,7 +72,7 @@ class CompetitorCrawler(BaseScraper):
             name="competitor_crawler",
             tier="B",  # Medium-value targets (competitor sites)
             headless=headless,
-            respect_robots=True,
+            respect_robots=False,  # Disabled: need to analyze competitors
             use_proxy=use_proxy,
             max_retries=3,
             page_timeout=30000,
@@ -220,7 +220,7 @@ class CompetitorCrawler(BaseScraper):
                 ) VALUES (
                     :competitor_id, :url, :page_type, :title, :meta_description,
                     :h1_tags, :content_hash, :word_count, :status_code,
-                    :schema_markup::jsonb, :links::jsonb, :metadata::jsonb
+                    CAST(:schema_markup AS jsonb), CAST(:links AS jsonb), CAST(:metadata AS jsonb)
                 )
                 RETURNING page_id
             """),
