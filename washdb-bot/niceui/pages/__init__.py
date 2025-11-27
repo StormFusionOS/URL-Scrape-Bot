@@ -12,7 +12,6 @@ from .settings import settings_page
 from .scheduler import scheduler_page
 from .diagnostics import diagnostics_page
 from .run_history import run_history_page
-from .seo_intelligence import seo_intelligence_page
 from .seo_database import seo_database_page
 from .seo_review_queue import seo_review_queue_page
 from .local_competitors import local_competitors_page
@@ -33,7 +32,6 @@ __all__ = [
     'scheduler_page',
     'diagnostics_page',
     'run_history_page',
-    'seo_intelligence_page',
     'seo_database_page',
     'seo_review_queue_page',
     'local_competitors_page',

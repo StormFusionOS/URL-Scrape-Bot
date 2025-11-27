@@ -1,0 +1,15 @@
+[Unit]
+Description=YP 5-Worker Continuous Crawler
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=rivercityscrape
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python scripts/yp_continuous_5workers.py
+Restart=always
+RestartSec=1800
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

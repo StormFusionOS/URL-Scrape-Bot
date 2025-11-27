@@ -3,7 +3,7 @@ Logging setup for washdb-bot.
 
 This module provides:
 - Centralized logging configuration
-- Console and file handlers
+- Console and file handlers with immediate flushing for real-time log viewing
 - Log rotation
 """
 
@@ -18,6 +18,16 @@ from dotenv import load_dotenv
 
 # Load environment
 load_dotenv()
+
+
+class FlushingRotatingFileHandler(RotatingFileHandler):
+    """
+    A RotatingFileHandler that flushes after every emit.
+    This ensures log lines appear immediately in the file for real-time tailing.
+    """
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
 
 
 def setup_logging(
@@ -66,7 +76,7 @@ def setup_logging(
     console_handler.setFormatter(console_formatter)
     logger.addHandler(console_handler)
 
-    # File handler (with rotation)
+    # File handler (with rotation and immediate flushing for real-time log viewing)
     if log_file is None:
         # Default to logs/{name}.log
         project_root = Path(__file__).parent.parent
@@ -74,7 +84,7 @@ def setup_logging(
         logs_dir.mkdir(exist_ok=True)
         log_file = logs_dir / f"{name}.log"
 
-    file_handler = RotatingFileHandler(
+    file_handler = FlushingRotatingFileHandler(
         log_file,
         maxBytes=10 * 1024 * 1024,  # 10 MB
         backupCount=5,

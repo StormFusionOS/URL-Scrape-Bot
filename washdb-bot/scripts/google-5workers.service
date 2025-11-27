@@ -1,0 +1,20 @@
+[Unit]
+Description=Google Maps 5-Worker Continuous Crawler
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=rivercityscrape
+Group=rivercityscrape
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+Environment="PATH=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python scripts/google_continuous_5workers.py
+Restart=always
+RestartSec=1800
+StandardOutput=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/google_5workers_service.log
+StandardError=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/google_5workers_service.log
+
+[Install]
+WantedBy=multi-user.target

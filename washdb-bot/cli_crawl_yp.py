@@ -3,13 +3,9 @@
 Yellow Pages Crawler CLI - City-First Approach (Default)
 
 This is the main CLI for the Yellow Pages scraper using the city-first strategy.
-For the old state-first approach, see cli_crawl_yp_state_first_BACKUP.py
+Targets are auto-generated from city_registry at startup if they don't exist.
 
 Usage:
-    # Generate targets for states (run this first)
-    python -m scrape_yp.generate_city_targets --states "RI,CA,TX"
-
-    # Run crawler
     python cli_crawl_yp.py --states RI --min-score 50
     python cli_crawl_yp.py --states "CA,TX,FL" --max-targets 1000
 """
@@ -43,6 +39,68 @@ if not DATABASE_URL:
     raise ValueError("DATABASE_URL not found in .env file")
 
 
+def ensure_targets_exist(session, state_ids: list[str]) -> int:
+    """
+    Ensure targets exist for the specified states.
+    Auto-generates from city_registry if no targets found.
+
+    Args:
+        session: SQLAlchemy session
+        state_ids: List of 2-letter state codes
+
+    Returns:
+        Number of planned targets available
+    """
+    from db.models import YPTarget
+
+    # Check if targets exist for these states
+    existing_count = (
+        session.query(YPTarget)
+        .filter(
+            YPTarget.state_id.in_(state_ids),
+            YPTarget.status == "planned"
+        )
+        .count()
+    )
+
+    if existing_count > 0:
+        logger.info(f"Found {existing_count:,} existing planned targets")
+        return existing_count
+
+    # No planned targets - check if any targets exist at all (might be done/failed)
+    total_count = (
+        session.query(YPTarget)
+        .filter(YPTarget.state_id.in_(state_ids))
+        .count()
+    )
+
+    if total_count > 0:
+        # Targets exist but none are planned - show status breakdown
+        done_count = session.query(YPTarget).filter(
+            YPTarget.state_id.in_(state_ids),
+            YPTarget.status == "done"
+        ).count()
+        logger.info(f"All targets completed: {done_count:,} done out of {total_count:,} total")
+        return 0
+
+    # No targets at all - auto-generate from city_registry
+    logger.info("No targets found - auto-generating from city_registry...")
+
+    from scrape_yp.generate_city_targets import generate_targets
+
+    try:
+        targets_created = generate_targets(
+            session,
+            state_ids=state_ids,
+            clear_existing=False  # Don't clear - we know there are none
+        )
+        logger.info(f"Auto-generated {targets_created:,} targets")
+        return targets_created
+    except Exception as e:
+        logger.error(f"Failed to auto-generate targets: {e}")
+        raise
+
+
 def progress_callback(target_idx: int, total_targets: int, target, results: list, stats: dict):
     """Progress callback for crawl updates."""
     progress_pct = (target_idx / total_targets) * 100
@@ -56,14 +114,11 @@ def progress_callback(target_idx: int, total_targets: int, target, results: list
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
-        description="Yellow Pages city-first crawler (default mode)",
+        description="Yellow Pages city-first crawler (auto-generates targets from city_registry)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Generate targets first (required before crawling)
-  python -m scrape_yp.generate_city_targets --states RI --clear
-
-  # Run crawler on Rhode Island
+  # Run crawler on Rhode Island (targets auto-generated if needed)
   python cli_crawl_yp.py --states RI
 
   # Multiple states with custom settings
@@ -72,8 +127,8 @@ Examples:
   # Dry run (no database saves)
   python cli_crawl_yp.py --states RI --dry-run
 
-Note: City-first is now the DEFAULT approach. For old state-first behavior,
-      see cli_crawl_yp_state_first_BACKUP.py
+Note: Targets are automatically generated from city_registry on first run.
+      No manual target generation step is required.
         """
     )
 
@@ -120,20 +175,47 @@ Note: City-first is now the DEFAULT approach. For old state-first behavior,
         action="store_true",
         help="Disable session breaks every 50 requests (default: enabled)",
     )
+    parser.add_argument(
+        "--worker-id",
+        type=int,
+        default=None,
+        help="Worker ID (1-5) for multi-worker deployments",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Custom log file path (default: logs/cli_yp.log)",
+    )
 
     args = parser.parse_args()
+
+    # Configure custom log file if specified
+    if args.log_file:
+        import logging
+        # Add file handler to logger
+        file_handler = logging.FileHandler(args.log_file)
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        ))
+        logger.addHandler(file_handler)
 
     # Parse state list
     state_ids = [s.strip().upper() for s in args.states.split(",")]
 
     print("=" * 80)
     print("Yellow Pages Crawler - City-First (Default)")
+    if args.worker_id:
+        print(f"Worker ID: {args.worker_id}")
     print("=" * 80)
     print(f"States: {', '.join(state_ids)}")
     print(f"Min Score: {args.min_score}")
     print(f"Include Sponsored: {args.include_sponsored}")
     print(f"Max Targets: {args.max_targets or 'All'}")
     print(f"Dry Run: {args.dry_run}")
+    if args.log_file:
+        print(f"Log File: {args.log_file}")
     print()
     print("Anti-Detection & Monitoring:")
     print(f"  Monitoring: {'Disabled' if args.disable_monitoring else 'Enabled ✓'}")
@@ -150,26 +232,16 @@ Note: City-first is now the DEFAULT approach. For old state-first behavior,
     session = Session()
 
     try:
-        # Check if targets exist
-        from db.models import YPTarget
-        target_count = (
-            session.query(YPTarget)
-            .filter(
-                YPTarget.state_id.in_(state_ids),
-                YPTarget.status == "planned"
-            )
-            .count()
-        )
+        # Ensure targets exist (auto-generate from city_registry if needed)
+        target_count = ensure_targets_exist(session, state_ids)
 
         if target_count == 0:
-            print("⚠️  No targets found for these states!")
-            print()
-            print("You need to generate targets first:")
-            print(f"  python -m scrape_yp.generate_city_targets --states \"{','.join(state_ids)}\" --clear")
+            print("⚠️  No planned targets available for these states!")
+            print("    (All targets may already be completed)")
             print()
             return 1
 
-        print(f"✓ Found {target_count} planned targets")
+        print(f"✓ Found {target_count:,} planned targets")
         if args.max_targets and args.max_targets < target_count:
             print(f"  (will process {args.max_targets} of {target_count})")
         print()
