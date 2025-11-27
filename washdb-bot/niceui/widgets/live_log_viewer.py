@@ -101,9 +101,9 @@ class LiveLogViewer:
                     f.seek(0, 2)  # Seek to end
                     self.file_position = f.tell()
 
-        # Create timer to poll for new lines (faster polling for better responsiveness)
+        # Create timer to poll for new lines (faster polling for real-time responsiveness)
         if not self.timer:
-            self.timer = ui.timer(0.25, self._tail_file)  # Poll every 250ms
+            self.timer = ui.timer(0.1, self._tail_file)  # Poll every 100ms for real-time feel
         else:
             self.timer.active = True
 

@@ -11,6 +11,7 @@ from datetime import datetime
 import asyncio
 import sys
 import os
+from pathlib import Path
 from scrape_yp.state_assignments import get_states_for_worker, get_proxy_assignments
 from typing import Dict, Optional
 
@@ -25,6 +26,9 @@ class DiscoveryState:
         self.log_element = None
         self.log_viewer = None  # LiveLogViewer instance
         self.subprocess_runner = None  # SubprocessRunner instance for instant kill
+        self.run_button = None  # Reference to run button for state management
+        self.stop_button = None  # Reference to stop button for state management
+        self.progress_bar = None  # Reference to progress bar for state management
 
     def cancel(self):
         self.cancel_requested = True
@@ -34,6 +38,16 @@ class DiscoveryState:
 
     def reset(self):
         self.cancel_requested = False
+
+    def reset_ui_state(self):
+        """Reset UI elements to stopped state."""
+        self.running = False
+        if self.run_button:
+            self.run_button.enable()
+        if self.stop_button:
+            self.stop_button.disable()
+        if self.progress_bar:
+            self.progress_bar.value = 0
 
     def add_log(self, message, level='info'):
         """Add a log message to the output window."""
@@ -339,7 +353,7 @@ async def run_yellow_pages_discovery(
 
     # Register job in process manager
     job_id = 'discovery_yp'
-    process_manager.register(job_id, 'YP Discovery', log_file='logs/yp_crawl_city_first.log')
+    process_manager.register(job_id, 'YP Discovery (5-Worker)', log_file='logs/YPContinuous5Workers.log')
 
     # Disable run button, enable stop button
     run_button.disable()
@@ -377,37 +391,16 @@ async def run_yellow_pages_discovery(
         }
 
     try:
-        ui.notify('Starting YP city-first crawler as subprocess...', type='info')
+        ui.notify('Starting YP 5-worker continuous scraper (all 50 states, auto-restart)...', type='info')
 
-        # Build command for subprocess (NEW CLI arguments)
-        states_str = ','.join(states)
-
+        # Build command for 5-worker continuous subprocess
         cmd = [
             sys.executable,  # Python interpreter from venv
-            'cli_crawl_yp.py',
-            '--states', states_str,
-            '--min-score', str(min_score)
+            'scripts/yp_continuous_5workers.py'
         ]
 
-        # Add optional flags
-        if include_sponsored:
-            cmd.append('--include-sponsored')
-
-        if max_targets:
-            cmd.extend(['--max-targets', str(max_targets)])
-
-        # Add monitoring flags
-        if not enable_monitoring:
-            cmd.append('--disable-monitoring')
-
-        if not enable_adaptive_rate_limiting:
-            cmd.append('--disable-adaptive-rate-limiting')
-
-        if not enable_session_breaks:
-            cmd.append('--no-session-breaks')
-
         # Create subprocess runner
-        runner = SubprocessRunner(job_id, 'logs/yp_crawl_city_first.log')
+        runner = SubprocessRunner(job_id, 'logs/YPContinuous5Workers.log')
         discovery_state.subprocess_runner = runner
 
         # Start subprocess
@@ -554,7 +547,7 @@ async def run_google_maps_discovery(
 
     # Register job in process manager
     job_id = 'discovery_google'
-    process_manager.register(job_id, 'Google Discovery', log_file='logs/google_scrape.log')
+    process_manager.register(job_id, 'Google Discovery (Continuous)', log_file='logs/GoogleContinuous.log')
 
     # Disable run button, enable stop button
     run_button.disable()
@@ -586,22 +579,16 @@ async def run_google_maps_discovery(
         }
 
     try:
-        ui.notify('Starting Google Maps scraper as subprocess...', type='info')
+        ui.notify('Starting Google continuous scraper (all 50 states, auto-restart)...', type='info')
 
-        # Build command for subprocess
+        # Build command for continuous subprocess (no args needed - all states hardcoded)
         cmd = [
             sys.executable,
-            'cli_crawl_google.py',
-            '--query', query,
-            '--location', location,
-            '--max-results', str(max_results)
+            'scripts/google_continuous.py'
         ]
 
-        if scrape_details:
-            cmd.append('--scrape-details')
-
         # Create subprocess runner
-        runner = SubprocessRunner(job_id, 'logs/google_scrape.log')
+        runner = SubprocessRunner(job_id, 'logs/GoogleContinuous.log')
         discovery_state.subprocess_runner = runner
 
         # Start subprocess
@@ -715,18 +702,24 @@ async def run_google_maps_discovery(
 
 
 async def run_google_maps_city_first_discovery(
-    state_ids,
-    max_targets,
-    scrape_details,
     stats_card,
     progress_bar,
     run_button,
     stop_button
 ):
-    """Run Google Maps city-first discovery in background with progress updates."""
+    """Run Google Maps city-first discovery in background with progress updates.
+
+    Note: The 5-worker system automatically handles all 50 states with partitioning.
+    No configuration parameters needed - everything is handled by the worker script.
+    """
     discovery_state.running = True
     discovery_state.reset()
     discovery_state.start_time = datetime.now()
+
+    # Store button references for stop_discovery to use
+    discovery_state.run_button = run_button
+    discovery_state.stop_button = stop_button
+    discovery_state.progress_bar = progress_bar
 
     # Register job in process manager
     job_id = 'discovery_google_city_first'
@@ -748,7 +741,6 @@ async def run_google_maps_city_first_discovery(
     discovery_state.add_log('=' * 60, 'info')
     discovery_state.add_log('Workers: 5 parallel workers with state partitioning', 'info')
     discovery_state.add_log('Coverage: All 50 US states', 'info')
-    discovery_state.add_log(f'Scrape Details: {scrape_details}', 'info')
     discovery_state.add_log('Log shown: Worker 1 (see logs/google_worker_*.log for others)', 'info')
     discovery_state.add_log('-' * 60, 'info')
 
@@ -775,58 +767,83 @@ async def run_google_maps_city_first_discovery(
         # Note: The 5-worker system automatically handles all 50 states with partitioning
         # Individual worker parameters (max_targets, scrape_details) are handled by the script
 
-        # Create subprocess runner (uses worker 1's log as primary)
-        runner = SubprocessRunner(job_id, 'logs/google_worker_1.log')
-        discovery_state.subprocess_runner = runner
+        # Start the 5-worker system (script launches workers and exits quickly)
+        import subprocess
+        result = subprocess.run(cmd, cwd=os.getcwd(), capture_output=True, text=True, timeout=60)
 
-        # Start the 5-worker system
-        pid = runner.start(cmd, cwd=os.getcwd())
-        ui.notify(f'5-worker system started (script PID: {pid})', type='positive')
+        if result.returncode != 0:
+            ui.notify(f'Failed to start workers: {result.stderr}', type='negative')
+            raise Exception(f'Start script failed: {result.stderr}')
+
+        # Wait a moment for PID file to be created
+        await asyncio.sleep(2)
+
+        # Verify workers started by checking PID file
+        pid_file = Path('logs/google_workers.pid')
+        if not pid_file.exists():
+            ui.notify('Workers failed to start - no PID file found', type='negative')
+            raise Exception('Workers failed to start - no PID file found')
+
+        # Read worker PIDs
+        with open(pid_file, 'r') as f:
+            worker_pids = [int(line.strip()) for line in f if line.strip()]
+
+        if not worker_pids:
+            ui.notify('Workers failed to start - empty PID file', type='negative')
+            raise Exception('Workers failed to start - empty PID file')
+
+        ui.notify(f'5-worker system started ({len(worker_pids)} workers)', type='positive')
         ui.notify('Workers deployed: 5 workers processing all 50 states', type='info')
 
-        # Update process manager with script PID
-        # Note: Individual worker PIDs are tracked in logs/google_workers.pid
-        process_manager.update_pid(job_id, pid)
+        # Update process manager with first worker PID
+        process_manager.update_pid(job_id, worker_pids[0])
 
-        # Wait for subprocess to complete
-        while runner.is_running():
-            await asyncio.sleep(1.0)
+        # Monitor workers until stopped or all finish
+        # Workers are long-running continuous processes
+        while True:
+            await asyncio.sleep(2.0)
 
-            # Update progress bar (rough estimate based on time)
+            # Check if workers are still running
+            running_count = 0
+            for pid in worker_pids:
+                try:
+                    result = subprocess.run(['ps', '-p', str(pid)], capture_output=True)
+                    if result.returncode == 0:
+                        running_count += 1
+                except Exception:
+                    pass
+
+            # Update progress bar (indeterminate - workers run continuously)
+            # Show a pulsing effect between 0.3 and 0.7
             elapsed = (datetime.now() - discovery_state.start_time).total_seconds()
-            # City-first: ~30 seconds per target average
-            if max_targets:
-                estimated_done = min(int(elapsed / 30), max_targets)
-                progress_bar.value = estimated_done / max_targets
-            else:
-                # Indeterminate progress
-                progress_bar.value = 0.5
+            import math
+            progress_bar.value = 0.5 + 0.2 * math.sin(elapsed / 5)
 
             # Check for cancellation
             if discovery_state.is_cancelled():
                 ui.notify('Stopping 5-worker system...', type='warning')
                 # Call stop script to gracefully stop all 5 workers
-                import subprocess
                 subprocess.run(['bash', 'scripts/google_workers/stop_google_workers.sh'],
                              cwd=os.getcwd(), capture_output=True)
-                runner.kill()  # Also kill the start script
                 break
 
-        # Get final status
-        status = runner.get_status()
-        return_code = status['return_code']
+            # Check if all workers finished
+            if running_count == 0:
+                ui.notify('All workers have completed!', type='positive')
+                break
 
-        if return_code == 0:
-            ui.notify('City-first scraper completed successfully!', type='positive')
-        elif return_code == -9:
-            ui.notify('City-first scraper was killed by user', type='warning')
+        # Determine final status
+        was_cancelled = discovery_state.is_cancelled()
+
+        if was_cancelled:
+            ui.notify('City-first scraper was stopped by user', type='warning')
         else:
-            ui.notify(f'City-first scraper failed with code {return_code}', type='negative')
+            ui.notify('City-first scraper completed successfully!', type='positive')
 
         # Parse final results from log (simplified - just show completion)
         result = {
-            "targets_processed": max_targets or "all",
-            "success": return_code == 0
+            "targets_processed": "all (5-worker system)",
+            "success": not was_cancelled
         }
 
         # Calculate elapsed time
@@ -883,203 +900,332 @@ async def run_google_maps_city_first_discovery(
 
 
 async def stop_discovery():
-    """Stop the running discovery immediately."""
-    if discovery_state.running:
-        # Set cancel flag (soft stop)
-        discovery_state.cancel()
+    """Stop ALL running Google discovery immediately - both foreground and background."""
+    import subprocess
 
-        # Try to kill subprocess directly (instant hard stop)
-        killed = False
-        if discovery_state.subprocess_runner:
-            killed = discovery_state.subprocess_runner.kill()
-            if killed:
-                ui.notify('Discovery stopped immediately (subprocess killed)', type='warning')
+    # Set cancel flag regardless of state
+    discovery_state.cancel()
 
-        # Fallback: Try to kill via process manager if no subprocess runner
-        if not killed:
-            killed = process_manager.kill('discovery_yp', force=True)
-            if killed:
-                ui.notify('Discovery stopped immediately (force killed)', type='warning')
-            else:
-                ui.notify('Stop requested - waiting for current batch to finish', type='info')
+    killed_count = 0
 
-        # Stop log tailing
-        if discovery_state.log_viewer:
-            discovery_state.log_viewer.stop_tailing()
+    # Step 1: Stop the systemd service (this handles auto-restart)
+    try:
+        result = subprocess.run(
+            ['sudo', 'systemctl', 'stop', 'google-5workers.service'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            killed_count += 1
+    except Exception as e:
+        print(f"Error stopping systemd service: {e}")
+
+    # Step 2: Kill ALL Google-related processes with pkill (instant kill)
+    patterns = [
+        'cli_crawl_google_city_first',
+        'google_continuous_5workers',
+        'google_continuous.py'
+    ]
+
+    for pattern in patterns:
+        try:
+            # Use SIGKILL for instant termination
+            subprocess.run(['pkill', '-9', '-f', pattern], capture_output=True)
+            killed_count += 1
+        except Exception:
+            pass
+
+    # Step 3: Double-check and force kill any remaining
+    try:
+        result = subprocess.run(
+            ['pgrep', '-f', 'cli_crawl_google'],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            pids = result.stdout.strip().split('\n')
+            for pid in pids:
+                try:
+                    subprocess.run(['kill', '-9', pid.strip()], capture_output=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Step 4: Clear the PID file
+    pid_file = Path('logs/google_workers.pid')
+    if pid_file.exists():
+        try:
+            pid_file.unlink()
+        except Exception:
+            pass
+
+    # Step 5: Clear the status file
+    status_file = Path('logs/google_workers_status.json')
+    if status_file.exists():
+        try:
+            status_file.unlink()
+        except Exception:
+            pass
+
+    # Notify user
+    ui.notify('All Google workers stopped immediately', type='warning')
+
+    # Try to kill subprocess directly (for GUI-started processes)
+    if discovery_state.subprocess_runner:
+        try:
+            discovery_state.subprocess_runner.kill()
+        except Exception:
+            pass
+
+    # Stop log tailing
+    if discovery_state.log_viewer:
+        discovery_state.log_viewer.stop_tailing()
+
+    # Reset UI state (buttons and progress bar) immediately
+    discovery_state.running = False
+    discovery_state.reset_ui_state()
 
 
-def detect_running_yp_scraper():
-    """Detect if a YP scraper is already running and reconnect to it."""
+async def stop_yp_discovery():
+    """Stop ALL running YP discovery immediately - both foreground and background."""
+    import subprocess
+
+    # Set cancel flag regardless of state
+    discovery_state.cancel()
+
+    # Kill ALL YP-related processes with pkill (instant kill, no sudo needed)
+    patterns = [
+        'cli_crawl_yp',
+        'yp_continuous_5workers',
+        'yp_continuous.py'
+    ]
+
+    for pattern in patterns:
+        try:
+            # Use SIGKILL for instant termination
+            subprocess.run(['pkill', '-9', '-f', pattern], capture_output=True)
+            killed_count += 1
+        except Exception:
+            pass
+
+    # Step 3: Double-check and force kill any remaining
+    try:
+        result = subprocess.run(
+            ['pgrep', '-f', 'cli_crawl_yp'],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            pids = result.stdout.strip().split('\n')
+            for pid in pids:
+                try:
+                    subprocess.run(['kill', '-9', pid.strip()], capture_output=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Step 4: Clear the PID file
+    pid_file = Path('logs/yp_workers.pid')
+    if pid_file.exists():
+        try:
+            pid_file.unlink()
+        except Exception:
+            pass
+
+    # Step 5: Clear the status file
+    status_file = Path('logs/yp_workers_status.json')
+    if status_file.exists():
+        try:
+            status_file.unlink()
+        except Exception:
+            pass
+
+    # Notify user
+    ui.notify('All YP workers stopped immediately', type='warning')
+
+    # Try to kill subprocess directly (for GUI-started processes)
+    if discovery_state.subprocess_runner:
+        try:
+            discovery_state.subprocess_runner.kill()
+        except Exception:
+            pass
+
+    # Stop log tailing
+    if discovery_state.log_viewer:
+        discovery_state.log_viewer.stop_tailing()
+
+    # Reset UI state (buttons and progress bar) immediately
+    discovery_state.running = False
+    discovery_state.reset_ui_state()
+
+
+def detect_running_yp_workers():
+    """Detect if YP workers are running (systemd service, GUI-started, or external)."""
     import subprocess
     import os
 
+    pid_file = 'logs/yp_workers.pid'
+    running_count = 0
+
+    # Method 1: Check systemd service status
     try:
-        # Check for running cli_crawl_yp.py processes
         result = subprocess.run(
-            ['ps', 'aux'],
+            ['systemctl', 'is-active', 'yp-5workers.service'],
             capture_output=True,
             text=True,
             timeout=5
         )
+        if result.stdout.strip() == 'active':
+            # Service is running - count workers via pgrep
+            worker_result = subprocess.run(
+                ['pgrep', '-cf', 'cli_crawl_yp'],
+                capture_output=True,
+                text=True
+            )
+            if worker_result.returncode == 0:
+                running_count = int(worker_result.stdout.strip())
+            else:
+                running_count = 5  # Assume 5 if service is active
 
-        for line in result.stdout.split('\n'):
-            if 'cli_crawl_yp.py' in line and 'grep' not in line:
-                # Extract PID
-                parts = line.split()
-                if len(parts) > 1:
-                    pid = int(parts[1])
-
-                    # Verify the process is actually still running
-                    try:
-                        os.kill(pid, 0)  # Signal 0 checks if process exists without killing it
-                    except OSError:
-                        # Process doesn't exist anymore
-                        continue
-
-                    # Register with process manager if not already registered
-                    if not process_manager.get('discovery_yp'):
-                        process_manager.register('discovery_yp', 'YP Discovery',
-                                                pid=pid,
-                                                log_file='logs/yp_crawl_city_first.log')
-                        discovery_state.running = True
-                        return True, pid
-                    else:
-                        # Already registered, update state
-                        discovery_state.running = True
-                        return True, pid
+            discovery_state.running = True
+            return True, running_count
     except Exception as e:
-        print(f"Error detecting running scraper: {e}")
+        print(f"Error checking YP systemd service: {e}")
 
-    # If we get here, no running scraper found - ensure state is clean
+    # Method 2: Check PID file (GUI-started workers)
+    try:
+        if os.path.exists(pid_file):
+            with open(pid_file, 'r') as f:
+                pids = [int(line.strip()) for line in f if line.strip()]
+
+            # Check if any PIDs are still running
+            for pid in pids[:5]:
+                try:
+                    result = subprocess.run(['ps', '-p', str(pid)], capture_output=True)
+                    if result.returncode == 0:
+                        running_count += 1
+                except Exception:
+                    pass
+
+            if running_count > 0:
+                discovery_state.running = True
+                return True, running_count
+
+    except Exception as e:
+        print(f"Error checking YP PID file: {e}")
+
+    # Method 3: Fallback - Use pgrep to find external workers
+    try:
+        patterns = ['cli_crawl_yp', 'yp_continuous_5workers']
+        for pattern in patterns:
+            result = subprocess.run(
+                ['pgrep', '-f', pattern],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                pids = result.stdout.strip().split('\n')
+                running_count = len(pids)
+                discovery_state.running = True
+                return True, running_count
+    except Exception as e:
+        print(f"Error in YP pgrep fallback: {e}")
+
+    # No running workers found
     discovery_state.running = False
-    return False, None
+    return False, 0
+
+
+def detect_running_google_workers():
+    """Detect if Google workers are running (systemd service, GUI-started, or external)."""
+    import subprocess
+    import os
+
+    pid_file = 'logs/google_workers.pid'
+    running_count = 0
+
+    # Method 1: Check systemd service status
+    try:
+        result = subprocess.run(
+            ['systemctl', 'is-active', 'google-5workers.service'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.stdout.strip() == 'active':
+            # Service is running - count workers via pgrep
+            worker_result = subprocess.run(
+                ['pgrep', '-cf', 'cli_crawl_google_city_first'],
+                capture_output=True,
+                text=True
+            )
+            if worker_result.returncode == 0:
+                running_count = int(worker_result.stdout.strip())
+            else:
+                running_count = 5  # Assume 5 if service is active
+
+            discovery_state.running = True
+            return True, running_count
+    except Exception as e:
+        print(f"Error checking systemd service: {e}")
+
+    # Method 2: Check PID file (GUI-started workers)
+    try:
+        if os.path.exists(pid_file):
+            with open(pid_file, 'r') as f:
+                pids = [int(line.strip()) for line in f if line.strip()]
+
+            # Check if any PIDs are still running
+            for pid in pids[:5]:
+                try:
+                    result = subprocess.run(['ps', '-p', str(pid)], capture_output=True)
+                    if result.returncode == 0:
+                        running_count += 1
+                except Exception:
+                    pass
+
+            if running_count > 0:
+                discovery_state.running = True
+                return True, running_count
+
+    except Exception as e:
+        print(f"Error checking PID file: {e}")
+
+    # Method 3: Fallback - Use pgrep to find external workers
+    try:
+        patterns = ['cli_crawl_google_city_first', 'google_continuous_5workers']
+        for pattern in patterns:
+            result = subprocess.run(
+                ['pgrep', '-f', pattern],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                pids = result.stdout.strip().split('\n')
+                running_count = len(pids)
+                discovery_state.running = True
+                return True, running_count
+    except Exception as e:
+        print(f"Error in pgrep fallback: {e}")
+
+    # No running workers found
+    discovery_state.running = False
+    return False, 0
 
 
 def build_yellow_pages_ui(container):
-    """Build Yellow Pages City-First discovery UI in the given container."""
+    """Build Yellow Pages discovery UI in the given container."""
 
-    # Check if scraper is already running on page load
-    is_running, pid = detect_running_yp_scraper()
+    # Check if workers are already running on page load
+    is_running, running_count = detect_running_yp_workers()
 
     with container:
-        # Show reconnection banner if scraper detected
+        # Show reconnection banner if workers detected
         if is_running:
             with ui.card().classes('w-full bg-green-900 border-l-4 border-green-500 mb-4'):
-                ui.label(f'✅ Reconnected to running scraper (PID: {pid})').classes('text-lg font-bold text-green-200')
-                ui.label('Live output resumed below. You can stop the scraper at any time.').classes('text-sm text-green-100')
-
-        # Info banner about city-first approach
-        with ui.card().classes('w-full bg-purple-900 border-l-4 border-purple-500 mb-4'):
-            ui.label('🎯 Yellow Pages City-First Scraper').classes('text-lg font-bold text-purple-200')
-            ui.label('• Scrapes 31,254 US cities with population-based prioritization').classes('text-sm text-purple-100')
-            ui.label('• Shallow pagination (1-3 pages per city) with early-exit optimization').classes('text-sm text-purple-100')
-            ui.label('• 85%+ precision filtering with 10 predefined categories').classes('text-sm text-purple-100')
-            ui.label('• Step 1: Generate targets → Step 2: Run crawler').classes('text-sm text-purple-100')
-
-        # Configuration card
-        with ui.card().classes('w-full mb-4'):
-            ui.label('Yellow Pages Configuration').classes('text-xl font-bold mb-4')
-
-            # State selection
-            ui.label('US States').classes('font-semibold mb-2')
-            ui.label('Select states to scrape (generates targets for all cities in selected states):').classes('text-sm text-gray-400 mb-2')
-
-            state_checkboxes = {}
-            with ui.grid(columns=10).classes('w-full gap-1 mb-4'):
-                for state in ALL_STATES:
-                    # Rhode Island selected by default for testing
-                    state_checkboxes[state] = ui.checkbox(state, value=(state == 'RI')).classes('text-xs')
-
-            # Quick select buttons
-            with ui.row().classes('gap-2 mb-4'):
-                def select_all_states():
-                    for cb in state_checkboxes.values():
-                        cb.value = True
-
-                def deselect_all_states():
-                    for cb in state_checkboxes.values():
-                        cb.value = False
-
-                ui.button('Select All', icon='check_box', on_click=select_all_states).props('flat dense')
-                ui.button('Deselect All', icon='check_box_outline_blank', on_click=deselect_all_states).props('flat dense')
-
-            ui.separator()
-
-            # Target generation section
-            ui.label('Step 1: Generate Targets').classes('font-semibold mb-2 mt-4')
-            ui.label('Generate scraping targets (city × category combinations) before running the crawler').classes('text-sm text-gray-400 mb-2')
-
-            # Target stats display (dynamic)
-            target_stats_container = ui.column().classes('w-full mb-3')
-
-            with ui.row().classes('gap-2 mb-4 items-center'):
-                generate_button = ui.button(
-                    'GENERATE TARGETS',
-                    icon='add_circle',
-                    color='secondary'
-                ).props('size=md')
-
-                refresh_stats_button = ui.button(
-                    'Refresh Stats',
-                    icon='refresh',
-                    on_click=lambda: None  # Will be set below
-                ).props('flat dense')
-
-            ui.separator()
-
-            # Crawler settings
-            ui.label('Step 2: Crawler Settings').classes('font-semibold mb-2 mt-4')
-
-            # Max targets
-            max_targets_input = ui.number(
-                label='Max Targets (leave empty for all)',
-                value=None,
-                min=1,
-                max=100000,
-                step=10
-            ).classes('w-64 mb-2')
-            ui.label('Limit number of targets to process (useful for testing)').classes('text-xs text-gray-400 mb-3')
-
-            # Minimum score slider
-            min_score_slider = ui.slider(
-                min=0,
-                max=100,
-                value=50,
-                step=5
-            ).classes('w-full mb-1').props('label-always')
-            ui.label('Minimum Confidence Score (lower = more results, higher = better precision)').classes('text-xs text-gray-400 mb-2')
-
-            # Include sponsored checkbox
-            include_sponsored_checkbox = ui.checkbox(
-                'Include Sponsored/Ad Listings',
-                value=False
-            ).classes('mb-1')
-            ui.label('Check to include paid ads (usually excluded for quality)').classes('text-xs text-gray-400')
-
-            ui.separator().classes('my-4')
-
-            # Monitoring & Anti-Detection Settings
-            ui.label('Anti-Detection & Monitoring').classes('font-semibold mb-2 mt-2')
-            ui.label('Enhanced monitoring and stealth features (recommended for production)').classes('text-xs text-gray-400 mb-2')
-
-            with ui.column().classes('gap-2'):
-                enable_monitoring_checkbox = ui.checkbox(
-                    '✓ Enable Monitoring & Health Checks',
-                    value=True
-                ).classes('text-sm')
-                ui.label('Real-time metrics, CAPTCHA detection, health monitoring').classes('text-xs text-gray-400 ml-6 -mt-2')
-
-                enable_adaptive_rate_limiting_checkbox = ui.checkbox(
-                    '✓ Enable Adaptive Rate Limiting',
-                    value=True
-                ).classes('text-sm')
-                ui.label('Automatically slows down on errors, speeds up on success').classes('text-xs text-gray-400 ml-6 -mt-2')
-
-                enable_session_breaks_checkbox = ui.checkbox(
-                    '✓ Enable Session Breaks',
-                    value=True
-                ).classes('text-sm')
-                ui.label('Takes 30-90s breaks every 50 requests for human-like behavior').classes('text-xs text-gray-400 ml-6 -mt-2')
+                ui.label(f'Reconnected to running workers ({running_count}/5 active)').classes('text-lg font-bold text-green-200')
+                ui.label('Live output resumed below. You can stop the workers at any time.').classes('text-sm text-green-100')
 
         # Stats and controls
         with ui.card().classes('w-full mb-4'):
@@ -1088,151 +1234,234 @@ def build_yellow_pages_ui(container):
             # Stats card
             stats_card = ui.column().classes('w-full mb-4')
             with stats_card:
-                ui.label('Ready to start').classes('text-lg')
+                if is_running:
+                    ui.label(f'Workers running ({running_count}/5 active)').classes('text-lg text-green-400')
+                else:
+                    ui.label('Ready to start').classes('text-lg')
 
             # Progress bar
             progress_bar = ui.linear_progress(value=0).classes('w-full mb-4')
 
             # Control buttons
             with ui.row().classes('gap-2'):
-                run_button = ui.button('START CRAWLER', icon='play_arrow', color='positive')
+                run_button = ui.button('START DISCOVERY', icon='play_arrow', color='positive')
                 stop_button = ui.button('STOP', icon='stop', color='negative')
 
-                # Set initial button states based on detected or global discovery state
-                if discovery_state.running or is_running:
+                # Set initial button states based on detection
+                if is_running or discovery_state.running:
                     run_button.disable()
                     stop_button.enable()
                 else:
                     run_button.enable()
                     stop_button.disable()
 
-        # Live output
+        # ====================================================================
+        # MULTI-WORKER STATUS DISPLAY (5 Workers)
+        # ====================================================================
+
+        # YP Worker State Assignments (matches yp_continuous_5workers.py)
+        yp_worker_states = {
+            0: ['AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA'],
+            1: ['HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD'],
+            2: ['MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ'],
+            3: ['NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC'],
+            4: ['SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY']
+        }
+
+        # Worker Status Grid
+        with ui.card().classes('w-full mb-4'):
+            ui.label('5-Worker System Status').classes('text-xl font-bold mb-4')
+
+            with ui.grid(columns=5).classes('w-full gap-3'):
+                yp_worker_badges = {}
+                yp_worker_labels = {}
+
+                for worker_id in range(5):
+                    states = yp_worker_states[worker_id]
+
+                    with ui.card().classes('p-3 hover:shadow-lg transition-shadow bg-gray-800'):
+                        # Header
+                        with ui.row().classes('items-center justify-between w-full mb-2'):
+                            ui.label(f'Worker {worker_id + 1}').classes('font-bold text-sm text-purple-200')
+                            yp_worker_badges[worker_id] = ui.badge('CHECKING', color='grey').classes('text-xs')
+
+                        # Assigned states
+                        ui.label(f"{', '.join(states[:3])}...").classes('text-xs text-gray-400 mb-2')
+
+                        # Stats placeholder
+                        yp_worker_labels[worker_id] = ui.label('Ready').classes('text-xs text-gray-300')
+
+        # Live output with tabbed multi-worker log viewers
         with ui.card().classes('w-full'):
-            ui.label('Live Crawler Output').classes('text-lg font-bold mb-2')
+            ui.label('Live Worker Output').classes('text-xl font-bold mb-2')
 
-            log_viewer = LiveLogViewer('logs/yp_crawl_city_first.log', max_lines=500, auto_scroll=True)
-            log_viewer.create()
+            # Tab selector for workers
+            with ui.tabs().classes('w-full') as yp_tabs:
+                yp_tab_all = ui.tab('All Workers')
+                yp_worker_tabs = []
+                for i in range(5):
+                    yp_worker_tabs.append(ui.tab(f'Worker {i + 1}'))
 
-            # If scraper was detected as running, load last 100 lines and start tailing
-            if is_running:
-                log_viewer.load_last_n_lines(100)
-                log_viewer.start_tailing()
+            # Tab panels
+            with ui.tab_panels(yp_tabs, value=yp_tab_all).classes('w-full'):
+                # All workers merged view - shows main orchestrator log
+                with ui.tab_panel(yp_tab_all):
+                    ui.label('📊 Live crawling activity from orchestrator').classes('text-xs text-gray-400 mb-2')
+                    log_viewer_all = LiveLogViewer('logs/YPContinuous5Workers.log', max_lines=400, auto_scroll=True)
+                    log_viewer_all.create()
+                    log_viewer_all.load_last_n_lines(100)
+                    log_viewer_all.start_tailing()
 
-            # Store references
-            discovery_state.log_viewer = log_viewer
-            discovery_state.log_element = None
+                # Individual worker logs
+                yp_log_viewers = []
+                for i in range(5):
+                    with ui.tab_panel(yp_worker_tabs[i]):
+                        states = yp_worker_states[i]
+                        ui.label(f"🌎 States: {', '.join(states)}").classes('text-xs text-gray-400 mb-2')
+                        log_viewer = LiveLogViewer(f'logs/yp_worker_{i + 1}.log', max_lines=300, auto_scroll=True)
+                        log_viewer.create()
+                        log_viewer.load_last_n_lines(100)
+                        log_viewer.start_tailing()
+                        yp_log_viewers.append(log_viewer)
 
-        # Helper function to update target stats display
-        async def update_target_stats():
-            selected_states = [state for state, cb in state_checkboxes.items() if cb.value]
-            if not selected_states:
-                target_stats_container.clear()
-                with target_stats_container:
-                    ui.label('No states selected').classes('text-gray-400 italic')
-                return
+        # Check worker status on page load
+        def check_yp_workers_status():
+            """Check if YP workers are running and update badges and buttons."""
+            import subprocess
+            running_count = 0
 
-            stats = await get_yp_target_stats(selected_states)
-
-            target_stats_container.clear()
-            if stats and stats['total'] > 0:
-                with target_stats_container:
-                    with ui.card().classes('w-full bg-slate-800 p-3'):
-                        ui.label('Target Statistics').classes('text-sm font-bold mb-2')
-                        with ui.grid(columns=5).classes('gap-2'):
-                            ui.label(f'Total: {stats["total"]}').classes('text-xs')
-                            ui.label(f'Planned: {stats["planned"]}').classes('text-xs text-blue-400')
-                            ui.label(f'In Progress: {stats["in_progress"]}').classes('text-xs text-yellow-400')
-                            ui.label(f'Done: {stats["done"]}').classes('text-xs text-green-400')
-                            ui.label(f'Failed: {stats["failed"]}').classes('text-xs text-red-400')
-            else:
-                with target_stats_container:
-                    ui.label('No targets generated yet for selected states').classes('text-yellow-400 italic text-sm')
-
-        # Generate targets button handler
-        async def handle_generate_targets():
-            selected_states = [state for state, cb in state_checkboxes.items() if cb.value]
-
-            if not selected_states:
-                ui.notify('Please select at least one state', type='warning')
-                return
-
-            # Confirm with user
-            with ui.dialog() as dialog, ui.card():
-                ui.label('Generate Targets?').classes('text-lg font-bold mb-2')
-                ui.label(f'This will generate targets for {len(selected_states)} state(s):').classes('text-sm mb-1')
-                ui.label(f'{", ".join(selected_states)}').classes('text-sm text-blue-400 mb-3')
-                ui.label('Existing targets for these states will be cleared.').classes('text-xs text-yellow-400 mb-3')
-
-                with ui.row().classes('gap-2'):
-                    ui.button('Cancel', on_click=dialog.close).props('flat')
-                    async def confirm_generate():
-                        dialog.close()
-
-                        # Launch target generation in detached background process
-                        success, message = generate_yp_targets_detached(selected_states, clear_existing=True)
-
-                        if success:
-                            # Calculate estimated time
-                            estimated_minutes = max(2, int(10 * len(selected_states) / 50))
-                            ui.notify(
-                                f'Target generation started for {len(selected_states)} state(s)! '
-                                f'Check logs/generate_targets.log for progress. Refresh in ~{estimated_minutes} minutes.',
-                                type='positive',
-                                timeout=10000
-                            )
+            try:
+                # Method 1: Check systemd service status first
+                try:
+                    result = subprocess.run(
+                        ['systemctl', 'is-active', 'yp-5workers.service'],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    if result.stdout.strip() == 'active':
+                        # Service is active - count actual workers
+                        worker_result = subprocess.run(
+                            ['pgrep', '-cf', 'cli_crawl_yp'],
+                            capture_output=True,
+                            text=True
+                        )
+                        if worker_result.returncode == 0:
+                            running_count = int(worker_result.stdout.strip())
                         else:
-                            ui.notify(
-                                f'Failed to start target generation: {message}',
-                                type='negative',
-                                timeout=5000
-                            )
+                            running_count = 5  # Assume 5 if service is active
+                except Exception:
+                    pass
 
-                    ui.button('Generate', on_click=confirm_generate, color='positive')
+                # Method 2: Check PID file if systemd not running
+                if running_count == 0:
+                    pid_file = 'logs/yp_workers.pid'
+                    if os.path.exists(pid_file):
+                        with open(pid_file, 'r') as f:
+                            pids = [int(line.strip()) for line in f if line.strip()]
 
-            dialog.open()
+                        for worker_id, pid in enumerate(pids[:5]):
+                            try:
+                                result = subprocess.run(['ps', '-p', str(pid)], capture_output=True)
+                                if result.returncode == 0:
+                                    running_count += 1
+                            except Exception:
+                                pass
 
-        generate_button.on('click', handle_generate_targets)
-        refresh_stats_button.on('click', update_target_stats)
+                # Method 3: Fallback - pgrep
+                if running_count == 0:
+                    try:
+                        result = subprocess.run(
+                            ['pgrep', '-f', 'cli_crawl_yp'],
+                            capture_output=True, text=True
+                        )
+                        if result.returncode == 0 and result.stdout.strip():
+                            pids = result.stdout.strip().split('\n')
+                            running_count = min(len(pids), 5)
+                    except Exception:
+                        pass
 
-        # Initialize stats display
-        asyncio.create_task(update_target_stats())
+                # Update badges based on running count
+                if running_count > 0:
+                    # Workers are running - disable start, enable stop
+                    run_button.disable()
+                    stop_button.enable()
+                    discovery_state.running = True
+
+                    for worker_id in range(5):
+                        if worker_id < running_count:
+                            if worker_id in yp_worker_badges:
+                                yp_worker_badges[worker_id].set_text('RUNNING')
+                                yp_worker_badges[worker_id].props('color=positive')
+                            if worker_id in yp_worker_labels:
+                                yp_worker_labels[worker_id].set_text('Processing targets...')
+                        else:
+                            if worker_id in yp_worker_badges:
+                                yp_worker_badges[worker_id].set_text('IDLE')
+                                yp_worker_badges[worker_id].props('color=grey')
+                            if worker_id in yp_worker_labels:
+                                yp_worker_labels[worker_id].set_text('Ready')
+                else:
+                    # No workers running - enable start, disable stop
+                    run_button.enable()
+                    stop_button.disable()
+                    discovery_state.running = False
+
+                    for worker_id in range(5):
+                        if worker_id in yp_worker_badges:
+                            yp_worker_badges[worker_id].set_text('IDLE')
+                            yp_worker_badges[worker_id].props('color=grey')
+                        if worker_id in yp_worker_labels:
+                            yp_worker_labels[worker_id].set_text('Ready')
+            except Exception as e:
+                print(f"Error checking YP worker status: {e}")
+
+        # Initial status check
+        check_yp_workers_status()
+
+        # Periodic status updates
+        ui.timer(5.0, check_yp_workers_status)
+
+        # Store references
+        discovery_state.log_viewer = log_viewer_all
+        discovery_state.log_element = None
 
         # Run button click handler
-        async def start_discovery():
-            # Get selected states
-            selected_states = [state for state, cb in state_checkboxes.items() if cb.value]
-
-            # Validate
-            if not selected_states:
-                ui.notify('Please select at least one state', type='warning')
+        async def start_yp_discovery():
+            # Check if workers are already running
+            already_running, _ = detect_running_yp_workers()
+            if already_running:
+                ui.notify('Workers are already running! Stop them first.', type='warning')
                 return
 
-            # Check if targets exist
-            stats = await get_yp_target_stats(selected_states)
-            if not stats or stats['planned'] == 0:
-                ui.notify('No planned targets found. Please generate targets first!', type='warning')
-                return
+            # Start 5-worker system directly (no sudo required)
+            import subprocess
+            try:
+                cmd = [
+                    sys.executable,
+                    'scripts/yp_continuous_5workers.py'
+                ]
 
-            # Run Yellow Pages city-first discovery
-            await run_yellow_pages_discovery(
-                selected_states,
-                int(max_targets_input.value) if max_targets_input.value else None,
-                stats_card,
-                progress_bar,
-                run_button,
-                stop_button,
-                min_score=min_score_slider.value,
-                include_sponsored=include_sponsored_checkbox.value,
-                enable_monitoring=enable_monitoring_checkbox.value,
-                enable_adaptive_rate_limiting=enable_adaptive_rate_limiting_checkbox.value,
-                enable_session_breaks=enable_session_breaks_checkbox.value
-            )
+                # Launch as detached background process
+                process = subprocess.Popen(
+                    cmd,
+                    cwd='/home/rivercityscrape/URL-Scrape-Bot/washdb-bot',
+                    stdout=open('logs/YPContinuous5Workers.log', 'a'),
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True  # Detach from parent
+                )
 
-            # Refresh stats after completion
-            await update_target_stats()
+                ui.notify(f'YP 5-worker system started! (PID: {process.pid})', type='positive')
+                run_button.disable()
+                stop_button.enable()
+                discovery_state.running = True
+                await asyncio.sleep(3)
+                check_yp_workers_status()
+            except Exception as e:
+                ui.notify(f'Error starting workers: {e}', type='negative')
 
-        run_button.on('click', start_discovery)
-        stop_button.on('click', stop_discovery)
+        run_button.on('click', start_yp_discovery)
+        stop_button.on('click', stop_yp_discovery)
 
 
 def build_multiworker_yp_ui(container):
@@ -1538,104 +1767,28 @@ def build_multiworker_yp_ui(container):
 
 def build_google_maps_ui(container):
     """Build Google Maps discovery UI in the given container."""
+
+    # Check if workers are already running on page load
+    is_running, running_count = detect_running_google_workers()
+
     with container:
-        # Configuration card
-        with ui.card().classes('w-full mb-4'):
-            ui.label('Google Maps Configuration').classes('text-xl font-bold mb-4')
+        # Show reconnection banner if workers detected
+        if is_running:
+            with ui.card().classes('w-full bg-green-900 border-l-4 border-green-500 mb-4'):
+                ui.label(f'Reconnected to running workers ({running_count}/5 active)').classes('text-lg font-bold text-green-200')
+                ui.label('Live output resumed below. You can stop the workers at any time.').classes('text-sm text-green-100')
 
-            # City-First Crawl Controls
-            ui.label('States to Crawl').classes('font-semibold mb-2')
-
-            # All 50 US states
-            all_states = [
-                'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
-                'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
-                'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
-                'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
-                'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY'
-            ]
-
-            # Store checkbox states in a dict
-            state_checkboxes = {}
-
-            with ui.card().classes('w-full bg-gray-800 p-4 mb-4'):
-                with ui.row().classes('w-full items-center mb-2'):
-                    ui.label('Select States').classes('text-sm font-bold text-blue-200')
-                    ui.space()
-                    select_all_btn = ui.button('Select All', icon='check_box', color='positive').props('size=sm outline')
-                    deselect_all_btn = ui.button('Deselect All', icon='check_box_outline_blank', color='warning').props('size=sm outline')
-
-                # Create checkbox grid (10 columns for 50 states = 5 rows)
-                with ui.grid(columns=10).classes('w-full gap-2'):
-                    for state in all_states:
-                        state_checkboxes[state] = ui.checkbox(state, value=True).classes('text-xs')
-
-                # Select/Deselect All functionality
-                def select_all():
-                    for checkbox in state_checkboxes.values():
-                        checkbox.value = True
-
-                def deselect_all():
-                    for checkbox in state_checkboxes.values():
-                        checkbox.value = False
-
-                select_all_btn.on('click', select_all)
-                deselect_all_btn.on('click', deselect_all)
-
-            ui.label('✓ All 50 states selected by default - will process ALL available targets').classes('text-xs text-green-400 mb-4')
-
-            ui.label('Max Targets').classes('font-semibold mb-2')
-            max_targets_input = ui.number(
-                label='Maximum targets to process (leave empty for all)',
-                value=None,
-                min=1,
-                max=10000,
-                step=1
-            ).classes('w-64 mb-4')
-            ui.label('✓ Set to process ALL targets in all selected states').classes('text-xs text-green-400 mb-4')
-
-            # Scrape details checkbox
-            scrape_details_checkbox = ui.checkbox(
-                'Scrape full business details',
-                value=True
-            ).classes('mb-2')
-            ui.label('Unchecking will only get basic info (faster but less data)').classes('text-xs text-gray-400')
-
-            # Target stats display
-            with ui.card().classes('w-full bg-gray-800 border-l-4 border-blue-500 mt-4'):
-                ui.label('Target Statistics').classes('text-md font-bold text-blue-200 mb-2')
-                stats_display = ui.column().classes('w-full')
-
-                def get_selected_states():
-                    """Helper function to get list of selected states from checkboxes."""
-                    return [state for state, checkbox in state_checkboxes.items() if checkbox.value]
-
-                def refresh_target_stats():
-                    """Refresh target statistics display."""
-                    from niceui.backend_facade import BackendFacade
-                    backend = BackendFacade()
-                    selected_states = get_selected_states()
-                    stats = backend.get_google_target_stats(selected_states)
-
-                    stats_display.clear()
-                    with stats_display:
-                        ui.label(f"Total targets: {stats['total']}").classes('text-sm text-gray-300')
-                        if stats['by_status']:
-                            for status, count in stats['by_status'].items():
-                                color = 'text-green-400' if status == 'DONE' else 'text-blue-400' if status == 'PLANNED' else 'text-yellow-400'
-                                ui.label(f"  {status}: {count}").classes(f'text-xs {color}')
-
-                ui.button('Refresh Stats', on_click=refresh_target_stats, icon='refresh').classes('mt-2')
-                refresh_target_stats()  # Initial load
-
-        # Stats and controls (same as before)
+        # Stats and controls
         with ui.card().classes('w-full mb-4'):
             ui.label('Discovery Status').classes('text-xl font-bold mb-4')
 
             # Stats card
             stats_card = ui.column().classes('w-full mb-4')
             with stats_card:
-                ui.label('Ready to start').classes('text-lg')
+                if is_running:
+                    ui.label(f'Workers running ({running_count}/5 active)').classes('text-lg text-green-400')
+                else:
+                    ui.label('Ready to start').classes('text-lg')
 
             # Progress bar
             progress_bar = ui.linear_progress(value=0).classes('w-full mb-4')
@@ -1645,8 +1798,8 @@ def build_google_maps_ui(container):
                 run_button = ui.button('START DISCOVERY', icon='play_arrow', color='positive')
                 stop_button = ui.button('STOP', icon='stop', color='negative')
 
-                # Set initial button states
-                if discovery_state.running:
+                # Set initial button states based on detection
+                if is_running or discovery_state.running:
                     run_button.disable()
                     stop_button.enable()
                 else:
@@ -1702,10 +1855,10 @@ def build_google_maps_ui(container):
 
             # Tab panels
             with ui.tab_panels(google_tabs, value=google_tab_all).classes('w-full'):
-                # All workers merged view - shows Worker 1 as primary
+                # All workers merged view - shows main activity log
                 with ui.tab_panel(google_tab_all):
-                    ui.label('📊 Aggregate view - showing Worker 1 log as primary').classes('text-xs text-gray-400 mb-2')
-                    log_viewer_all = LiveLogViewer('logs/google_worker_1.log', max_lines=400, auto_scroll=True)
+                    ui.label('📊 Live crawling activity from all workers').classes('text-xs text-gray-400 mb-2')
+                    log_viewer_all = LiveLogViewer('logs/google_crawl_city_first.log', max_lines=400, auto_scroll=True)
                     log_viewer_all.create()
                     log_viewer_all.load_last_n_lines(100)
                     log_viewer_all.start_tailing()
@@ -1724,39 +1877,93 @@ def build_google_maps_ui(container):
 
         # Check worker status on page load
         def check_google_workers_status():
-            """Check if Google workers are running and update badges."""
+            """Check if Google workers are running and update badges and buttons."""
             import subprocess
-            try:
-                # Check for running worker processes via PID file
-                pid_file = 'logs/google_workers.pid'
-                if os.path.exists(pid_file):
-                    with open(pid_file, 'r') as f:
-                        pids = [int(line.strip()) for line in f if line.strip()]
+            running_count = 0
 
-                    # Check if PIDs are running
-                    for worker_id, pid in enumerate(pids[:5]):
-                        try:
-                            result = subprocess.run(['ps', '-p', str(pid)], capture_output=True)
-                            if result.returncode == 0:
-                                # Worker is running
-                                if worker_id in google_worker_badges:
-                                    google_worker_badges[worker_id].set_text('RUNNING')
-                                    google_worker_badges[worker_id].props('color=positive')
-                                if worker_id in google_worker_labels:
-                                    google_worker_labels[worker_id].set_text('Processing targets...')
-                            else:
-                                # Worker stopped
-                                if worker_id in google_worker_badges:
-                                    google_worker_badges[worker_id].set_text('STOPPED')
-                                    google_worker_badges[worker_id].props('color=warning')
-                        except Exception:
-                            pass
+            try:
+                # Method 1: Check systemd service status first
+                try:
+                    result = subprocess.run(
+                        ['systemctl', 'is-active', 'google-5workers.service'],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    if result.stdout.strip() == 'active':
+                        # Service is active - count actual workers
+                        worker_result = subprocess.run(
+                            ['pgrep', '-cf', 'cli_crawl_google_city_first'],
+                            capture_output=True,
+                            text=True
+                        )
+                        if worker_result.returncode == 0:
+                            running_count = int(worker_result.stdout.strip())
+                        else:
+                            running_count = 5  # Assume 5 if service is active
+                except Exception:
+                    pass
+
+                # Method 2: Check PID file if systemd not running
+                if running_count == 0:
+                    pid_file = 'logs/google_workers.pid'
+                    if os.path.exists(pid_file):
+                        with open(pid_file, 'r') as f:
+                            pids = [int(line.strip()) for line in f if line.strip()]
+
+                        for worker_id, pid in enumerate(pids[:5]):
+                            try:
+                                result = subprocess.run(['ps', '-p', str(pid)], capture_output=True)
+                                if result.returncode == 0:
+                                    running_count += 1
+                            except Exception:
+                                pass
+
+                # Method 3: Fallback - pgrep
+                if running_count == 0:
+                    try:
+                        result = subprocess.run(
+                            ['pgrep', '-f', 'cli_crawl_google_city_first'],
+                            capture_output=True, text=True
+                        )
+                        if result.returncode == 0 and result.stdout.strip():
+                            pids = result.stdout.strip().split('\n')
+                            running_count = min(len(pids), 5)
+                    except Exception:
+                        pass
+
+                # Update badges based on running count
+                if running_count > 0:
+                    # Workers are running - disable start, enable stop
+                    run_button.disable()
+                    stop_button.enable()
+                    discovery_state.running = True
+
+                    for worker_id in range(5):
+                        if worker_id < running_count:
+                            if worker_id in google_worker_badges:
+                                google_worker_badges[worker_id].set_text('RUNNING')
+                                google_worker_badges[worker_id].props('color=positive')
+                            if worker_id in google_worker_labels:
+                                google_worker_labels[worker_id].set_text('Processing targets...')
+                        else:
+                            if worker_id in google_worker_badges:
+                                google_worker_badges[worker_id].set_text('IDLE')
+                                google_worker_badges[worker_id].props('color=grey')
+                            if worker_id in google_worker_labels:
+                                google_worker_labels[worker_id].set_text('Ready')
                 else:
-                    # No PID file, workers not running
+                    # No workers running - enable start, disable stop
+                    run_button.enable()
+                    stop_button.disable()
+                    discovery_state.running = False
+
                     for worker_id in range(5):
                         if worker_id in google_worker_badges:
                             google_worker_badges[worker_id].set_text('IDLE')
                             google_worker_badges[worker_id].props('color=grey')
+                        if worker_id in google_worker_labels:
+                            google_worker_labels[worker_id].set_text('Ready')
             except Exception as e:
                 print(f"Error checking worker status: {e}")
 
@@ -1772,19 +1979,14 @@ def build_google_maps_ui(container):
 
         # Run button click handler - City-First Discovery
         async def start_discovery():
-            # Get selected states from checkboxes
-            selected_states = [state for state, checkbox in state_checkboxes.items() if checkbox.value]
-
-            # Validate city-first inputs
-            if not selected_states:
-                ui.notify('Please select at least one state', type='warning')
+            # Check if workers are already running
+            already_running, _ = detect_running_google_workers()
+            if already_running:
+                ui.notify('Workers are already running! Stop them first.', type='warning')
                 return
 
-            # Run city-first discovery
+            # Run city-first discovery (all 50 states handled by 5-worker system)
             await run_google_maps_city_first_discovery(
-                selected_states,
-                int(max_targets_input.value) if max_targets_input.value else None,
-                scrape_details_checkbox.value,
                 stats_card,
                 progress_bar,
                 run_button,

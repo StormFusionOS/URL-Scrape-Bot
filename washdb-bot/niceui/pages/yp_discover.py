@@ -821,489 +821,289 @@ def build_yellow_pages_ui(container):
 
 def build_multiworker_yp_ui(container):
     """
-    Build the multi-worker Yellow Pages UI.
-
-    This creates a complete interface for launching and monitoring 5 workers.
+    Build the simplified multi-worker Yellow Pages UI.
+    Matches the Google Maps UI pattern with systemd service integration.
     """
+    import subprocess
+    from pathlib import Path
+
+    # YP Worker State Assignments (matches yp_continuous_5workers.py)
+    yp_worker_states = {
+        0: ['AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA'],
+        1: ['HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD'],
+        2: ['MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ'],
+        3: ['NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC'],
+        4: ['SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY']
+    }
+
+    def detect_running_yp_workers():
+        """Detect if YP workers are running."""
+        running_count = 0
+        try:
+            # Check systemd service status first
+            result = subprocess.run(
+                ['systemctl', 'is-active', 'yp-5workers.service'],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.stdout.strip() == 'active':
+                worker_result = subprocess.run(
+                    ['pgrep', '-cf', 'cli_crawl_yp'],
+                    capture_output=True, text=True
+                )
+                if worker_result.returncode == 0:
+                    running_count = int(worker_result.stdout.strip())
+                else:
+                    running_count = 5
+                return True, running_count
+        except Exception:
+            pass
+
+        # Fallback - pgrep
+        try:
+            result = subprocess.run(
+                ['pgrep', '-f', 'cli_crawl_yp'],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                pids = result.stdout.strip().split('\n')
+                running_count = min(len(pids), 5)
+                return True, running_count
+        except Exception:
+            pass
+
+        return False, 0
+
+    # Check initial state
+    is_running, running_count = detect_running_yp_workers()
 
     with container:
-        # Info banner - YP city-first specific
-        with ui.card().classes('w-full bg-purple-900 border-l-4 border-purple-500 mb-4'):
-            ui.label('🎯 Yellow Pages City-First Scraper').classes('text-lg font-bold text-purple-200')
-            ui.label('• Scrapes 31,254 US cities with population-based prioritization').classes('text-sm text-purple-100')
-            ui.label('• Shallow pagination (1-3 pages per city) with early-exit optimization').classes('text-sm text-purple-100')
-            ui.label('• 85%+ precision filtering with 10 predefined categories').classes('text-sm text-purple-100')
-            ui.label('• Step 1: Generate targets → Step 2: Run crawler').classes('text-sm text-purple-100')
+        # Show reconnection banner if workers detected
+        if is_running:
+            with ui.card().classes('w-full bg-green-900 border-l-4 border-green-500 mb-4'):
+                ui.label(f'Reconnected to running workers ({running_count}/5 active)').classes('text-lg font-bold text-green-200')
+                ui.label('Live output resumed below. You can stop the workers at any time.').classes('text-sm text-green-100')
 
-        # Configuration card
+        # Stats and controls
         with ui.card().classes('w-full mb-4'):
-            ui.label('Yellow Pages Configuration').classes('text-xl font-bold mb-4')
+            ui.label('Discovery Status').classes('text-xl font-bold mb-4')
 
-            # State selection
-            ui.label('US States').classes('font-semibold mb-2')
-            ui.label('Select states to scrape (generates targets for all cities in selected states):').classes('text-sm text-gray-400 mb-2')
+            # Stats card
+            stats_card = ui.column().classes('w-full mb-4')
+            with stats_card:
+                if is_running:
+                    ui.label(f'Workers running ({running_count}/5 active)').classes('text-lg text-green-400')
+                else:
+                    ui.label('Ready to start').classes('text-lg')
 
-            state_checkboxes = {}
-            with ui.grid(columns=10).classes('w-full gap-1 mb-4'):
-                for state in ALL_STATES:
-                    # Rhode Island selected by default for testing
-                    state_checkboxes[state] = ui.checkbox(state, value=(state == 'RI')).classes('text-xs')
+            # Progress bar
+            progress_bar = ui.linear_progress(value=0).classes('w-full mb-4')
 
-            # Quick select buttons
-            with ui.row().classes('gap-2 mb-4'):
-                def select_all_states():
-                    for cb in state_checkboxes.values():
-                        cb.value = True
+            # Control buttons
+            with ui.row().classes('gap-2'):
+                run_button = ui.button('START DISCOVERY', icon='play_arrow', color='positive')
+                stop_button = ui.button('STOP', icon='stop', color='negative')
 
-                def deselect_all_states():
-                    for cb in state_checkboxes.values():
-                        cb.value = False
-
-                ui.button('Select All', icon='check_box', on_click=select_all_states).props('flat dense')
-                ui.button('Deselect All', icon='check_box_outline_blank', on_click=deselect_all_states).props('flat dense')
-
-            ui.separator()
-
-            # Target generation section
-            ui.label('Step 1: Generate Targets').classes('font-semibold mb-2 mt-4')
-            ui.label('Generate scraping targets (city × category combinations) before running the crawler').classes('text-sm text-gray-400 mb-2')
-
-            # Target stats display (dynamic)
-            target_stats_container = ui.column().classes('w-full mb-3')
-
-            with ui.row().classes('gap-2 mb-4 items-center'):
-                generate_button = ui.button(
-                    'GENERATE TARGETS',
-                    icon='add_circle',
-                    color='secondary'
-                ).props('size=md')
-
-                refresh_stats_button = ui.button(
-                    'Refresh Stats',
-                    icon='refresh',
-                    on_click=lambda: None  # Will be set below
-                ).props('flat dense')
-
-            ui.separator()
-
-            # Worker count selector
-            ui.label('Step 2: Worker Configuration').classes('font-semibold mb-2 mt-4')
-            with ui.row().classes('items-center gap-4 mb-4'):
-                ui.label('Number of Workers:').classes('font-semibold')
-                worker_count_slider = ui.slider(min=1, max=5, value=5, step=1).props('label-always').classes('w-64')
-                worker_count_label = ui.label('5 workers').classes('text-sm text-gray-400')
-
-                def update_worker_count(e):
-                    count = int(e.value)
-                    worker_count_label.set_text(f'{count} worker{"s" if count != 1 else ""}')
-
-                worker_count_slider.on('update:model-value', update_worker_count)
-
-            ui.separator().classes('my-4')
-
-            # Crawler Settings
-            ui.label('Crawler Settings').classes('font-semibold mb-2 mt-4')
-
-            # Max targets
-            max_targets_input = ui.number(
-                label='Max Targets (leave empty for all)',
-                value=None,
-                min=1,
-                max=100000,
-                step=10
-            ).classes('w-64 mb-2')
-            ui.label('Limit number of targets to process (useful for testing)').classes('text-xs text-gray-400 mb-3')
-
-            # Minimum score slider
-            min_score_slider = ui.slider(
-                min=0,
-                max=100,
-                value=50,
-                step=5
-            ).classes('w-full mb-1').props('label-always')
-            ui.label('Minimum Confidence Score (lower = more results, higher = better precision)').classes('text-xs text-gray-400 mb-2')
-
-            # Include sponsored checkbox
-            include_sponsored_checkbox = ui.checkbox(
-                'Include Sponsored/Ad Listings',
-                value=False
-            ).classes('mb-1')
-            ui.label('Check to include paid ads (usually excluded for quality)').classes('text-xs text-gray-400')
-
-            ui.separator().classes('my-4')
-
-            # Monitoring & Anti-Detection Settings
-            ui.label('Anti-Detection & Monitoring').classes('font-semibold mb-2 mt-2')
-            ui.label('Enhanced monitoring and stealth features (recommended for production)').classes('text-xs text-gray-400 mb-2')
-
-            with ui.column().classes('gap-2'):
-                enable_monitoring_checkbox = ui.checkbox(
-                    '✓ Enable Monitoring & Health Checks',
-                    value=True
-                ).classes('text-sm')
-                ui.label('Real-time metrics, CAPTCHA detection, health monitoring').classes('text-xs text-gray-400 ml-6 -mt-2')
-
-                enable_adaptive_rate_limiting_checkbox = ui.checkbox(
-                    '✓ Enable Adaptive Rate Limiting',
-                    value=True
-                ).classes('text-sm')
-                ui.label('Automatically slows down on errors, speeds up on success').classes('text-xs text-gray-400 ml-6 -mt-2')
-
-                enable_session_breaks_checkbox = ui.checkbox(
-                    '✓ Enable Session Breaks',
-                    value=True
-                ).classes('text-sm')
-                ui.label('Takes 30-90s breaks every 50 requests for human-like behavior').classes('text-xs text-gray-400 ml-6 -mt-2')
-
-            ui.separator().classes('my-4')
-
-            # Quick stats
-            with ui.row().classes('gap-4'):
-                with ui.card().classes('p-3 bg-gray-800'):
-                    ui.label('States per Worker').classes('text-xs text-gray-400')
-                    ui.label('10-11').classes('text-2xl font-bold text-purple-400')
-
-                with ui.card().classes('p-3 bg-gray-800'):
-                    ui.label('Total Proxies').classes('text-xs text-gray-400')
-                    ui.label('50').classes('text-2xl font-bold text-blue-400')
-
-                with ui.card().classes('p-3 bg-gray-800'):
-                    ui.label('Expected Speed').classes('text-xs text-gray-400')
-                    ui.label('YP Targets').classes('text-2xl font-bold text-green-400')
+                # Set initial button states
+                if is_running:
+                    run_button.disable()
+                    stop_button.enable()
+                else:
+                    run_button.enable()
+                    stop_button.disable()
 
         # Worker Status Grid
         with ui.card().classes('w-full mb-4'):
-            ui.label('Worker Status').classes('text-xl font-bold mb-4')
+            ui.label('5-Worker System Status').classes('text-xl font-bold mb-4')
 
             with ui.grid(columns=5).classes('w-full gap-3'):
-                for worker_id in range(5):
-                    worker = multi_worker_state.workers[worker_id]
+                yp_worker_badges = {}
+                yp_worker_labels = {}
 
-                    with ui.card().classes('p-3 hover:shadow-lg transition-shadow'):
+                for worker_id in range(5):
+                    states = yp_worker_states[worker_id]
+
+                    with ui.card().classes('p-3 hover:shadow-lg transition-shadow bg-gray-800'):
                         # Header
                         with ui.row().classes('items-center justify-between w-full mb-2'):
-                            ui.label(f'Worker {worker_id}').classes('font-bold text-sm')
-                            worker.status_badge = ui.badge('IDLE', color='grey').classes('text-xs')
+                            ui.label(f'Worker {worker_id + 1}').classes('font-bold text-sm text-purple-200')
+                            yp_worker_badges[worker_id] = ui.badge('CHECKING', color='grey').classes('text-xs')
 
                         # Assigned states
-                        ui.label(worker.get_display_states()).classes('text-xs text-gray-400 mb-2')
+                        ui.label(f"{', '.join(states[:3])}...").classes('text-xs text-gray-400 mb-2')
 
-                        # Stats
-                        worker.target_label = ui.label('-').classes('text-xs truncate w-full')
-                        worker.found_label = ui.label('Processed: 0').classes('text-xs text-gray-300 mt-1')
+                        # Stats placeholder
+                        yp_worker_labels[worker_id] = ui.label('Ready').classes('text-xs text-gray-300')
 
-                        # Progress bar
-                        worker.progress_bar = ui.linear_progress(value=0).classes('w-full mt-2')
-
-        # Aggregate Status Card
-        with ui.card().classes('w-full mb-4'):
-            ui.label('Aggregate Status').classes('text-xl font-bold mb-4')
-
-            # Stats row
-            with ui.row().classes('gap-6 mb-4'):
-                with ui.column():
-                    ui.label('Active Workers').classes('text-sm text-gray-400')
-                    active_workers_label = ui.label('0/5').classes('text-2xl font-bold')
-
-                with ui.column():
-                    ui.label('Targets Processed').classes('text-sm text-gray-400')
-                    total_processed_label = ui.label('0').classes('text-2xl font-bold')
-
-                with ui.column():
-                    ui.label('Items Found').classes('text-sm text-gray-400')
-                    total_found_label = ui.label('0').classes('text-2xl font-bold')
-
-            # Overall progress
-            aggregate_progress = ui.linear_progress(value=0).classes('w-full mb-4')
-
-            # Control buttons
-            with ui.row().classes('gap-3'):
-                start_button = ui.button('START ALL WORKERS', icon='play_arrow', color='positive').classes('px-6')
-                stop_button = ui.button('STOP ALL', icon='stop', color='negative').classes('px-6')
-                stop_button.disable()
-
-        # Log Viewer with Tabs
+        # Live output with tabbed multi-worker log viewers
         with ui.card().classes('w-full'):
-            ui.label('Live Output').classes('text-xl font-bold mb-2')
+            ui.label('Live Worker Output').classes('text-xl font-bold mb-2')
 
             # Tab selector for workers
-            with ui.tabs().classes('w-full') as tabs:
-                tab_all = ui.tab('All Workers')
-                worker_tabs = []
+            with ui.tabs().classes('w-full') as yp_tabs:
+                yp_tab_all = ui.tab('All Workers')
+                yp_worker_tabs = []
                 for i in range(5):
-                    worker_tabs.append(ui.tab(f'Worker {i}'))
+                    yp_worker_tabs.append(ui.tab(f'Worker {i + 1}'))
 
             # Tab panels
-            with ui.tab_panels(tabs, value=tab_all).classes('w-full'):
-                # All workers merged view
-                with ui.tab_panel(tab_all):
-                    log_viewer_all = LiveLogViewer('logs/state_worker_pool.log', max_lines=300, auto_scroll=True)
+            with ui.tab_panels(yp_tabs, value=yp_tab_all).classes('w-full'):
+                # All workers merged view - shows main orchestrator log
+                with ui.tab_panel(yp_tab_all):
+                    ui.label('📊 Live crawling activity from orchestrator').classes('text-xs text-gray-400 mb-2')
+                    log_viewer_all = LiveLogViewer('logs/YPContinuous5Workers.log', max_lines=400, auto_scroll=True)
                     log_viewer_all.create()
+                    log_viewer_all.load_last_n_lines(100)
+                    log_viewer_all.start_tailing()
 
                 # Individual worker logs
-                worker_log_viewers = []
+                yp_log_viewers = []
                 for i in range(5):
-                    with ui.tab_panel(worker_tabs[i]):
-                        log_viewer = LiveLogViewer(f'logs/state_worker_{i}.log', max_lines=200, auto_scroll=True)
+                    with ui.tab_panel(yp_worker_tabs[i]):
+                        states = yp_worker_states[i]
+                        ui.label(f"🌎 States: {', '.join(states)}").classes('text-xs text-gray-400 mb-2')
+                        log_viewer = LiveLogViewer(f'logs/yp_worker_{i + 1}.log', max_lines=300, auto_scroll=True)
                         log_viewer.create()
-                        worker_log_viewers.append(log_viewer)
+                        log_viewer.load_last_n_lines(100)
+                        log_viewer.start_tailing()
+                        yp_log_viewers.append(log_viewer)
 
-        # ====================================================================
-        # TARGET GENERATION HANDLERS
-        # ====================================================================
+        # Check worker status and update UI
+        def check_yp_workers_status():
+            """Check if YP workers are running and update badges and buttons."""
+            running_count = 0
 
-        # Helper function to update target stats display
-        async def update_target_stats():
-            selected_states = [state for state, cb in state_checkboxes.items() if cb.value]
-            if not selected_states:
-                target_stats_container.clear()
-                with target_stats_container:
-                    ui.label('No states selected').classes('text-gray-400 italic')
-                return
-
-            stats = await get_yp_target_stats(selected_states)
-
-            target_stats_container.clear()
-            if stats and stats['total'] > 0:
-                with target_stats_container:
-                    with ui.card().classes('w-full bg-slate-800 p-3'):
-                        ui.label('Target Statistics').classes('text-sm font-bold mb-2')
-                        with ui.grid(columns=5).classes('gap-2'):
-                            ui.label(f'Total: {stats["total"]}').classes('text-xs')
-                            ui.label(f'Planned: {stats["planned"]}').classes('text-xs text-blue-400')
-                            ui.label(f'In Progress: {stats["in_progress"]}').classes('text-xs text-yellow-400')
-                            ui.label(f'Done: {stats["done"]}').classes('text-xs text-green-400')
-                            ui.label(f'Failed: {stats["failed"]}').classes('text-xs text-red-400')
-            else:
-                with target_stats_container:
-                    ui.label('No targets generated yet for selected states').classes('text-yellow-400 italic text-sm')
-
-        # Generate targets button handler
-        async def handle_generate_targets():
-            selected_states = [state for state, cb in state_checkboxes.items() if cb.value]
-
-            if not selected_states:
-                ui.notify('Please select at least one state', type='warning')
-                return
-
-            # Confirm with user
-            with ui.dialog() as dialog, ui.card():
-                ui.label('Generate Targets?').classes('text-lg font-bold mb-2')
-                ui.label(f'This will generate targets for {len(selected_states)} state(s):').classes('text-sm mb-1')
-                ui.label(f'{", ".join(selected_states)}').classes('text-sm text-blue-400 mb-3')
-                ui.label('Existing targets for these states will be cleared.').classes('text-xs text-yellow-400 mb-3')
-
-                with ui.row().classes('gap-2'):
-                    ui.button('Cancel', on_click=dialog.close).props('flat')
-                    async def confirm_generate():
-                        dialog.close()
-
-                        # Launch target generation in detached background process
-                        success, message = generate_yp_targets_detached(selected_states, clear_existing=True)
-
-                        if success:
-                            # Calculate estimated time
-                            estimated_minutes = max(2, int(10 * len(selected_states) / 50))
-                            ui.notify(
-                                f'Target generation started for {len(selected_states)} state(s)! '
-                                f'Check logs/generate_targets.log for progress. Refresh in ~{estimated_minutes} minutes.',
-                                type='positive',
-                                timeout=10000
-                            )
+            try:
+                # Check systemd service status first
+                try:
+                    result = subprocess.run(
+                        ['systemctl', 'is-active', 'yp-5workers.service'],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if result.stdout.strip() == 'active':
+                        worker_result = subprocess.run(
+                            ['pgrep', '-cf', 'cli_crawl_yp'],
+                            capture_output=True, text=True
+                        )
+                        if worker_result.returncode == 0:
+                            running_count = int(worker_result.stdout.strip())
                         else:
-                            ui.notify(
-                                f'Failed to start target generation: {message}',
-                                type='negative',
-                                timeout=5000
-                            )
+                            running_count = 5
+                except Exception:
+                    pass
 
-                    ui.button('Generate', on_click=confirm_generate, color='positive')
+                # Fallback - pgrep
+                if running_count == 0:
+                    try:
+                        result = subprocess.run(
+                            ['pgrep', '-f', 'cli_crawl_yp'],
+                            capture_output=True, text=True
+                        )
+                        if result.returncode == 0 and result.stdout.strip():
+                            pids = result.stdout.strip().split('\n')
+                            running_count = min(len(pids), 5)
+                    except Exception:
+                        pass
 
-            dialog.open()
-
-        generate_button.on('click', handle_generate_targets)
-        refresh_stats_button.on('click', update_target_stats)
-
-        # Initialize stats display
-        asyncio.create_task(update_target_stats())
-
-        # ====================================================================
-        # EVENT HANDLERS
-        # ====================================================================
-
-        def start_all_workers():
-            """Start all workers using the state worker pool manager."""
-            try:
-                start_button.disable()
-                ui.notify('Starting worker pool...', type='info')
-
-                # Build command to launch state worker pool
-                cmd = [
-                    sys.executable,
-                    'scripts/run_state_workers_5.py',
-                    '--workers', str(int(worker_count_slider.value)),
-                    '--yes'  # Skip interactive confirmation prompt
-                ]
-
-                # Create subprocess runner
-                job_id = f'multiworker_yp_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
-                runner = SubprocessRunner(job_id, 'logs/state_worker_pool.log')
-
-                # Start the process
-                pid = runner.start(cmd, cwd=os.getcwd())
-
-                multi_worker_state.manager_subprocess = runner
-                multi_worker_state.running = True
-
-                # Update UI
-                for worker in multi_worker_state.workers.values():
-                    worker.status = 'running'
-                    if worker.status_badge:
-                        worker.status_badge.text = 'RUNNING'
-                        worker.status_badge.props(f'color={worker.get_status_color()}')
-
-                stop_button.enable()
-
-                # Start monitoring
-                log_viewer_all.start_tailing()
-                for log_viewer in worker_log_viewers:
-                    log_viewer.start_tailing()
-
-                ui.notify(f'Worker pool started! (PID: {pid})', type='positive')
-
-                # Start update timer
-                def update_worker_stats():
-                    """Update worker statistics from log files."""
-                    if not multi_worker_state.running:
-                        return
-
-                    # Update active count
-                    active_count = multi_worker_state.get_active_count()
-                    active_workers_label.set_text(f'{active_count}/{multi_worker_state.num_workers}')
-
-                    # Update totals (parse from logs in real implementation)
-                    total_processed = multi_worker_state.get_total_processed()
-                    total_found = multi_worker_state.get_total_found()
-
-                    total_processed_label.set_text(str(total_processed))
-                    total_found_label.set_text(str(total_found))
-
-                    # Update progress (example: assume 10000 total targets)
-                    if total_processed > 0:
-                        progress = min(total_processed / 10000, 1.0)
-                        aggregate_progress.value = progress
-
-                ui.timer(2.0, update_worker_stats)
-
-            except Exception as e:
-                ui.notify(f'Error starting workers: {e}', type='negative')
-                start_button.enable()
-
-        def stop_all_workers():
-            """Stop all workers."""
-            try:
-                ui.notify('Stopping all workers...', type='warning')
-
-                multi_worker_state.stop_all()
-
-                # Update UI
-                for worker in multi_worker_state.workers.values():
-                    if worker.status_badge:
-                        worker.status_badge.text = 'STOPPED'
-                        worker.status_badge.props('color=warning')
-
-                start_button.enable()
-                stop_button.disable()
-
-                log_viewer_all.stop_tailing()
-                for log_viewer in worker_log_viewers:
-                    log_viewer.stop_tailing()
-
-                ui.notify('All workers stopped', type='info')
-
-            except Exception as e:
-                ui.notify(f'Error stopping workers: {e}', type='negative')
-
-        # Bind button handlers
-        start_button.on('click', start_all_workers)
-        stop_button.on('click', stop_all_workers)
-
-        # ====================================================================
-        # CHECK IF WORKERS ARE ALREADY RUNNING (on page load)
-        # ====================================================================
-        def check_workers_running():
-            """Check if workers are already running and update UI accordingly."""
-            import subprocess
-            try:
-                # Check for running state_worker processes
-                result = subprocess.run(
-                    ['ps', 'aux'],
-                    capture_output=True,
-                    text=True
-                )
-
-                # Count running worker processes
-                running_count = 0
-                for line in result.stdout.split('\n'):
-                    if 'run_state_workers_5.py' in line and 'grep' not in line:
-                        running_count += 1
-
-                # If workers are running, update UI
+                # Update badges based on running count
                 if running_count > 0:
-                    multi_worker_state.running = True
-
-                    # Update worker statuses
-                    for worker in multi_worker_state.workers.values():
-                        worker.status = 'running'
-                        if worker.status_badge:
-                            worker.status_badge.text = 'RUNNING'
-                            worker.status_badge.props(f'color={worker.get_status_color()}')
-
-                    # Update buttons
-                    start_button.disable()
+                    run_button.disable()
                     stop_button.enable()
 
-                    # Start log tailing
-                    log_viewer_all.start_tailing()
-                    for log_viewer in worker_log_viewers:
-                        log_viewer.start_tailing()
+                    for worker_id in range(5):
+                        if worker_id < running_count:
+                            if worker_id in yp_worker_badges:
+                                yp_worker_badges[worker_id].set_text('RUNNING')
+                                yp_worker_badges[worker_id].props('color=positive')
+                            if worker_id in yp_worker_labels:
+                                yp_worker_labels[worker_id].set_text('Processing targets...')
+                        else:
+                            if worker_id in yp_worker_badges:
+                                yp_worker_badges[worker_id].set_text('IDLE')
+                                yp_worker_badges[worker_id].props('color=grey')
+                            if worker_id in yp_worker_labels:
+                                yp_worker_labels[worker_id].set_text('Ready')
+                else:
+                    run_button.enable()
+                    stop_button.disable()
 
-                    # Update stats
-                    active_count = multi_worker_state.get_active_count()
-                    active_workers_label.set_text(f'{active_count}/{multi_worker_state.num_workers}')
-
-                    ui.notify(f'Detected {running_count} running worker processes', type='info')
-
-                    # Start update timer
-                    def update_worker_stats():
-                        """Update worker statistics from log files."""
-                        if not multi_worker_state.running:
-                            return
-
-                        # Update active count
-                        active_count = multi_worker_state.get_active_count()
-                        active_workers_label.set_text(f'{active_count}/{multi_worker_state.num_workers}')
-
-                        # Update totals
-                        total_processed = multi_worker_state.get_total_processed()
-                        total_found = multi_worker_state.get_total_found()
-
-                        total_processed_label.set_text(str(total_processed))
-                        total_found_label.set_text(str(total_found))
-
-                        # Update progress
-                        if total_processed > 0:
-                            progress = min(total_processed / 10000, 1.0)
-                            aggregate_progress.value = progress
-
-                    ui.timer(2.0, update_worker_stats)
-
+                    for worker_id in range(5):
+                        if worker_id in yp_worker_badges:
+                            yp_worker_badges[worker_id].set_text('IDLE')
+                            yp_worker_badges[worker_id].props('color=grey')
+                        if worker_id in yp_worker_labels:
+                            yp_worker_labels[worker_id].set_text('Ready')
             except Exception as e:
-                # Silently fail - workers just aren't running
-                pass
+                print(f"Error checking YP worker status: {e}")
 
-        # Check on page load
-        check_workers_running()
+        # Initial status check
+        check_yp_workers_status()
+
+        # Periodic status updates
+        ui.timer(5.0, check_yp_workers_status)
+
+        # Start button handler
+        async def start_yp_discovery():
+            """Start YP 5-worker system directly (no sudo required)."""
+            # Check if already running
+            is_running, _ = detect_running_yp_workers()
+            if is_running:
+                ui.notify('Workers are already running! Stop them first.', type='warning')
+                return
+
+            try:
+                # Start the 5-worker script directly as a background process
+                import sys
+                cmd = [
+                    sys.executable,
+                    'scripts/yp_continuous_5workers.py'
+                ]
+
+                # Launch as detached background process
+                process = subprocess.Popen(
+                    cmd,
+                    cwd='/home/rivercityscrape/URL-Scrape-Bot/washdb-bot',
+                    stdout=open('logs/YPContinuous5Workers.log', 'a'),
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True  # Detach from parent
+                )
+
+                ui.notify(f'YP 5-worker system started! (PID: {process.pid})', type='positive')
+                run_button.disable()
+                stop_button.enable()
+                await asyncio.sleep(3)
+                check_yp_workers_status()
+            except Exception as e:
+                ui.notify(f'Error starting workers: {e}', type='negative')
+
+        # Stop button handler
+        async def stop_yp_discovery():
+            """Stop ALL running YP discovery immediately (no sudo required)."""
+            ui.notify('Stopping all YP workers...', type='warning')
+
+            # Kill all YP processes (pkill works without sudo for same-user processes)
+            patterns = ['cli_crawl_yp', 'yp_continuous_5workers', 'yp_continuous.py']
+            for pattern in patterns:
+                try:
+                    subprocess.run(['pkill', '-9', '-f', pattern], capture_output=True)
+                except Exception:
+                    pass
+
+            # Clear PID and status files
+            for f in ['logs/yp_workers.pid', 'logs/yp_workers_status.json']:
+                try:
+                    Path(f).unlink()
+                except Exception:
+                    pass
+
+            ui.notify('All YP workers stopped', type='info')
+            run_button.enable()
+            stop_button.disable()
+            await asyncio.sleep(1)
+            check_yp_workers_status()
+
+        # Bind button handlers
+        run_button.on('click', start_yp_discovery)
+        stop_button.on('click', stop_yp_discovery)
 
 
 def yp_discover_page():

@@ -1,11 +1,14 @@
-"""Testing Page - Automated Pytest Test Suite Runner.
+"""Testing Page - Automated Pytest Test Suite Runner and Manual URL Discovery.
 
 This page provides a GUI interface for running and monitoring the automated
 pytest test suite with real-time results, live log streaming, and interactive controls.
+Also includes manual URL discovery tools for single-pass scraping.
 """
 
 from nicegui import ui
 import asyncio
+import sys
+import os
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -21,6 +24,18 @@ from ..utils.test_parser import (
     get_status_icon,
     format_duration
 )
+from ..utils.subprocess_runner import SubprocessRunner
+from ..utils.process_manager import process_manager
+
+
+# US States for manual discovery
+ALL_STATES = [
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+]
 
 
 class TestingPageState:
@@ -95,6 +110,257 @@ class TestingPageState:
 
 # Module-level state instance
 state = TestingPageState()
+
+
+# Manual URL Discovery State Management
+class ManualDiscoveryState:
+    """State management for Manual URL Discovery."""
+
+    def __init__(self):
+        self.running = False
+        self.current_source = None  # 'yp' or 'google'
+        self.subprocess_runner: Optional[SubprocessRunner] = None
+        self.log_viewer: Optional[ui.log] = None
+        self.status_badge: Optional[ui.badge] = None
+        self.run_yp_button: Optional[ui.button] = None
+        self.run_google_button: Optional[ui.button] = None
+        self.stop_button: Optional[ui.button] = None
+        self.selected_states: List[str] = ['RI']  # Default state
+        self.max_targets: int = 10
+
+    def reset(self):
+        """Reset state for a new run."""
+        self.running = False
+        self.current_source = None
+        self.subprocess_runner = None
+
+
+# Manual discovery state instance
+discovery_state = ManualDiscoveryState()
+
+
+async def run_manual_yp_discovery():
+    """Run Yellow Pages discovery manually (single pass)."""
+    if discovery_state.running:
+        ui.notify('Discovery already running', type='warning')
+        return
+
+    try:
+        discovery_state.running = True
+        discovery_state.current_source = 'yp'
+
+        # Update UI
+        if discovery_state.status_badge:
+            discovery_state.status_badge.props('color=info')
+            discovery_state.status_badge.set_text('RUNNING')
+        if discovery_state.run_yp_button:
+            discovery_state.run_yp_button.props('disable')
+        if discovery_state.run_google_button:
+            discovery_state.run_google_button.props('disable')
+        if discovery_state.stop_button:
+            discovery_state.stop_button.props(remove='disable')
+        if discovery_state.log_viewer:
+            discovery_state.log_viewer.clear()
+            discovery_state.log_viewer.push(f">>> Starting YP Manual Discovery")
+            discovery_state.log_viewer.push(f">>> States: {', '.join(discovery_state.selected_states)}")
+            discovery_state.log_viewer.push(f">>> Max Targets: {discovery_state.max_targets}")
+            discovery_state.log_viewer.push("")
+
+        # Register job
+        job_id = 'manual_yp_discovery'
+        process_manager.register(job_id, 'Manual YP Discovery', log_file='logs/cli_yp.log')
+
+        # Build command
+        states_str = ','.join(discovery_state.selected_states)
+        cmd = [
+            sys.executable,
+            'cli_crawl_yp.py',
+            '--states', states_str,
+            '--max-targets', str(discovery_state.max_targets),
+            '--min-score', '50.0'
+        ]
+
+        # Create subprocess runner
+        runner = SubprocessRunner(job_id, 'logs/cli_yp.log')
+        discovery_state.subprocess_runner = runner
+
+        # Start subprocess
+        pid = runner.start(cmd, cwd=os.getcwd())
+        if discovery_state.log_viewer:
+            discovery_state.log_viewer.push(f">>> Process started (PID: {pid})")
+            discovery_state.log_viewer.push("")
+
+        # Update process manager with actual PID
+        process_manager.update_pid(job_id, pid)
+
+        # Stream output
+        await stream_manual_discovery_output(runner)
+
+    except Exception as e:
+        if discovery_state.log_viewer:
+            discovery_state.log_viewer.push(f"ERROR: {e}")
+        if discovery_state.status_badge:
+            discovery_state.status_badge.props('color=negative')
+            discovery_state.status_badge.set_text('ERROR')
+    finally:
+        finalize_manual_discovery()
+
+
+async def run_manual_google_discovery():
+    """Run Google Maps discovery manually (single pass)."""
+    if discovery_state.running:
+        ui.notify('Discovery already running', type='warning')
+        return
+
+    try:
+        discovery_state.running = True
+        discovery_state.current_source = 'google'
+
+        # Update UI
+        if discovery_state.status_badge:
+            discovery_state.status_badge.props('color=info')
+            discovery_state.status_badge.set_text('RUNNING')
+        if discovery_state.run_yp_button:
+            discovery_state.run_yp_button.props('disable')
+        if discovery_state.run_google_button:
+            discovery_state.run_google_button.props('disable')
+        if discovery_state.stop_button:
+            discovery_state.stop_button.props(remove='disable')
+        if discovery_state.log_viewer:
+            discovery_state.log_viewer.clear()
+            discovery_state.log_viewer.push(f">>> Starting Google Manual Discovery")
+            discovery_state.log_viewer.push(f">>> States: {', '.join(discovery_state.selected_states)}")
+            discovery_state.log_viewer.push(f">>> Max Targets: {discovery_state.max_targets}")
+            discovery_state.log_viewer.push("")
+
+        # Register job
+        job_id = 'manual_google_discovery'
+        process_manager.register(job_id, 'Manual Google Discovery', log_file='logs/google_crawl_city_first.log')
+
+        # Build command
+        cmd = [
+            sys.executable,
+            'cli_crawl_google_city_first.py',
+            '--states'
+        ] + discovery_state.selected_states + [
+            '--max-targets', str(discovery_state.max_targets),
+            '--save'
+        ]
+
+        # Create subprocess runner
+        runner = SubprocessRunner(job_id, 'logs/google_crawl_city_first.log')
+        discovery_state.subprocess_runner = runner
+
+        # Start subprocess
+        pid = runner.start(cmd, cwd=os.getcwd())
+        if discovery_state.log_viewer:
+            discovery_state.log_viewer.push(f">>> Process started (PID: {pid})")
+            discovery_state.log_viewer.push("")
+
+        # Update process manager with actual PID
+        process_manager.update_pid(job_id, pid)
+
+        # Stream output
+        await stream_manual_discovery_output(runner)
+
+    except Exception as e:
+        if discovery_state.log_viewer:
+            discovery_state.log_viewer.push(f"ERROR: {e}")
+        if discovery_state.status_badge:
+            discovery_state.status_badge.props('color=negative')
+            discovery_state.status_badge.set_text('ERROR')
+    finally:
+        finalize_manual_discovery()
+
+
+async def stream_manual_discovery_output(runner: SubprocessRunner):
+    """Stream output from the manual discovery subprocess."""
+    while runner.is_running():
+        await asyncio.sleep(1.0)
+
+        # Read new output from log file
+        try:
+            log_file = runner.log_file
+            if os.path.exists(log_file):
+                with open(log_file, 'r') as f:
+                    content = f.read()
+                    # Show last 50 lines
+                    lines = content.strip().split('\n')[-50:]
+                    if discovery_state.log_viewer and lines:
+                        # Only push new lines
+                        for line in lines[-5:]:  # Show last 5 lines each iteration
+                            if line.strip():
+                                discovery_state.log_viewer.push(line)
+        except Exception:
+            pass
+
+    # Get final status
+    status = runner.get_status()
+    return_code = status.get('return_code')
+
+    if discovery_state.log_viewer:
+        discovery_state.log_viewer.push("")
+        if return_code == 0:
+            discovery_state.log_viewer.push(">>> Discovery completed successfully!")
+        elif return_code == -9:
+            discovery_state.log_viewer.push(">>> Discovery was stopped by user")
+        else:
+            discovery_state.log_viewer.push(f">>> Discovery exited with code {return_code}")
+
+
+def finalize_manual_discovery():
+    """Finalize manual discovery run and reset UI."""
+    discovery_state.running = False
+
+    # Update status badge
+    if discovery_state.status_badge:
+        if discovery_state.subprocess_runner:
+            status = discovery_state.subprocess_runner.get_status()
+            return_code = status.get('return_code')
+            if return_code == 0:
+                discovery_state.status_badge.props('color=positive')
+                discovery_state.status_badge.set_text('COMPLETED')
+            elif return_code == -9:
+                discovery_state.status_badge.props('color=warning')
+                discovery_state.status_badge.set_text('STOPPED')
+            else:
+                discovery_state.status_badge.props('color=negative')
+                discovery_state.status_badge.set_text('FAILED')
+        else:
+            discovery_state.status_badge.props('color=grey')
+            discovery_state.status_badge.set_text('READY')
+
+    # Re-enable buttons
+    if discovery_state.run_yp_button:
+        discovery_state.run_yp_button.props(remove='disable')
+    if discovery_state.run_google_button:
+        discovery_state.run_google_button.props(remove='disable')
+    if discovery_state.stop_button:
+        discovery_state.stop_button.props('disable')
+
+    # Mark job as completed
+    job_id = f'manual_{discovery_state.current_source}_discovery'
+    process_manager.mark_completed(job_id, success=True)
+
+    discovery_state.reset()
+
+
+def stop_manual_discovery():
+    """Stop the currently running manual discovery."""
+    if not discovery_state.running or not discovery_state.subprocess_runner:
+        ui.notify('No discovery running', type='warning')
+        return
+
+    ui.notify('Stopping discovery...', type='info')
+
+    try:
+        discovery_state.subprocess_runner.kill()
+        if discovery_state.log_viewer:
+            discovery_state.log_viewer.push("")
+            discovery_state.log_viewer.push(">>> Discovery stopped by user")
+        ui.notify('Discovery stopped', type='warning')
+    except Exception as e:
+        ui.notify(f'Error stopping: {e}', type='negative')
 
 
 async def run_test_suite(suite_name: str):
@@ -531,6 +797,7 @@ def testing_page():
         tab_safety = ui.tab('Safety (37 tests)', icon='security')
         tab_acceptance = ui.tab('Acceptance', icon='integration_instructions')
         tab_all = ui.tab('Run All Tests', icon='play_circle_filled')
+        tab_discovery = ui.tab('Manual URL Discovery', icon='search')
 
     # Tab Panels
     with ui.tab_panels(tabs, value=tab_env).classes('w-full'):
@@ -577,6 +844,77 @@ def testing_page():
 
             # Update active suite when tab is clicked
             tab_all.on('click', lambda: setattr(state, 'active_tab_suite', 'all'))
+
+        # Manual URL Discovery Tab
+        with ui.tab_panel(tab_discovery):
+            with ui.card().classes('w-full mb-4'):
+                ui.label('Manual URL Discovery').classes('text-xl font-bold')
+                ui.label('Run single-pass URL discovery with custom state selection').classes('text-sm text-gray-400 mb-4')
+
+                # Status and controls row
+                with ui.row().classes('w-full items-center gap-4 mb-4'):
+                    ui.label('Status:').classes('text-sm')
+                    discovery_state.status_badge = ui.badge('READY', color='grey').classes('text-lg px-4')
+
+                ui.separator().classes('my-2')
+
+                # Configuration section
+                with ui.row().classes('w-full gap-4 items-end'):
+                    # State selection
+                    state_select = ui.select(
+                        options=ALL_STATES,
+                        value=['RI'],
+                        label='Select States',
+                        multiple=True
+                    ).classes('w-64')
+
+                    def update_states(e):
+                        discovery_state.selected_states = e.value if e.value else ['RI']
+
+                    state_select.on('update:model-value', update_states)
+
+                    # Max targets
+                    max_targets_input = ui.number(
+                        label='Max Targets',
+                        value=10,
+                        min=1,
+                        max=1000
+                    ).classes('w-32')
+
+                    def update_max_targets(e):
+                        discovery_state.max_targets = int(e.value) if e.value else 10
+
+                    max_targets_input.on('update:model-value', update_max_targets)
+
+                ui.separator().classes('my-4')
+
+                # Run buttons
+                with ui.row().classes('gap-2'):
+                    discovery_state.run_yp_button = ui.button(
+                        'Run YP Discovery',
+                        icon='search',
+                        color='primary',
+                        on_click=lambda: asyncio.create_task(run_manual_yp_discovery())
+                    ).props('outline')
+
+                    discovery_state.run_google_button = ui.button(
+                        'Run Google Discovery',
+                        icon='public',
+                        color='secondary',
+                        on_click=lambda: asyncio.create_task(run_manual_google_discovery())
+                    ).props('outline')
+
+                    discovery_state.stop_button = ui.button(
+                        'Stop',
+                        icon='stop',
+                        color='negative',
+                        on_click=stop_manual_discovery
+                    ).props('outline disable')
+
+            # Discovery Output Log
+            with ui.card().classes('w-full'):
+                ui.label('Discovery Output').classes('text-lg font-bold mb-2')
+                discovery_state.log_viewer = ui.log(max_lines=500).classes('w-full h-64 bg-gray-900 text-sm font-mono')
 
     # Initialize run button with single handler that uses active_tab_suite
     state.run_button.on('click', lambda: asyncio.create_task(run_test_suite(state.active_tab_suite)))

@@ -1,0 +1,35 @@
+[Unit]
+Description=Washbot YP Scraper Service (24/7)
+Documentation=https://github.com/rivercityscrape/washdb-bot
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=rivercityscrape
+Group=rivercityscrape
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/.env
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python scripts/yp_continuous.py
+
+# Restart configuration
+Restart=always
+RestartSec=30
+
+# Logging
+StandardOutput=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/yp_service.log
+StandardError=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/yp_service_error.log
+
+# Resource limits
+MemoryMax=4G
+CPUQuota=50%
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

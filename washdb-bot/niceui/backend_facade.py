@@ -34,6 +34,218 @@ from sqlalchemy import select, func, or_, and_
 logger = get_logger("backend_facade")
 
 
+def check_google_workers_running() -> bool:
+    """Check if Google workers are running (GUI-started or external)."""
+    import subprocess
+
+    # Method 1: Check PID file (GUI-started workers)
+    pid_file = Path(__file__).parent.parent / 'logs' / 'google_workers.pid'
+    if pid_file.exists():
+        try:
+            with open(pid_file, 'r') as f:
+                pids = [int(line.strip()) for line in f if line.strip()]
+
+            if pids:
+                # Check if any PIDs are still running
+                for pid in pids[:5]:  # Check up to 5 workers
+                    try:
+                        result = subprocess.run(['ps', '-p', str(pid)], capture_output=True)
+                        if result.returncode == 0:
+                            return True  # At least one worker is running
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # Method 2: Fallback - Use pgrep to find external workers
+    try:
+        patterns = ['google_continuous', 'cli_crawl_google']
+        for pattern in patterns:
+            result = subprocess.run(
+                ['pgrep', '-f', pattern],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+def check_yp_workers_running() -> bool:
+    """Check if YP workers are running by looking for cli_crawl_yp processes."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['pgrep', '-f', 'cli_crawl_yp'],
+            capture_output=True,
+            text=True
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
+def check_yelp_workers_running() -> bool:
+    """Check if Yelp workers are running by looking for yelp scraper processes."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['pgrep', '-f', 'scrape_yelp'],
+            capture_output=True,
+            text=True
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
+def count_google_workers() -> int:
+    """Count the number of running Google workers."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['pgrep', '-cf', 'cli_crawl_google_city_first'],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+    except Exception:
+        pass
+    return 0
+
+
+def count_yp_workers() -> int:
+    """Count the number of running YP workers."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['pgrep', '-cf', 'cli_crawl_yp'],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+    except Exception:
+        pass
+    return 0
+
+
+def count_yelp_workers() -> int:
+    """Count the number of running Yelp workers."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['pgrep', '-cf', 'scrape_yelp'],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+    except Exception:
+        pass
+    return 0
+
+
+def cleanup_orphaned_targets(session, heartbeat_timeout_minutes: int = 30) -> dict:
+    """
+    Clean up orphaned IN_PROGRESS targets that have stale heartbeats.
+
+    This function resets targets that are stuck in IN_PROGRESS status
+    when no workers are actually running. It checks:
+    1. If workers are running (via process/PID checks)
+    2. If heartbeat is older than the timeout threshold
+
+    Args:
+        session: SQLAlchemy session
+        heartbeat_timeout_minutes: Minutes after which a heartbeat is considered stale
+
+    Returns:
+        dict with cleanup counts per provider
+    """
+    from db.models import YPTarget, GoogleTarget, YelpTarget
+    from sqlalchemy import func
+
+    cleanup_counts = {'YP': 0, 'Google': 0, 'Yelp': 0}
+    cutoff_time = datetime.utcnow() - timedelta(minutes=heartbeat_timeout_minutes)
+
+    # ===== Google Targets =====
+    if not check_google_workers_running():
+        # No workers running - reset any IN_PROGRESS targets with stale/no heartbeat
+        google_orphans = session.query(GoogleTarget).filter(
+            func.upper(GoogleTarget.status) == 'IN_PROGRESS',
+            or_(
+                GoogleTarget.heartbeat_at.is_(None),
+                GoogleTarget.heartbeat_at < cutoff_time
+            )
+        ).all()
+
+        for target in google_orphans:
+            target.status = 'PLANNED'
+            target.claimed_by = None
+            target.claimed_at = None
+            target.heartbeat_at = None
+            target.note = 'Auto-recovered from orphaned IN_PROGRESS'
+
+        cleanup_counts['Google'] = len(google_orphans)
+        if google_orphans:
+            logger.info(f"Cleaned up {len(google_orphans)} orphaned Google targets")
+
+    # ===== YP Targets =====
+    if not check_yp_workers_running():
+        # No workers running - reset any IN_PROGRESS targets with stale/no heartbeat
+        yp_orphans = session.query(YPTarget).filter(
+            func.lower(YPTarget.status) == 'in_progress',
+            or_(
+                YPTarget.heartbeat_at.is_(None),
+                YPTarget.heartbeat_at < cutoff_time
+            )
+        ).all()
+
+        for target in yp_orphans:
+            target.status = 'planned'
+            target.claimed_by = None
+            target.claimed_at = None
+            target.heartbeat_at = None
+            target.note = 'Auto-recovered from orphaned IN_PROGRESS'
+
+        cleanup_counts['YP'] = len(yp_orphans)
+        if yp_orphans:
+            logger.info(f"Cleaned up {len(yp_orphans)} orphaned YP targets")
+
+    # ===== Yelp Targets =====
+    if not check_yelp_workers_running():
+        # No workers running - reset any IN_PROGRESS targets with stale/no heartbeat
+        yelp_orphans = session.query(YelpTarget).filter(
+            func.upper(YelpTarget.status) == 'IN_PROGRESS',
+            or_(
+                YelpTarget.heartbeat_at.is_(None),
+                YelpTarget.heartbeat_at < cutoff_time
+            )
+        ).all()
+
+        for target in yelp_orphans:
+            target.status = 'PLANNED'
+            target.claimed_by = None
+            target.claimed_at = None
+            target.heartbeat_at = None
+            target.note = 'Auto-recovered from orphaned IN_PROGRESS'
+
+        cleanup_counts['Yelp'] = len(yelp_orphans)
+        if yelp_orphans:
+            logger.info(f"Cleaned up {len(yelp_orphans)} orphaned Yelp targets")
+
+    # Commit changes if any orphans were cleaned up
+    total_cleaned = sum(cleanup_counts.values())
+    if total_cleaned > 0:
+        session.commit()
+        logger.info(f"Total orphaned targets cleaned: {total_cleaned}")
+
+    return cleanup_counts
+
+
 class BackendFacade:
     """Facade for interacting with scraper backend."""
 
@@ -600,6 +812,10 @@ class BackendFacade:
         statuses = {}
 
         try:
+            # ===== Clean up orphaned IN_PROGRESS targets first =====
+            # This resets targets stuck in IN_PROGRESS when no workers are running
+            cleanup_orphaned_targets(session, heartbeat_timeout_minutes=30)
+
             # ===== YP (Yellow Pages) Status =====
             yp_in_progress = session.query(func.count(YPTarget.id)).filter(
                 YPTarget.status == 'in_progress'
@@ -624,8 +840,8 @@ class BackendFacade:
             ).order_by(desc(YPTarget.finished_at)).first()
 
             statuses['YP'] = {
-                'is_running': yp_in_progress > 0,
-                'active_count': yp_in_progress,
+                'is_running': check_yp_workers_running(),  # Check actual process status, not DB
+                'active_count': count_yp_workers(),  # Count actual running workers, not DB targets
                 'pending_count': yp_planned,
                 'done_count': yp_done,
                 'failed_count': yp_failed,
@@ -660,8 +876,8 @@ class BackendFacade:
             ).order_by(desc(GoogleTarget.finished_at)).first()
 
             statuses['Google'] = {
-                'is_running': google_in_progress > 0,
-                'active_count': google_in_progress,
+                'is_running': check_google_workers_running(),  # Check actual process status, not DB
+                'active_count': count_google_workers(),  # Count actual running workers, not DB targets
                 'pending_count': google_planned,
                 'done_count': google_done,
                 'failed_count': google_failed,
@@ -697,8 +913,8 @@ class BackendFacade:
             ).order_by(desc(YelpTarget.finished_at)).first()
 
             statuses['Yelp'] = {
-                'is_running': yelp_in_progress > 0,
-                'active_count': yelp_in_progress,
+                'is_running': check_yelp_workers_running(),  # Check actual process status, not DB
+                'active_count': count_yelp_workers(),  # Count actual running workers, not DB targets
                 'pending_count': yelp_planned,
                 'done_count': yelp_done,
                 'failed_count': yelp_failed,

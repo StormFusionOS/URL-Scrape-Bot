@@ -8,6 +8,7 @@ from nicegui import ui
 from ..backend_facade import backend
 from ..widgets.kpi import create_kpi_card
 from ..theme import COLORS
+from .verification import verification_state, get_verification_stats
 
 
 def create_sparkline_chart(title: str, data: list, color: str = None):
@@ -278,26 +279,30 @@ def build_discovery_status_cards(status_container):
 
                 ui.label(f"{google_status.get('active_count', 0)} active, {google_status.get('pending_count', 0)} pending").classes('text-xs text-gray-300')
 
-            # Yelp
-            yelp_status = source_statuses.get('Yelp', {})
+            # Verification Tool
+            try:
+                verif_stats = get_verification_stats()
+            except Exception:
+                verif_stats = {'needs_review': 0, 'passed': 0, 'failed': 0}
+            verif_is_running = verification_state.worker_pool_running or verification_state.running
             with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
                 with ui.row().classes('items-center gap-2 mb-2'):
-                    if yelp_status.get('is_running', False):
+                    if verif_is_running:
                         ui.icon('fiber_manual_record', size='sm').classes('text-green-400')
-                    elif yelp_status.get('pending_count', 0) > 0:
+                    elif verif_stats.get('needs_review', 0) > 0:
                         ui.icon('fiber_manual_record', size='sm').classes('text-yellow-400')
                     else:
-                        ui.icon('fiber_manual_record', size='sm').classes('text-red-400')
-                    ui.label('Yelp').classes('text-sm text-gray-200 font-bold')
+                        ui.icon('fiber_manual_record', size='sm').classes('text-blue-400')
+                    ui.label('Verification').classes('text-sm text-gray-200 font-bold')
 
-                if yelp_status.get('is_running', False):
+                if verif_is_running:
                     ui.badge('RUNNING', color='positive').classes('mb-1')
-                elif yelp_status.get('pending_count', 0) > 0:
-                    ui.badge('READY', color='warning').classes('mb-1')
+                elif verif_stats.get('needs_review', 0) > 0:
+                    ui.badge('PENDING', color='warning').classes('mb-1')
                 else:
                     ui.badge('IDLE', color='grey').classes('mb-1')
 
-                ui.label(f"{yelp_status.get('active_count', 0)} active, {yelp_status.get('pending_count', 0)} pending").classes('text-xs text-gray-300')
+                ui.label(f"{verif_stats.get('passed', 0)} passed, {verif_stats.get('needs_review', 0)} pending").classes('text-xs text-gray-300')
 
         # Last Run & System Info Row
         with ui.row().classes('w-full gap-4'):
@@ -322,7 +327,7 @@ def build_discovery_status_cards(status_container):
                     else:
                         return "Just now"
 
-                for source_name in ['YP', 'Google', 'Yelp']:
+                for source_name in ['YP', 'Google']:
                     status = source_statuses.get(source_name, {})
                     last_run = status.get('last_run')
                     if last_run and last_run.get('timestamp'):
@@ -331,6 +336,10 @@ def build_discovery_status_cards(status_container):
                         ui.label(f"{source_name}: {time_str} ({results} found)").classes('text-xs text-white')
                     else:
                         ui.label(f"{source_name}: Never run").classes('text-xs text-gray-400')
+                # Verification status
+                verif_passed = verif_stats.get('passed', 0)
+                verif_failed = verif_stats.get('failed', 0)
+                ui.label(f"Verification: {verif_passed} passed, {verif_failed} failed").classes('text-xs text-white')
 
             # Database Status
             with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
