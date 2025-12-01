@@ -39,6 +39,11 @@ from runner.logging_setup import get_logger
 from scrape_site.site_scraper import fetch_page, discover_internal_links, scrape_website
 from scrape_site.site_parse import parse_site_content
 from scrape_site.service_verifier import create_verifier
+from verification.config_verifier import (
+    COMBINED_HIGH_THRESHOLD,
+    COMBINED_LOW_THRESHOLD,
+    RED_FLAG_AUTO_REJECT_COUNT,
+)
 
 load_dotenv()
 
@@ -249,36 +254,69 @@ def update_company_verification(
     company_id: int,
     verification_result: Dict,
     combined_score: float,
-    min_score: float = 0.75,
-    max_score: float = 0.35
+    min_score: float = None,  # Deprecated, use config
+    max_score: float = None   # Deprecated, use config
 ):
     """
-    Update company record with verification results.
+    Update company record with verification results using proper triage logic.
+
+    Three-way triage based on combined signals:
+    - passed (auto-accept): High combined score + LLM legitimate + no red flags
+    - failed (auto-reject): Low combined score OR multiple red flags + not legitimate
+    - needs_review: Ambiguous signals, disagreement, or low confidence
 
     Args:
         session: SQLAlchemy session
         company_id: Company ID
-        verification_result: Verification result dict
+        verification_result: Verification result dict from service_verifier
         combined_score: Combined score (discovery + website + reviews)
-        min_score: Minimum score for auto-accept
-        max_score: Maximum score for auto-reject
+        min_score: Deprecated - use config_verifier.COMBINED_HIGH_THRESHOLD
+        max_score: Deprecated - use config_verifier.COMBINED_LOW_THRESHOLD
     """
-    # LLM-based verification: trust is_legitimate flag
+    # === Extract decision signals ===
+    svc_status = verification_result.get('status', 'unknown')  # From service_verifier
+    svc_score = verification_result.get('score', 0.0)
     is_legitimate = verification_result.get('is_legitimate', False)
+    red_flags = verification_result.get('red_flags', []) or []
 
-    # Determine active flag based on LLM legitimacy check
-    if is_legitimate:
+    # === Three-way triage logic ===
+    needs_review = False
+
+    # HIGH: Auto-accept conditions
+    if (combined_score >= COMBINED_HIGH_THRESHOLD and
+        is_legitimate and
+        svc_status == 'passed' and
+        len(red_flags) == 0):
         active = True
-        verification_result['status'] = 'passed'
-        verification_result['needs_review'] = False
-    else:
-        active = False
-        verification_result['status'] = 'failed'
-        verification_result['needs_review'] = False
+        final_status = 'passed'
+        logger.info(f"Company {company_id} ACCEPTED: score={combined_score:.2f}, legitimate=True")
 
-    # Add combined score to result
+    # LOW: Auto-reject conditions
+    elif (combined_score <= COMBINED_LOW_THRESHOLD or
+          (not is_legitimate and len(red_flags) >= RED_FLAG_AUTO_REJECT_COUNT) or
+          (svc_status == 'failed' and len(red_flags) >= RED_FLAG_AUTO_REJECT_COUNT)):
+        active = False
+        final_status = 'failed'
+        logger.info(f"Company {company_id} REJECTED: score={combined_score:.2f}, "
+                   f"legitimate={is_legitimate}, red_flags={len(red_flags)}")
+
+    # MIDDLE: Needs manual review
+    else:
+        active = False  # Don't auto-activate uncertain companies
+        final_status = 'unknown'
+        needs_review = True
+        logger.info(f"Company {company_id} NEEDS REVIEW: score={combined_score:.2f}, "
+                   f"svc_status={svc_status}, red_flags={len(red_flags)}")
+
+    # === Update verification result with triage outcome ===
+    verification_result['status'] = final_status
+    verification_result['needs_review'] = needs_review
     verification_result['combined_score'] = combined_score
     verification_result['verified_at'] = datetime.now().isoformat()
+    verification_result['triage_reason'] = (
+        f"score={combined_score:.2f}, legit={is_legitimate}, "
+        f"red_flags={len(red_flags)}, svc={svc_status}"
+    )
 
     # Build update query
     # Properly serialize verification result to JSON

@@ -1,192 +1,264 @@
-# 04 – LLM Verification & Scoring Pipeline
+# 04 – LLM Verification & Scoring Pipeline (llm_verifier + workers)
 
 **Goal for Claude**  
-Design and implement the **LLM classification** layer that:
-- Takes `DomainSnapshot` + `HeuristicResult` as input.
-- Calls the LLM with a structured prompt.
-- Gets **strict JSON** back with detailed classification.
-- Combines LLM + heuristics into a final decision & `needs_review` flag.
+Upgrade how the LLM is used and how its output is combined with heuristics, using these files:
+
+- `scrape_site/llm_verifier.py`  (LLM logic)
+- `scrape_site/service_verifier.py` (calls LLM and combines scores)
+- `verification/llm_service.py` + `verification/llm_queue.py` (GPU queue)
+- `verification/verification_worker.py` and `db/verify_company_urls.py` (DB updates)
 
 ---
 
-## 1. Define the LLM output schema
+## 1. Improve context building in `llm_verifier._build_context`
 
-Create a strict schema object to validate against:
+Current implementation (simplified):
 
 ```python
-class LlmClassification(BaseModel):
-    overall_label: str                   # 'service_provider', 'directory', 'agency', 'blog', 'franchise', 'unknown'
-    is_pressure_washing_provider: bool
-    is_window_cleaning_provider: bool
-    is_wood_restoration_provider: bool
-    is_directory_or_aggregator: bool
-    is_marketing_or_agency: bool
-    is_blog_or_content_only: bool
-    is_franchise_opportunity: bool
-    confidence_score: float              # 0..1
-    needs_review: bool
-    reason_short: str
+def _build_context(self, company_name, services_text, about_text, homepage_text):
+    services_text = (services_text or "")[:600]
+    about_text = (about_text or "")[:600]
+    homepage_text = (homepage_text or "")[:400]
+    ...
 ```
-Adjust types to match the repository’s style, but keep these fields.
+
+This can truncate away the only mentions of relevant services on small pages.
+
+**Upgrade plan:**
+
+1. Add a “smart truncation” helper:
+
+   ```python
+   def _truncate_smart(self, text: str, fallback_limit: int = 2000) -> str:
+       if not text:
+           return ""
+       text = text.strip()
+       if len(text) <= fallback_limit:
+           return text
+
+       keywords = [
+           "pressure wash", "power wash", "soft wash",
+           "house wash", "roof wash", "roof cleaning",
+           "window cleaning", "glass cleaning",
+           "gutter cleaning", "gutter brightening", "gutter whitening",
+           "deck staining", "wood restoration", "fence staining",
+           "exterior cleaning"
+       ]
+       sentences = re.split(r'(?<=[.!?])\s+', text)
+       hits = [s for s in sentences if any(k in s.lower() for k in keywords)]
+
+       selected = []
+       for s in hits:
+           if len(" ".join(selected + [s])) > fallback_limit:
+               break
+           selected.append(s)
+
+       if selected:
+           return " ".join(selected)[:fallback_limit]
+
+       # Fallback: first N chars if no keyword-rich sentences found
+       return text[:fallback_limit]
+   ```
+
+2. Use it in `_build_context`:
+
+   ```python
+   services_text = self._truncate_smart(services_text, 2000)
+   about_text = self._truncate_smart(about_text, 2000)
+   homepage_text = self._truncate_smart(homepage_text, 1500)
+   ```
+
+3. Keep the final context structure:
+
+   ```python
+   context = f"Company: {company_name}\n"
+   if services_text:
+       context += f"Services: {services_text}\n"
+   if about_text:
+       context += f"About: {about_text}\n"
+   if homepage_text:
+       context += f"Homepage: {homepage_text}\n"
+   ```
+
+This gives much richer input without blowing up context size and specifically focuses on service-related sentences.
 
 ---
 
-## 2. Prompt design
+## 2. Ensure we use the shared LLM queue (GPU-friendly)
 
-### 2.1 System message
+`llm_verifier` already supports two modes:
 
-Example (adapt to your LLM provider):
+- Direct (`_generate_direct`)
+- Queue (`_generate_queued` via `verification.llm_queue.llm_generate`)
 
-> You are a strict JSON‑only classifier for local home‑service websites.  
-> You decide whether a website is a real business offering exterior cleaning services  
-> (pressure washing, window cleaning, wood restoration) to paying customers, or something else  
-> such as a directory, marketing agency, blog, or franchise opportunity.  
-> You must obey the JSON schema the user provides and never return anything except valid JSON.
+For 24/7 operation with multiple workers:
 
-### 2.2 User message template
+- Default `LLMVerifier` to **queue mode**.
+- Verify all calls (e.g. `_ask_yesno`, `_call_json_model`) go through `_generate_queued` when queue mode is enabled.
+- Ensure `verification/llm_service.py` is launched by systemd (or supervisor) and documented in the project runbook.
 
-Pass in a **compressed, structured context**:
-
-- Domain & URL
-- High‑level heuristic summary
-- Key extracted signals
-- Truncated combined text
-
-Example (pseudo):
-
-```text
-You will receive information about a website. 
-Decide if it is a real local service provider for exterior cleaning services.
-
-JSON schema you MUST follow:
-{schema_definition}
-
-Website info:
-- Domain: {domain}
-- Main URL: {main_url}
-
-Heuristic summary:
-- Heuristic label: {heur.label}
-- Heuristic score: {heur.score}
-- Reasons: {joined_heur_reasons}
-
-Signals:
-- Any contact form: {any_contact_form}
-- Any phone number: {any_phone_number}
-- Any service terms: {any_service_terms}
-- Any pricing/quote language: {any_pricing_or_quote_lang}
-- Directory cues: {any_directory_cues}
-- Agency cues: {any_agency_cues}
-- Blog cues: {any_blog_cues}
-- Franchise cues: {any_franchise_cues}
-
-Content sample (may be truncated):
-"""
-{combined_text_truncated}
-"""
-
-Rules:
-1. If it looks like a genuine local business providing services to end customers, classify as a service provider.
-2. If it is about helping OTHER businesses get customers (marketing/lead gen/agency/SaaS), classify as marketing/agency.
-3. If it shows many providers, price comparisons, or "find a pro" functionality, classify as directory/aggregator.
-4. If it is mostly articles/tutorials and not clearly selling services, classify as blog/content.
-5. If it sells franchises or recruitment opportunities, classify as franchise.
-6. If you are not sure, choose the label that best fits but set needs_review = true.
-
-Return ONLY a JSON object matching the schema.
-```
-
-Truncate `combined_text` to ~10k characters or less to avoid context blowup.
+No major code changes needed beyond making queue mode the default and ensuring error handling falls back gracefully (e.g., mark an LLM failure and set `needs_review = True` higher up).
 
 ---
 
-## 3. LLM call + validation + retry
+## 3. Classification schema and red flags (already present)
 
-Implement a function, e.g.:
+`llm_verifier.classify_company(...)` already:
+
+- Detects:
+  - Target services (pressure/window/wood).
+  - Company type:
+    - 1 = service provider
+    - 4 = directory / listing
+    - 5 = blog / informational
+    - 6 = lead gen / marketing agency
+    - (and franchise-style types via explanation text)
+- Asks focused yes/no questions to determine:
+  - Residential vs commercial scope.
+  - Legitimacy as a real business vs training site, spam, etc.
+
+Our main task is to:
+
+- Make sure `service_verifier.verify_company` is **always** recording:
+  - `llm_result`
+  - `llm_score`
+  - `is_legitimate`
+  - `red_flags`
+- And that the DB layer respects these when triaging (next section).
+
+---
+
+## 4. DB-level scoring & triage (verification_worker + verify_company_urls)
+
+### 4.1 Combined score (already implemented)
+
+`db/verify_company_urls.py` has:
 
 ```python
-def classify_with_llm(domain_snapshot: DomainSnapshot, heur: HeuristicResult) -> LlmClassification:
-    # 1) Build system + user messages
-    # 2) Call LLM API
-    # 3) Parse JSON with strict validation
-    # 4) Retry with error hint if parsing fails
+def calculate_combined_score(company: Dict, verification_result: Dict) -> float:
+    # Uses google_filter.confidence, yp_filter.confidence,
+    # verification_result['score'], and review counts
+    ...
 ```
 
-### Steps:
+This function is already imported and used in:
 
-1. **Call LLM**
-   - Use the existing client in the repo (OpenAI, local model, etc.).
-   - Request a single completion/response.
+- `db/verify_company_urls.main()` (batch job)
+- `verification/verification_worker.py` (continuous worker)
 
-2. **Parse JSON**
-   - Try `json.loads` on the raw text.
-   - Validate against `LlmClassification` schema (or equivalent).
+We KEEP this function and use its output as `combined_score`.
 
-3. **On failure**
-   - If parsing or validation fails:
-     - Re‑prompt LLM with a short error hint, e.g.:  
-       “Your previous response was not valid JSON: {error}. Return ONLY valid JSON.”
-     - Limit retries (e.g., max 2 attempts).
+### 4.2 Fixing `update_company_verification` (batch + worker)
 
-4. **Logging**
-   - Log raw responses & errors (redacted if necessary) for debugging.
-   - Store the final accepted JSON along with the URL in logs or DB.
+Both:
 
----
+- `db/verify_company_urls.update_company_verification`
+- `verification/verification_worker.update_company_verification`
 
-## 4. Fusion: heuristics + LLM → final decision
-
-Define a final decision structure:
+currently do:
 
 ```python
-class FinalDecision(BaseModel):
-    final_label: str         # 'accepted_provider', 'rejected_non_provider', 'needs_review'
-    raw_llm: LlmClassification
-    raw_heur: HeuristicResult
+is_legitimate = verification_result.get('is_legitimate', False)
+if is_legitimate:
+    active = True
+    verification_result['status'] = 'passed'
+    verification_result['needs_review'] = False
+else:
+    active = False
+    verification_result['status'] = 'failed'
+    verification_result['needs_review'] = False
 ```
 
-Then combine as follows:
+They **ignore**:
 
-1. **Agreement**
-   - If `heur.label == 'provider'` and `llm.overall_label == 'service_provider'` and `llm.confidence_score >= 0.75`:
-     - `final_label = 'accepted_provider'`, `needs_review = False`
+- `verification_result['score']`
+- `verification_result['status']` set by `service_verifier`
+- `combined_score`
+- Red flags.
 
-   - If `heur.label == 'non_provider'` and `llm.overall_label != 'service_provider'` and `llm.confidence_score >= 0.75`:
-     - `final_label = 'rejected_non_provider'`, `needs_review = False`
+We want to replace this with a proper triage:
 
-2. **Disagreement or low confidence**
-   - If labels conflict (one says provider, other non‑provider), OR `llm.confidence_score < 0.6`:
-     - `final_label = 'needs_review'`
+1. Define thresholds (in both files, or better: import from a shared config):
 
-3. **LLM explicit needs_review**
-   - If `llm.needs_review` is `true`, always set `final_label = 'needs_review'` even if everything else looks good.
+   ```python
+   HIGH = min_score   # e.g. 0.75
+   LOW  = max_score   # e.g. 0.35
+   ```
 
-4. **Bias for safety**
-   - In ambiguous cases, prefer `needs_review` over automatic accept/reject.
+2. Derive decision signals:
 
-You can persist `FinalDecision` plus underlying raw structures in your storage layer.
+   ```python
+   svc_status = verification_result.get('status')          # 'passed'/'failed'/'unknown'
+   svc_score  = verification_result.get('score', 0.0)
+   is_legit   = verification_result.get('is_legitimate', False)
+   red_flags  = verification_result.get('red_flags', []) or []
+   web_conf   = svc_score
+   comb       = combined_score
+   ```
+
+3. Decision logic:
+
+   ```python
+   needs_review = False
+
+   if comb >= HIGH and is_legit and svc_status == 'passed' and len(red_flags) == 0:
+       active = True
+       final_status = 'passed'
+   elif comb <= LOW and (not is_legit or svc_status == 'failed' or len(red_flags) >= 2):
+       active = False
+       final_status = 'failed'
+   else:
+       active = False
+       final_status = 'unknown'
+       needs_review = True
+   ```
+
+4. Update `verification_result` before writing:
+
+   ```python
+   verification_result['status'] = final_status
+   verification_result['needs_review'] = needs_review
+   verification_result['combined_score'] = comb
+   verification_result['verified_at'] = datetime.now().isoformat()
+   ```
+
+5. When building the SQL query, store `verification_json` into `parse_metadata['verification']` exactly as before, but now `needs_review` is meaningful.
+
+For the **continuous worker**, also include `worker_id` (already present) in `verification_result` for debugging.
 
 ---
 
-## 5. Integration into existing pipeline
+## 5. Interpreting outcomes
 
-Identify the existing entry point where a URL is currently sent to an LLM. Replace that with:
+After this change, your three effective states are:
 
-1. Build `DomainSnapshot` (doc 02).
-2. Run `HeuristicResult = run_heuristics(snapshot)` (doc 03).
-3. Run `LlmClassification = classify_with_llm(snapshot, heur)` (this doc).
-4. Compute `FinalDecision`.
-5. Emit final label + store full context for audit/training.
+- **Auto-accepted provider**
+  - `parse_metadata['verification']['status'] == 'passed'`
+  - `active = true`
+  - `needs_review = false`
+- **Auto-rejected non-provider**
+  - `status == 'failed'`
+  - `active = false`
+  - `needs_review = false`
+- **Needs manual review**
+  - `status == 'unknown'`
+  - `active = false`
+  - `needs_review = true`
 
-Make sure any calling code expects the three states: `accepted_provider`, `rejected_non_provider`, `needs_review`.
+Your NiceGUI dashboard or admin tools can then filter on:
+
+- `parse_metadata->'verification'->>'needs_review' = 'true'`
+
+to build a review queue (as described in doc 05).
 
 ---
 
 ## 6. Checklist
 
-- [ ] Define `LlmClassification` schema.
-- [ ] Implement structured system + user prompts.
-- [ ] Implement LLM call, JSON parsing, validation, and retries.
-- [ ] Implement fusion logic → `FinalDecision`.
-- [ ] Replace direct LLM calls with the new multi‑stage pipeline.
-- [ ] Add logging for raw prompts/responses (with redaction if necessary).
+- [ ] Implement smart truncation in `scrape_site/llm_verifier._build_context`.
+- [ ] Ensure queue mode is the default for LLM calls via `verification.llm_queue`.
+- [ ] Verify that `service_verifier.verify_company` always populates `is_legitimate`, `red_flags`, `llm_score`, and `status`.
+- [ ] Update both `update_company_verification` functions (batch + worker) to:
+  - Use `combined_score`, `result['score']`, LLM legitimacy, and red flags.
+  - Set `needs_review = True` only for ambiguous cases.
+- [ ] Confirm that `parse_metadata['verification']` ends up with a rich, self-contained JSON blob for auditing and training.

@@ -32,21 +32,35 @@ from sqlalchemy.orm import sessionmaker
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from runner.logging_setup import get_logger
-from scrape_site.site_scraper import fetch_page
+from scrape_site.site_scraper import fetch_page, scrape_website
 from scrape_site.site_parse import parse_site_content
 from scrape_site.service_verifier import create_verifier
 from db.verify_company_urls import calculate_combined_score
+from verification.ml_classifier import (
+    build_features,
+    predict_provider_prob,
+    compute_final_score,
+    get_model_info,
+)
+from verification.config_verifier import (
+    MIN_DELAY_SECONDS,
+    MAX_DELAY_SECONDS,
+    EMPTY_QUEUE_DELAY,
+    MAX_EMPTY_QUEUE_DELAY,
+    PREFETCH_BUFFER_SIZE,
+    COMBINED_HIGH_THRESHOLD,
+    COMBINED_LOW_THRESHOLD,
+    RED_FLAG_AUTO_REJECT_COUNT,
+    LLM_CONFIDENCE_LOW,
+    THIN_TEXT_THRESHOLD,
+    MAX_DEEP_SCRAPES_PER_HOUR,
+)
+
+# Track deep scrapes per hour (reset hourly)
+_deep_scrape_count = 0
+_deep_scrape_hour = None
 
 load_dotenv()
-
-# Configuration
-MIN_DELAY_SECONDS = float(os.getenv('VERIFY_MIN_DELAY_SECONDS', '2.0'))
-MAX_DELAY_SECONDS = float(os.getenv('VERIFY_MAX_DELAY_SECONDS', '5.0'))
-EMPTY_QUEUE_DELAY = 60  # Seconds to wait when queue is empty
-MAX_EMPTY_QUEUE_DELAY = 300  # Max backoff delay
-MIN_SCORE = float(os.getenv('VERIFY_MIN_SCORE', '0.75'))
-MAX_SCORE = float(os.getenv('VERIFY_MAX_SCORE', '0.25'))  # Lowered from 0.35
-PREFETCH_BUFFER_SIZE = int(os.getenv('VERIFY_PREFETCH_SIZE', '3'))  # Companies to prefetch
 
 # Shutdown flag
 shutdown_requested = False
@@ -131,12 +145,48 @@ class PrefetchBuffer:
                 html = None
                 metadata = None
                 fetch_error = None
+                used_deep_scrape = False
 
                 if website:
                     try:
                         html = fetch_page(website, delay=MIN_DELAY_SECONDS)
                         if html:
                             metadata = parse_site_content(html, website)
+
+                            # === Deep scrape for thin sites ===
+                            # Check if site has minimal content
+                            services_len = len(metadata.get('services') or '')
+                            homepage_len = len(metadata.get('homepage_text') or '')
+
+                            if (services_len < THIN_TEXT_THRESHOLD and
+                                homepage_len < THIN_TEXT_THRESHOLD):
+                                # This is a thin site - check deep scrape budget
+                                global _deep_scrape_count, _deep_scrape_hour
+                                current_hour = datetime.now().hour
+
+                                # Reset hourly counter
+                                if _deep_scrape_hour != current_hour:
+                                    _deep_scrape_count = 0
+                                    _deep_scrape_hour = current_hour
+
+                                if _deep_scrape_count < MAX_DEEP_SCRAPES_PER_HOUR:
+                                    try:
+                                        self.logger.info(
+                                            f"Thin site detected ({homepage_len} chars), "
+                                            f"running deep scrape for {company['name']}"
+                                        )
+                                        scraper_result = scrape_website(website)
+                                        if scraper_result:
+                                            # Merge deep scrape metadata
+                                            metadata = scraper_result
+                                            metadata['deep_scraped'] = True
+                                            used_deep_scrape = True
+                                            _deep_scrape_count += 1
+                                    except Exception as e:
+                                        self.logger.warning(
+                                            f"Deep scrape failed for {website}: {e}"
+                                        )
+                                        # Continue with original metadata
                         else:
                             fetch_error = "Failed to fetch website"
                     except Exception as e:
@@ -472,42 +522,114 @@ def verify_prefetched_company(prefetched: PrefetchedCompany, verifier, logger) -
 def update_company_verification(
     session,
     company_id: int,
+    company_data: Dict,
     verification_result: Dict,
     combined_score: float,
     worker_id: int,
     logger
 ):
     """
-    Update company record with verification results.
+    Update company record with verification results using proper triage logic.
+
+    Three-way triage based on combined signals:
+    - passed (auto-accept): High final score + LLM legitimate + no red flags
+    - failed (auto-reject): Low final score OR multiple red flags + not legitimate
+    - needs_review: Ambiguous signals, disagreement, or low confidence
 
     Args:
         session: SQLAlchemy session
         company_id: Company ID
-        verification_result: Verification result dict
+        company_data: Company data dict (used for ML feature building)
+        verification_result: Verification result dict from service_verifier
         combined_score: Combined score (discovery + website + reviews)
         worker_id: Worker ID for tracking
         logger: Logger instance
     """
     try:
-        # LLM-based verification: trust is_legitimate flag
+        # === Extract decision signals ===
+        svc_status = verification_result.get('status', 'unknown')  # From service_verifier
+        svc_score = verification_result.get('score', 0.0)
         is_legitimate = verification_result.get('is_legitimate', False)
+        red_flags = verification_result.get('red_flags', []) or []
+        llm_confidence = verification_result.get('llm_classification', {}).get('confidence', 0.0)
 
-        # Determine active flag based on LLM legitimacy check
-        if is_legitimate:
+        # === ML Classifier Integration ===
+        # Build features and get ML probability if model exists
+        ml_prob = None
+        final_score = combined_score  # Default to combined_score if no model
+
+        try:
+            # Create a simple object with parse_metadata for build_features
+            class CompanyProxy:
+                def __init__(self, data):
+                    self.parse_metadata = data.get('parse_metadata', {})
+
+            company_proxy = CompanyProxy(company_data)
+            features = build_features(company_proxy, verification_result, combined_score)
+            ml_prob = predict_provider_prob(features)
+
+            if ml_prob is not None:
+                # Fuse ML probability with combined score
+                final_score = compute_final_score(combined_score, ml_prob, ml_weight=0.5)
+                logger.debug(f"ML: combined={combined_score:.3f}, ml_prob={ml_prob:.3f}, "
+                           f"final={final_score:.3f}")
+        except Exception as e:
+            logger.warning(f"ML prediction failed, using combined_score: {e}")
+
+        # === Three-way triage logic (using final_score) ===
+        needs_review = False
+
+        # HIGH: Auto-accept conditions
+        # - Final score >= threshold (e.g., 0.75)
+        # - LLM says legitimate
+        # - Service verifier passed
+        # - No red flags
+        if (final_score >= COMBINED_HIGH_THRESHOLD and
+            is_legitimate and
+            svc_status == 'passed' and
+            len(red_flags) == 0):
             active = True
-            verification_result['status'] = 'passed'
-            verification_result['needs_review'] = False
-            logger.info(f"LLM verified as legitimate")
-        else:
-            active = False
-            verification_result['status'] = 'failed'
-            verification_result['needs_review'] = False
-            logger.info(f"LLM marked as not legitimate")
+            final_status = 'passed'
+            logger.info(f"ACCEPTED: final_score={final_score:.2f}, legitimate=True, no red flags")
 
-        # Add metadata
+        # LOW: Auto-reject conditions
+        # - Final score <= threshold (e.g., 0.35)
+        # - OR: Not legitimate + multiple red flags
+        # - OR: Service verifier explicitly failed with red flags
+        elif (final_score <= COMBINED_LOW_THRESHOLD or
+              (not is_legitimate and len(red_flags) >= RED_FLAG_AUTO_REJECT_COUNT) or
+              (svc_status == 'failed' and len(red_flags) >= RED_FLAG_AUTO_REJECT_COUNT)):
+            active = False
+            final_status = 'failed'
+            logger.info(f"REJECTED: final_score={final_score:.2f}, legitimate={is_legitimate}, "
+                       f"red_flags={len(red_flags)}")
+
+        # MIDDLE: Needs manual review
+        # - Score in uncertain range
+        # - OR: Heuristics and LLM disagree
+        # - OR: LLM confidence is low
+        # - OR: Service verifier said unknown
+        else:
+            active = False  # Don't auto-activate uncertain companies
+            final_status = 'unknown'
+            needs_review = True
+            logger.info(f"NEEDS REVIEW: final_score={final_score:.2f}, legitimate={is_legitimate}, "
+                       f"svc_status={svc_status}, red_flags={len(red_flags)}")
+
+        # === Update verification result with triage outcome ===
+        verification_result['status'] = final_status
+        verification_result['needs_review'] = needs_review
         verification_result['combined_score'] = combined_score
+        verification_result['final_score'] = final_score
+        if ml_prob is not None:
+            verification_result['ml_prob'] = ml_prob
         verification_result['verified_at'] = datetime.now().isoformat()
         verification_result['worker_id'] = worker_id
+        verification_result['triage_reason'] = (
+            f"final={final_score:.2f}, combined={combined_score:.2f}, "
+            f"ml_prob={ml_prob if ml_prob else 'N/A'}, legit={is_legitimate}, "
+            f"red_flags={len(red_flags)}, svc={svc_status}"
+        )
 
         # Serialize to JSON
         verification_json = json.dumps(verification_result)
@@ -579,8 +701,8 @@ def run_worker(worker_id: int, config: Dict):
     logger.info("=" * 70)
     logger.info(f"Min delay: {MIN_DELAY_SECONDS}s")
     logger.info(f"Max delay: {MAX_DELAY_SECONDS}s")
-    logger.info(f"Min score (auto-pass): {MIN_SCORE}")
-    logger.info(f"Max score (auto-reject): {MAX_SCORE}")
+    logger.info(f"High threshold (auto-pass): {COMBINED_HIGH_THRESHOLD}")
+    logger.info(f"Low threshold (auto-reject): {COMBINED_LOW_THRESHOLD}")
     logger.info(f"Prefetch buffer size: {PREFETCH_BUFFER_SIZE}")
     logger.info("-" * 70)
 
@@ -604,6 +726,15 @@ def run_worker(worker_id: int, config: Dict):
             logger.info("🤖 LLM verification ENABLED (direct mode)")
     else:
         logger.info("📊 Rule-based verification only (LLM disabled)")
+
+    # Log ML classifier info
+    ml_info = get_model_info()
+    if ml_info:
+        logger.info(f"🧠 ML Classifier LOADED: {ml_info.get('model_type', 'unknown')} "
+                   f"(trained: {ml_info.get('trained_at', 'unknown')[:10]}, "
+                   f"samples: {ml_info.get('n_train', 'unknown')})")
+    else:
+        logger.info("📊 ML Classifier NOT AVAILABLE - using combined_score only")
 
     # Setup prefetch buffer if using LLM queue
     prefetch_buffer = None
@@ -670,6 +801,7 @@ def run_worker(worker_id: int, config: Dict):
                     update_company_verification(
                         session,
                         company['id'],
+                        company,  # Pass company_data for ML feature building
                         verification_result,
                         combined_score,
                         worker_id,

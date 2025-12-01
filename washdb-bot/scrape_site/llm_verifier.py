@@ -19,8 +19,16 @@ Supports two modes:
 
 import logging
 import os
+import re
 import requests
 from typing import Dict, List, Optional, Tuple
+
+from verification.config_verifier import (
+    LLM_SERVICES_TEXT_LIMIT,
+    LLM_ABOUT_TEXT_LIMIT,
+    LLM_HOMEPAGE_TEXT_LIMIT,
+    LLM_PRIORITY_KEYWORDS,
+)
 
 
 class LLMVerifier:
@@ -319,6 +327,53 @@ class LLMVerifier:
 
         return False
 
+    def _truncate_smart(self, text: str, fallback_limit: int = 2000) -> str:
+        """
+        Smart truncation that prioritizes service-related content.
+
+        Instead of blindly truncating, extract sentences containing
+        relevant keywords to maximize signal density for the LLM.
+
+        Args:
+            text: Input text to truncate
+            fallback_limit: Maximum character limit
+
+        Returns:
+            Truncated text prioritizing relevant content
+        """
+        if not text:
+            return ""
+
+        text = text.strip()
+        if len(text) <= fallback_limit:
+            return text
+
+        # Split into sentences
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+
+        # Find sentences containing priority keywords
+        hits = []
+        for sentence in sentences:
+            sentence_lower = sentence.lower()
+            if any(keyword in sentence_lower for keyword in LLM_PRIORITY_KEYWORDS):
+                hits.append(sentence)
+
+        # Build result from keyword-rich sentences
+        if hits:
+            selected = []
+            current_len = 0
+            for sentence in hits:
+                if current_len + len(sentence) + 1 > fallback_limit:
+                    break
+                selected.append(sentence)
+                current_len += len(sentence) + 1
+
+            if selected:
+                return " ".join(selected)[:fallback_limit]
+
+        # Fallback: first N chars if no keyword-rich sentences found
+        return text[:fallback_limit]
+
     def _build_context(
         self,
         company_name: str,
@@ -326,11 +381,16 @@ class LLMVerifier:
         about_text: str,
         homepage_text: str
     ) -> str:
-        """Build context summary for LLM questions."""
-        # Larger context for better analysis (GPU can handle it)
-        services_text = (services_text or "")[:600]
-        about_text = (about_text or "")[:600]
-        homepage_text = (homepage_text or "")[:400]
+        """
+        Build context summary for LLM questions using smart truncation.
+
+        Uses larger limits and prioritizes service-related content
+        to give the LLM better signal for classification.
+        """
+        # Smart truncation with larger limits (GPU can handle it)
+        services_text = self._truncate_smart(services_text or "", LLM_SERVICES_TEXT_LIMIT)
+        about_text = self._truncate_smart(about_text or "", LLM_ABOUT_TEXT_LIMIT)
+        homepage_text = self._truncate_smart(homepage_text or "", LLM_HOMEPAGE_TEXT_LIMIT)
 
         context = f"Company: {company_name}\n"
         if services_text:
