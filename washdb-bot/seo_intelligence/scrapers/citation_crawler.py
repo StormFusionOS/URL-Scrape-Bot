@@ -33,6 +33,15 @@ from seo_intelligence.scrapers.base_scraper import BaseScraper
 from seo_intelligence.services import get_task_logger, get_change_manager
 from runner.logging_setup import get_logger
 from db.models import Company, BusinessSource
+from scrape_yp.yp_stealth import (
+    get_playwright_context_params,
+    human_delay,
+    get_exponential_backoff_delay,
+    get_enhanced_playwright_init_scripts,
+    get_human_reading_delay,
+    get_scroll_delays,
+    SessionBreakManager,
+)
 
 # Load environment
 load_dotenv()
@@ -167,7 +176,32 @@ class CitationCrawler(BaseScraper):
             self.engine = None
             logger.warning("DATABASE_URL not set - database storage disabled")
 
-        logger.info("CitationCrawler initialized (tier=B)")
+        # Session break management (YP-style anti-detection)
+        self.session_manager = SessionBreakManager(
+            requests_per_session=50,
+            short_break_range=(30, 60),
+            long_break_range=(120, 300),
+        )
+        self.request_count = 0
+
+        logger.info("CitationCrawler initialized (tier=B, YP-style stealth enabled)")
+
+    def _get_stealth_context_options(self) -> dict:
+        """
+        Override to use YP-style stealth context options.
+
+        Combines base scraper options with YP anti-detection parameters.
+        """
+        # Get YP's proven stealth parameters
+        yp_context_params = get_playwright_context_params()
+
+        # Get base scraper options
+        base_options = super()._get_stealth_context_options()
+
+        # Merge with YP params taking precedence
+        merged_options = {**base_options, **yp_context_params}
+
+        return merged_options
 
     def _normalize_phone(self, phone: str) -> str:
         """Normalize phone number to digits only."""
@@ -800,7 +834,18 @@ class CitationCrawler(BaseScraper):
         logger.info(f"Checking {dir_info['name']} for '{business.name}'")
 
         try:
+            # Check for session break (YP-style anti-detection)
+            self.request_count += 1
+            break_duration = self.session_manager.should_break(self.request_count)
+            if break_duration:
+                logger.info(f"[SESSION BREAK] Taking {break_duration}s break after {self.request_count} requests")
+                time.sleep(break_duration)
+                self.request_count = 0
+
             with self.browser_session() as (browser, context, page):
+                # Human delay before navigation (YP-style timing)
+                human_delay(2.0, 5.0)
+
                 html = self.fetch_page(
                     url=search_url,
                     page=page,
@@ -811,6 +856,25 @@ class CitationCrawler(BaseScraper):
                 if not html:
                     logger.warning(f"Failed to fetch {dir_info['name']}")
                     return None
+
+                # Simulate human reading and scrolling behavior
+                reading_time = get_human_reading_delay(len(html))
+                logger.debug(f"Simulating human reading for {reading_time:.1f}s")
+
+                # Random scrolling with pauses (YP-style behavior)
+                scroll_delays = get_scroll_delays(num_scrolls=random.randint(2, 4))
+                for i, scroll_delay in enumerate(scroll_delays):
+                    try:
+                        # Scroll to random position
+                        scroll_position = random.randint(300, 800) * (i + 1)
+                        page.evaluate(f"window.scrollTo(0, {scroll_position})")
+                        time.sleep(scroll_delay)
+                    except Exception as scroll_error:
+                        logger.debug(f"Scroll simulation error: {scroll_error}")
+                        break
+
+                # Final reading pause
+                time.sleep(min(reading_time, 3.0))  # Cap at 3s to avoid excessive delays
 
                 result = self._extract_listing_info(html, directory, business)
 
@@ -880,18 +944,11 @@ class CitationCrawler(BaseScraper):
 
         with task_logger.log_task("citation_crawler", "scraper", {"business_count": len(businesses)}) as task:
             for business in businesses:
-                dir_count = 0
                 for directory in directories:
                     task.increment_processed()
 
-                    # Add random delay between directory checks to appear more human-like
-                    # First directory gets no delay, subsequent ones get 15-45 seconds
-                    if dir_count > 0:
-                        delay = random.uniform(15, 45)
-                        logger.debug(f"Waiting {delay:.1f}s before checking {directory}...")
-                        time.sleep(delay)
-                    dir_count += 1
-
+                    # YP-style delays are now handled in check_directory()
+                    # via SessionBreakManager and human_delay()
                     result = self.check_directory(business, directory)
 
                     if result:

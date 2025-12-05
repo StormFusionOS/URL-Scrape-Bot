@@ -1,196 +1,180 @@
-# 02 – Crawling & Content Extraction Improvements
+# 02 – Crawling & Content Extraction Improvements (anchored to washdb-bot)
 
 **Goal for Claude**  
-Ensure the verifier has **rich, accurate context** for each URL by:
-- Crawling a small but meaningful subset of pages per site.
-- Handling JS‑rendered content and contact info.
-- Extracting structured signals needed by heuristics and the LLM.
+Upgrade the website context that feeds verification, using the code that already exists in this repo:
 
-Assume there is already some code that fetches URLs and passes HTML to an LLM.  
-Your job is to **upgrade** that layer, not to rewrite everything from scratch.
+- `scrape_site/site_scraper.py`
+- `scrape_site/site_parse.py`
+- `verification/verification_worker.py`
+- `db/verify_company_urls.py`
 
----
-
-## 1. Define a `PageSnapshot` structure
-
-Add (or extend) a structured type to represent a crawled page.
-
-Example (Python‑style pseudocode; adapt to repo language):
-
-```python
-class PageSnapshot(BaseModel):
-    url: str
-    status_code: int
-    final_url: str         # after redirects
-    html: str
-    text: str              # cleaned visible text
-    title: str | None
-    meta_description: str | None
-    h1: list[str]
-    h2: list[str]
-    links_internal: list[str]
-    links_external: list[str]
-    has_contact_form: bool
-    has_phone_number: bool
-    has_email_address: bool
-    has_service_area_terms: bool
-    has_pricing_or_quote_language: bool
-```
-You don’t have to use Pydantic – the key point is to unify what’s extracted from each page.
+We’re not reinventing the scraper; we’re tightening how it’s used in the verification pipeline.
 
 ---
 
-## 2. Small site crawl strategy per domain
+## 1. Current behavior
 
-For each **input URL** to verify:
+In the **continuous verification worker** (`verification/verification_worker.py`):
 
-1. **Normalize URL**
-   - Force scheme (https if missing).
-   - Strip obvious tracking params (`utm_*`, `fbclid`, etc.).
+- `acquire_company_for_verification` selects a company from `companies`.
+- `_prefetch_loop` calls:
+  - `scrape_site.site_scraper.fetch_page(website)` → HTML
+  - `scrape_site.site_parse.parse_site_content(html, website)` → `metadata` dict with:
+    - `name`, `phones`, `emails`, `services`, `service_area`, `address`, `json_ld`, `homepage_text`, etc.
+- `verify_prefetched_company` passes this to:
+  - `scrape_site.service_verifier.create_verifier().verify_company(...)`
 
-2. **Seed URLs for the domain**
-   - Always include:
-     - The given URL
-     - The domain root (homepage) if different
-   - After fetching those, add up to **N internal links** whose anchor/text matches:
-     - “services”, “service”, “exterior cleaning”, “pressure washing”, “window cleaning”, “wood restoration”
-     - “about”, “our company”, “who we are”
-     - “contact”, “request a quote”, “get a quote”, “book now”
+The **batch script** (`db/verify_company_urls.py`) mirrors this logic for manual runs.
 
-3. **Limit**
-   - Add a config constant, e.g. `MAX_PAGES_PER_DOMAIN = 5–8`.
-   - Only crawl that many pages per verification run.
-
-4. **Respect robots/timeout**
-   - Make sure requests obey any existing robot/timeout code in the repo.
-   - Set a sane timeout (e.g. 10–15s) to avoid hanging.
-
-Result: for each domain you should end up with a **list of PageSnapshot** objects.
+Right now, the verification worker only fetches **one page (homepage)** per domain in its fast path.
 
 ---
 
-## 3. JS‑rendered & minimal HTML handling
+## 2. When and how to fetch more than the homepage
 
-**Problem:** Some small sites render key content via JS (SPAs, page builders, dynamic contact widgets).  
-**Solution:** Add a **headless browser fallback** used *only when needed*.
+We already have a multi-page website scraper in `scrape_site/site_scraper.py`:
 
-1. Add a headless renderer module
-   - Use Playwright, Puppeteer, or an existing headless stack in the repo.
-   - API shape (pseudo):
+- `scrape_website(url)`:
+  - Fetches homepage.
+  - Discovers internal `Contact`, `About`, and `Services` pages via `discover_internal_links(...)`.
+  - Fetches up to 3 additional pages.
+  - Merges metadata via `merge_results(...)`.
 
-```python
-async def render_page(url: str, timeout: int = 20000) -> str:
-    """
-    Return fully rendered HTML for `url` (after JS execution).
-    Should block heavy resources (images/fonts) to keep it light.
-    """
-```
+We want to use this **selectively**, so the GPU isn’t waiting on network I/O for every company.
 
-   - Configure it to:
-     - Block images, fonts, video.
-     - Wait until network idle or a fixed timeout (whichever first).
-     - Return `page.content()`.
+### 2.1 Fast path (current behavior)
 
-2. Detection logic – when to use headless
-   - After fetching a page with normal HTTP:
-     - If `len(text)` is below a small threshold (e.g. < 500 chars), **and**
-     - DOM contains lots of `<script>` tags, or
-     - You detect common SPA markers (e.g. root `<div id="app">`, `<div id="__next">`)
-   - Then call `render_page(url)` once and re‑extract the text & features from the rendered HTML.
+Keep the existing fast path for the majority of companies:
 
-3. Avoid overuse
-   - Add limit constants:
-     - `MAX_RENDERED_PAGES_PER_DOMAIN` (e.g. 2)
-     - `MAX_RENDERED_PAGES_PER_RUN` (e.g. 50)
-   - Track counters in the process and skip rendering when limits are hit.
+- Use `fetch_page` + `parse_site_content` on the homepage only.
+- This is what `_prefetch_loop` currently does.
 
----
+### 2.2 Deep path (for thin or ambiguous sites)
 
-## 4. Text extraction & cleaning
+Add a conditional “deep scrape” that uses `scrape_website` **only when it’s worth it**:
 
-Implement a function like:
+In `verification/verification_worker.py` inside `_prefetch_loop`:
 
-```python
-def extract_visible_text(html: str) -> str:
-    # 1) Parse HTML with lxml/BeautifulSoup/etc.
-    # 2) Remove <script>, <style>, <noscript>, <head>, and hidden elements.
-    # 3) Join text blocks with whitespace normalized.
-```
+1. After the first `parse_site_content` call, inspect `metadata`:
 
-Guidelines:
+   - If:
+     - `len(metadata.get("services") or "") < SMALL_THRESHOLD`
+       **and**
+     - `len(metadata.get("homepage_text") or "") < SMALL_THRESHOLD`
+   - Then treat this as a **thin site**.
 
-- Remove nav/footer boilerplate where possible.
-- Collapse multiple spaces & newlines.
-- Keep headings and body paragraphs – they are valuable to the LLM.
+2. For thin sites *and* only when we haven’t exceeded an hourly budget, call:
 
----
+   ```python
+   from scrape_site.site_scraper import scrape_website
 
-## 5. Signal extraction (for later stages)
+   try:
+       scraper_result = scrape_website(website)
+       # scraper_result already includes merged metadata
+       metadata = scraper_result  # or merge carefully with existing metadata
+   except Exception as e:
+       logger.warning(f"Deep scrape failed for {website}: {e}")
+       # Fall back to the original metadata
+   ```
 
-For each `PageSnapshot`, set the following booleans or counters:
+3. SMALL_THRESHOLD can be 500–800 characters of text; add it to a config (see doc 06).
 
-1. **Contact & NAP signals**
-   - Phone detection:
-     - Regex for patterns like `(xxx) xxx-xxxx` or `xxx-xxx-xxxx` or international forms.
-   - Email detection:
-     - Regex for `something@something`.
-   - Address cues:
-     - Look for tokens like “Street”, “St.”, “Road”, “Rd.”, zip codes, city names if available.
-   - Form detection:
-     - Check for `<form>` plus inputs like `name`, `phone`, `email`, `message`.
+4. Limit how many “deep scrapes” you do per hour or per worker to preserve throughput:
+   - e.g., `MAX_DEEP_SCRAPES_PER_HOUR = 50`.
 
-2. **Service‑intent language**
-   - Search (case‑insensitive) for phrases like:
-     - “pressure washing”, “power washing”, “soft washing”
-     - “window cleaning”, “gutter cleaning”, “house washing”, “roof cleaning”
-     - “deck staining”, “wood restoration”, “fence staining”
-   - Set `has_service_area_terms` when you find “serving [city]”, “we serve [area]”, etc.
-   - Set `has_pricing_or_quote_language` when you find “get a quote”, “free estimate”, “schedule service”, etc.
-
-3. **Non‑provider cues**
-   - Blog / tutorial language:
-     - “how to”, “guide”, “tips”, “DIY”, “step‑by‑step guide” in titles/headings.
-   - Marketing/agency cues:
-     - “we build brands”, “digital marketing agency”, “SEO services”, “lead generation for contractors”.
-   - Franchise/opportunity cues:
-     - “franchise opportunity”, “be your own boss”, “territory available”, “invest”, “franchisee”.
-   - Directory/aggregator cues:
-     - “find a pro”, “compare local pros”, “get multiple quotes”, lists of many cities/companies.
-
-Store these as simple fields so later modules can use them (heuristics & LLM prompt).
+This gives the LLM better context for **small/minimal sites**, which were a major false-negative source.
 
 ---
 
-## 6. Aggregated view per domain
+## 3. JS-rendered content (headless fallback)
 
-After crawling, create a **DomainSnapshot** (you don’t have to persist it, but make it a struct the verifier can use):
+The repo already uses Playwright heavily for YP and Google — the site scraper is currently using plain `requests`/`httpx` for websites.
 
-```python
-class DomainSnapshot(BaseModel):
-    domain: str
-    pages: list[PageSnapshot]
-    combined_text: str             # concat of page.text, truncated
-    any_contact_form: bool
-    any_phone_number: bool
-    any_service_terms: bool
-    any_pricing_or_quote_lang: bool
-    any_directory_cues: bool
-    any_agency_cues: bool
-    any_franchise_cues: bool
-    any_blog_cues: bool
-```
+We want a **light** JS fallback for sites where static HTML is basically empty:
 
-- `combined_text` can be the concatenation of all page texts up to e.g. 10–20k characters, which you’ll pass into the LLM.
+1. Add a headless render helper (you can reuse the patterns from `scrape_yp` / `scrape_google` stealth modules):
 
-This gives later stages a **single, coherent object** for “this website’s evidence”.
+   ```python
+   # e.g., scrape_site/js_render.py
+   async def render_page(url: str, timeout_ms: int = 20000) -> str:
+       # Playwright browser launch (headless)
+       # Block images/fonts/video for speed
+       # Wait for network idle or timeout
+       # Return page.content()
+   ```
+
+2. Detection conditions (in verification worker):
+
+   - After `fetch_page` + `parse_site_content`:
+     - If:
+       - `len(metadata.get("homepage_text") or "") < 300`
+       - and there are many `<script>` tags (you can count in the raw HTML)
+       - and no phone/email/address was detected
+     - Then, **once per domain**, try the JS-render path:
+       - Store a small in-memory or DB-level flag `js_rendered` in `parse_metadata['verification']` or in a local cache so we don’t re-render repeatedly.
+
+3. Re-run `parse_site_content` on the rendered HTML.
+
+4. Guardrails:
+   - `MAX_RENDERED_PAGES_PER_RUN` and `MAX_RENDERED_PAGES_PER_DOMAIN` in config.
+   - If rendering fails or times out, log and continue with static HTML.
+
+This tackles false negatives where the contact info and services are all injected via JavaScript.
 
 ---
 
-## 7. Checklist
+## 4. Metadata fields that matter most
 
-- [ ] Define/extend `PageSnapshot` with all the fields above.
-- [ ] Implement small per‑domain crawl (seed URLs + limited internal links).
-- [ ] Add JS rendering fallback with strict limits and detection logic.
-- [ ] Implement robust `extract_visible_text` function.
-- [ ] Populate contact, service, and non‑provider cues.
-- [ ] Construct a `DomainSnapshot` used by the rest of the pipeline.
+`parse_site_content` already provides a rich metadata dict. For verification, ensure the following keys are reliably populated and passed into `service_verifier.verify_company`:
+
+- `name`
+- `services`
+- `service_area`
+- `address`
+- `phones`
+- `emails`
+- `homepage_text`
+- `json_ld` (for schema.org)
+- `reviews` (if available)
+
+If needed, adjust `site_parse.py` to:
+
+- Recognize additional synonyms and niche terminology for:
+  - Pressure washing, soft washing, exterior cleaning, etc.
+  - Window cleaning, glass cleaning.
+  - Wood restoration, deck/fence/log home refinishing.
+- Normalize phone numbers and addresses consistently so the verifier’s local-business checks are robust.
+
+---
+
+## 5. Domain-level aggregation
+
+While we don’t need a formal `DomainSnapshot` class, we effectively create one via `website_metadata`:
+
+- After the fast and optional deep paths, ensure `website_metadata` has:
+
+  - Combined text:
+    - `services`
+    - `about` (from about page if fetched)
+    - `homepage_text`
+  - Boolean flags:
+    - Has phone?
+    - Has email?
+    - Has address?
+    - Has service area?
+    - Has clear service phrases vs blog/agency/franchise language?
+
+These are consumed by `service_verifier` and `llm_verifier` already; our goal is to **feed them richer, more complete data**.
+
+---
+
+## 6. Checklist for implementation
+
+- [ ] In `verification/verification_worker.py`, add an optional deep-scrape path using `scrape_site.site_scraper.scrape_website` for thin sites.
+- [ ] Add a JS-render fallback module and call it only when static HTML is clearly insufficient.
+- [ ] Add configuration constants for:
+  - Thin-site thresholds
+  - Deep-scrape budgets
+  - JS-render budgets
+- [ ] Ensure `website_metadata` passed into `service_verifier.verify_company(...)` includes all key fields.
+- [ ] Extend `site_parse.py` term lists for niche exterior cleaning terminology as needed.

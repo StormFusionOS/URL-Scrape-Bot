@@ -31,6 +31,12 @@ from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from runner.logging_setup import get_logger
+from verification.config_verifier import (
+    SCORE_CAP_DIRECTORY,
+    SCORE_CAP_AGENCY,
+    SCORE_CAP_BLOG_NO_NAP,
+    SCORE_CAP_FRANCHISE,
+)
 
 logger = get_logger("service_verifier")
 
@@ -238,6 +244,44 @@ class ServiceVerifier:
             result['rule_score'] = rule_score
             logger.debug(f"Combined score: LLM={llm_score:.0f}, rule={rule_score:.2f}, "
                         f"final={result['score']:.2f} (weight={self.llm_weight})")
+
+            # === Score Capping for Red Flag Categories ===
+            # Map LLM type codes to structured red flags and cap scores
+            llm_type = llm_result.get('type', 1)
+
+            # Directory / aggregator (type=4)
+            if llm_type == 4:
+                if 'directory_or_listing' not in result['red_flags']:
+                    result['red_flags'].append('directory_or_listing')
+                result['score'] = min(result['score'], SCORE_CAP_DIRECTORY)
+                logger.debug(f"Score capped for directory: {result['score']:.2f}")
+
+            # Blog / informational (type=5)
+            elif llm_type == 5:
+                if 'blog_or_informational' not in result['red_flags']:
+                    result['red_flags'].append('blog_or_informational')
+                # Only cap if no NAP (phone/email/address)
+                has_nap = (result.get('has_phone') or result.get('has_email') or
+                          result.get('has_address'))
+                if not has_nap:
+                    result['score'] = min(result['score'], SCORE_CAP_BLOG_NO_NAP)
+                    logger.debug(f"Score capped for blog (no NAP): {result['score']:.2f}")
+
+            # Marketing agency / lead gen (type=6)
+            elif llm_type == 6:
+                if 'marketing_agency' not in result['red_flags']:
+                    result['red_flags'].append('marketing_agency')
+                result['score'] = min(result['score'], SCORE_CAP_AGENCY)
+                logger.debug(f"Score capped for agency: {result['score']:.2f}")
+
+            # Check for franchise opportunity in red flags or type=3
+            if (llm_type == 3 or
+                any('franchise' in flag.lower() for flag in result.get('red_flags', []))):
+                if 'franchise_opportunity' not in result['red_flags']:
+                    result['red_flags'].append('franchise_opportunity')
+                result['score'] = min(result['score'], SCORE_CAP_FRANCHISE)
+                logger.debug(f"Score capped for franchise: {result['score']:.2f}")
+
         elif self.ml_model:
             ml_score = self._get_ml_score(company_data, result)
             result['score'] = 0.6 * rule_score + 0.4 * ml_score

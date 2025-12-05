@@ -911,7 +911,7 @@ async def stop_discovery():
     # Step 1: Stop the systemd service (this handles auto-restart)
     try:
         result = subprocess.run(
-            ['sudo', 'systemctl', 'stop', 'google-5workers.service'],
+            ['sudo', 'systemctl', 'stop', 'google-state-workers.service'],
             capture_output=True,
             text=True,
             timeout=10
@@ -1073,7 +1073,7 @@ def detect_running_yp_workers():
     # Method 1: Check systemd service status
     try:
         result = subprocess.run(
-            ['systemctl', 'is-active', 'yp-5workers.service'],
+            ['systemctl', 'is-active', 'yp-state-workers.service'],
             capture_output=True,
             text=True,
             timeout=5
@@ -1149,7 +1149,7 @@ def detect_running_google_workers():
     # Method 1: Check systemd service status
     try:
         result = subprocess.run(
-            ['systemctl', 'is-active', 'google-5workers.service'],
+            ['systemctl', 'is-active', 'google-state-workers.service'],
             capture_output=True,
             text=True,
             timeout=5
@@ -1307,7 +1307,7 @@ def build_yellow_pages_ui(container):
                 # All workers merged view - shows main orchestrator log
                 with ui.tab_panel(yp_tab_all):
                     ui.label('📊 Live crawling activity from orchestrator').classes('text-xs text-gray-400 mb-2')
-                    log_viewer_all = LiveLogViewer('logs/YPContinuous5Workers.log', max_lines=400, auto_scroll=True)
+                    log_viewer_all = LiveLogViewer('logs/yp_workers.log', max_lines=400, auto_scroll=True)
                     log_viewer_all.create()
                     log_viewer_all.load_last_n_lines(100)
                     log_viewer_all.start_tailing()
@@ -1318,7 +1318,7 @@ def build_yellow_pages_ui(container):
                     with ui.tab_panel(yp_worker_tabs[i]):
                         states = yp_worker_states[i]
                         ui.label(f"🌎 States: {', '.join(states)}").classes('text-xs text-gray-400 mb-2')
-                        log_viewer = LiveLogViewer(f'logs/yp_worker_{i + 1}.log', max_lines=300, auto_scroll=True)
+                        log_viewer = LiveLogViewer(f'logs/state_worker_{i}.log', max_lines=300, auto_scroll=True)
                         log_viewer.create()
                         log_viewer.load_last_n_lines(100)
                         log_viewer.start_tailing()
@@ -1334,7 +1334,7 @@ def build_yellow_pages_ui(container):
                 # Method 1: Check systemd service status first
                 try:
                     result = subprocess.run(
-                        ['systemctl', 'is-active', 'yp-5workers.service'],
+                        ['systemctl', 'is-active', 'yp-state-workers.service'],
                         capture_output=True,
                         text=True,
                         timeout=5
@@ -1857,8 +1857,8 @@ def build_google_maps_ui(container):
             with ui.tab_panels(google_tabs, value=google_tab_all).classes('w-full'):
                 # All workers merged view - shows main activity log
                 with ui.tab_panel(google_tab_all):
-                    ui.label('📊 Live crawling activity from all workers').classes('text-xs text-gray-400 mb-2')
-                    log_viewer_all = LiveLogViewer('logs/google_crawl_city_first.log', max_lines=400, auto_scroll=True)
+                    ui.label('📊 Live crawling activity from orchestrator').classes('text-xs text-gray-400 mb-2')
+                    log_viewer_all = LiveLogViewer('logs/google_workers.log', max_lines=400, auto_scroll=True)
                     log_viewer_all.create()
                     log_viewer_all.load_last_n_lines(100)
                     log_viewer_all.start_tailing()
@@ -1869,7 +1869,7 @@ def build_google_maps_ui(container):
                     with ui.tab_panel(google_worker_tabs[i]):
                         states = google_worker_states[i]
                         ui.label(f"🌎 States: {', '.join(states)}").classes('text-xs text-gray-400 mb-2')
-                        log_viewer = LiveLogViewer(f'logs/google_worker_{i + 1}.log', max_lines=300, auto_scroll=True)
+                        log_viewer = LiveLogViewer(f'logs/google_state_worker_{i}.log', max_lines=300, auto_scroll=True)
                         log_viewer.create()
                         log_viewer.load_last_n_lines(100)
                         log_viewer.start_tailing()
@@ -1885,7 +1885,7 @@ def build_google_maps_ui(container):
                 # Method 1: Check systemd service status first
                 try:
                     result = subprocess.run(
-                        ['systemctl', 'is-active', 'google-5workers.service'],
+                        ['systemctl', 'is-active', 'google-state-workers.service'],
                         capture_output=True,
                         text=True,
                         timeout=5

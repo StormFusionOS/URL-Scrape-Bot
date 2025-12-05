@@ -1,140 +1,156 @@
-# 03 – Heuristics & Rule‑Based Filtering
+# 03 – Heuristics & Rule-Based Filtering (mapped to service_verifier.py)
 
 **Goal for Claude**  
-Implement a fast, deterministic heuristic layer that:
-- Quickly rejects obvious non‑providers (blogs, agencies, generic directories).
-- Boosts confidence for obvious local service providers.
-- Produces a **heuristic label + score** consumed by the LLM fusion logic.
+Tune and extend the heuristic layer that already exists in `scrape_site/service_verifier.py` so we:
 
-You will build on top of the `DomainSnapshot` and `PageSnapshot` structures from doc 02.
-
----
-
-## 1. Define heuristic output type
-
-Create a small struct / dataclass:
-
-```python
-class HeuristicResult(BaseModel):
-    label: str          # 'provider', 'non_provider', or 'uncertain'
-    score: float        # 0..1, "confidence provider"
-    reasons: list[str]  # human-readable notes
-```
-
-This will be combined later with LLM output.
+- Boost obvious service providers.
+- Aggressively penalize blogs, agencies, directories, and franchise/business-opportunity sites.
+- Produce a `status` + `score` that the DB update functions will respect when deciding `accept / reject / needs_review`.
 
 ---
 
-## 2. Core positive provider signals
+## 1. Where heuristics live today
 
-Compute a numeric `score` starting from 0.5 and adjusting up/down.
+File: `scrape_site/service_verifier.py`
 
-Increase score for:
+Key components:
 
-1. **Service‑intent terms present**
-   - If `any_service_terms`: `score += 0.25`
-2. **Contact & NAP present**
-   - If `any_contact_form` or `any_phone_number`: `score += 0.1`
-   - If both phone + email + address evidence: `score += 0.1`
-3. **Service‑style CTAs**
-   - If `any_pricing_or_quote_lang`: `score += 0.1`
-4. **Domain hints**
-   - If domain contains words like `"pressurewash"`, `"pwashing"`, `"softwash"`, `"windowclean"`, `"exteriorclean"`, `"powerwash"`: `score += 0.15`
+- `verify_company(...)`:
+  - Builds a `result` dict with:
+    - `status` (`'passed' | 'failed' | 'unknown'`)
+    - `score` (0.0–1.0)
+    - `tier` (`'A'..'D'`)
+    - `services_detected`, `positive_signals`, `negative_signals`, `reason`
+    - `is_legitimate`, `red_flags`, `quality_signals` (from LLM)
+- `_analyze_language(...)`:
+  - Uses `provider_phrases`, `informational_phrases`, `cta_phrases`.
+- `_validate_local_business(...)`:
+  - Checks for phone, email, address, service area.
+- `_calculate_rule_score(...)`:
+  - Computes a rule-based score from headings, service phrases, CTA phrases, and local-business artifacts.
+- Phase 5 logic:
+  - Combines LLM score + rule score (or ML score) into `result['score']`.
 
-Add human‑readable reasons for each increment, e.g. `"found pressure washing keywords"`, `"has quote form"`, etc.
-
-Clamp `score` to [0,1].
-
----
-
-## 3. Strong negative signals
-
-Decrease score and possibly **short‑circuit to non‑provider** when strong evidence exists.
-
-Check for:
-
-1. **Directory / aggregator**
-   - `any_directory_cues` (e.g., “find a pro”, “compare local pros”, lists of many companies).
-   - Many external links to different domains with names like businesses.
-   - If strong: set `score = 0.0`, `label = 'non_provider'`, add reason `"directory/aggregator language"`.
-
-2. **Marketing agency / SaaS / vendor**
-   - `any_agency_cues` (e.g., “we provide SEO for home service businesses”, “lead generation agency”).
-   - Frequent mentions of “clients”, “case studies”, “campaigns” rather than “our services”.
-   - If strong: `score = 0.0`, `label = 'non_provider'`, reason `"marketing/agency site"`.
-
-3. **Blog / pure content**
-   - `any_blog_cues` (headlines like “How to pressure wash your deck” with no clear service CTA).
-   - Many posts with bylines/dates, little evidence of a specific business.
-   - If strong and no service CTAs: reduce score heavily, e.g. `score -= 0.3` and maybe label `'non_provider'` when `score < 0.2`.
-
-4. **Franchise opportunity microsite**
-   - `any_franchise_cues` (e.g., “territories available”, “become a franchisee”, “investment”).
-   - If it’s clearly recruitment/investment only, `score = 0.0`, label `'non_provider'`, reason `"franchise opportunity site"`.
+All of this is already close to what we want; we just need to **tighten it for your use case** and later wire the output into the DB.
 
 ---
 
-## 4. Final label from heuristics
+## 2. Strengthening positive provider signals
 
-After applying positives & negatives and clamping `score`:
+Make sure the rule score strongly reflects being a real exterior cleaning provider:
 
-- If `score >= 0.75` and no strong negative flag:
-  - `label = 'provider'`
-- Else if `score <= 0.25`:
-  - `label = 'non_provider'`
-- Else:
-  - `label = 'uncertain'`
+- **Service terms**:
+  - Expand `self.services` and `provider_phrases` in the config JSON to include:
+    - soft wash / soft washing
+    - house wash / house washing
+    - roof washing / roof cleaning
+    - driveway / sidewalk / concrete cleaning
+    - paver cleaning / paver sealing
+    - gutter brightening / gutter whitening
+    - deck/fence/log home staining & restoration
+- **Local business structure**:
+  - Ensure `_validate_local_business` adds strong positive signals when:
+    - At least one US phone is present.
+    - At least one email is present.
+    - A plausible address is present.
+    - Service area text mentions cities/counties.
+- **CTAs**:
+  - In `_analyze_language`, boost `cta_phrase_count` for phrases like:
+    - “get a quote”, “free estimate”, “schedule service”, “book now”.
 
-Return `HeuristicResult(label, score, reasons)`.
+In `_calculate_rule_score`, consider:
 
-Keep the thresholds as constants so they can be tuned:
-
-```python
-HEUR_PROVIDER_THRESHOLD = 0.75
-HEUR_NON_PROVIDER_THRESHOLD = 0.25
-```
-
----
-
-## 5. Integration point
-
-Add a function like:
-
-```python
-def run_heuristics(domain_snapshot: DomainSnapshot) -> HeuristicResult:
-    ...
-```
-
-Then, in the main verification flow:
-
-1. Build `DomainSnapshot` (from doc 02).
-2. Call `heur = run_heuristics(domain_snapshot)`.
-3. Pass `heur` along with `domain_snapshot` into the LLM stage (doc 04).
+- Slightly increasing the weight of:
+  - Provider phrases in headings and services text.
+  - Local business artifacts (phone/email/address).
+  - CTA phrases.
+- Keeping the max total rule score in the same range so it still nicely mixes with LLM scores.
 
 ---
 
-## 6. Edge‑case handling & notes
+## 3. Hard negative patterns (blogs, agencies, directories, franchise)
 
-1. **Very small sites**
-   - If the domain has only 1–2 pages and some service cues but weak CTAs, avoid harsh penalties.
-   - Bias slightly toward `uncertain` instead of `non_provider` to reduce false negatives.
+The LLM side (`llm_verifier.py`) already asks:
 
-2. **Multi‑service contractors**
-   - Don’t penalize presence of other home services: e.g., “roofing, painting, pressure washing” should still be allowed – these can be legitimate providers.
+- “Is this a marketing agency, lead generation service, or advertising company?”
+- “Is this primarily a blog, tutorial site, or informational website?”
+- “Is this a directory, listing site, or aggregator of multiple businesses?”
+- “Is this a franchise opportunity or business opportunity site?”
 
-3. **Geo‑targeted directories**
-   - Treat things like “best pressure washing companies in [city]” lists as directories, not providers.
+And sets `type` and `description` accordingly.
 
-4. **Config**
-   - All patterns (keywords, phrases) should live in a config array so they can be updated without changing core logic.
+In `service_verifier.verify_company`, when you process `llm_result`, make sure to:
+
+1. Map LLM types to **structured red flags**:
+
+   - `type == 6` → `"marketing_agency"`
+   - `type == 5` → `"blog_or_informational"`
+   - `type == 4` → `"directory_or_listing"`
+   - `type == 3` or specific wording → `"franchise_opportunity"`
+
+   Append these to `result['red_flags']` if not already present.
+
+2. Apply **hard penalties** to `rule_score` or directly to `result['score']`:
+
+   - If `"directory_or_listing"` in `red_flags`:
+     - Cap `result['score']` at, say, 0.25.
+   - If `"marketing_agency"` in `red_flags`:
+     - Cap `result['score']` at 0.25.
+   - If `"blog_or_informational"` in `red_flags` **and** there are no phone/email/address signals:
+     - Cap `result['score']` at 0.25.
+   - If `"franchise_opportunity"` in `red_flags`:
+     - Cap `result['score']` at 0.20.
+
+3. Reflect this in `status` logic:
+
+   Inside the “Phase 5: Combined Scoring” section:
+
+   ```python
+   is_llm_legitimate = result.get('is_legitimate', False)
+
+   if result['score'] >= 0.70 and is_llm_legitimate:
+       result['status'] = 'passed'
+       ...
+   elif result['score'] >= 0.75:
+       result['status'] = 'passed'
+       ...
+   elif result['score'] <= 0.30 or (
+       llm_result and not is_llm_legitimate and len(result.get('red_flags', [])) >= 2
+   ):
+       result['status'] = 'failed'
+       ...
+   else:
+       result['status'] = 'unknown'
+       ...
+   ```
+
+You can tweak the thresholds, but the idea is:
+
+- Strong negative patterns plus low score → `failed`.
+- Mixed signals → `unknown` (which will become `needs_review` at the DB layer).
 
 ---
 
-## 7. Checklist
+## 4. Heuristic output contract
 
-- [ ] Create `HeuristicResult` struct.
-- [ ] Implement scoring logic with adjustable thresholds.
-- [ ] Encode positive provider signals.
-- [ ] Encode strong negative patterns (directory, agency, blog, franchise).
-- [ ] Wire heuristics into the main verification flow.
-- [ ] Add unit tests for representative sites (service provider, agency, directory, blog, tiny site).
+At the end of `verify_company`, make sure `result` contains:
+
+- `status` in `{'passed','failed','unknown'}`
+- `score` ∈ [0,1]
+- `is_legitimate` (bool, from LLM)
+- `red_flags` (list of strings)
+- `quality_signals` (list of strings, optional)
+- `tier` (A–D)
+- `services_detected` map
+
+This is the information the DB-level decision logic will use in the next doc.
+
+---
+
+## 5. Checklist
+
+- [ ] Expand `provider_phrases` and service-related phrases in the config JSON for `service_verifier`.
+- [ ] Ensure `_validate_local_business` and `_analyze_language` reward real local-business artifacts.
+- [ ] Map LLM `type` codes to structured `red_flags` in the verification result.
+- [ ] Cap `score` aggressively for directories, agencies, blogs without NAP, and franchise-opportunity sites.
+- [ ] Leave final `status` computation as the canonical heuristic outcome to be respected by DB update functions.

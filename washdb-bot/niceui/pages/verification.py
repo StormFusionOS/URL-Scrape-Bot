@@ -16,6 +16,7 @@ import asyncio
 import os
 import sys
 import json
+from pathlib import Path
 
 from ..backend_facade import backend
 from ..widgets.live_log_viewer import LiveLogViewer
@@ -25,6 +26,18 @@ from sqlalchemy.orm import sessionmaker
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Import ML classifier for model info
+try:
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    from verification.ml_classifier import get_model_info, reload_model
+    ML_CLASSIFIER_AVAILABLE = True
+except ImportError:
+    ML_CLASSIFIER_AVAILABLE = False
+    def get_model_info():
+        return None
+    def reload_model():
+        return None
 
 
 # Global state for verification
@@ -150,8 +163,9 @@ def get_verification_stats() -> Dict:
             COUNT(CASE WHEN parse_metadata->'verification'->>'status' = 'failed' THEN 1 END) as failed,
             COUNT(CASE WHEN parse_metadata->'verification'->>'status' = 'unknown' THEN 1 END) as unknown,
             COUNT(CASE WHEN parse_metadata->'verification'->>'needs_review' = 'true' THEN 1 END) as needs_review,
-            COUNT(CASE WHEN parse_metadata->'verification'->>'label_human' = 'target' THEN 1 END) as labeled_target,
-            COUNT(CASE WHEN parse_metadata->'verification'->>'label_human' = 'non_target' THEN 1 END) as labeled_non_target
+            COUNT(CASE WHEN parse_metadata->'verification'->>'human_label' = 'provider' THEN 1 END) as labeled_provider,
+            COUNT(CASE WHEN parse_metadata->'verification'->>'human_label' IN ('non_provider', 'directory', 'agency', 'blog', 'franchise') THEN 1 END) as labeled_non_provider,
+            COUNT(CASE WHEN parse_metadata->'verification'->>'human_label' IS NOT NULL THEN 1 END) as total_labeled
         FROM companies
         WHERE parse_metadata->'verification' IS NOT NULL
         """
@@ -165,50 +179,93 @@ def get_verification_stats() -> Dict:
             'failed': row.failed,
             'unknown': row.unknown,
             'needs_review': row.needs_review,
-            'labeled_target': row.labeled_target,
-            'labeled_non_target': row.labeled_non_target
+            'labeled_provider': row.labeled_provider,
+            'labeled_non_provider': row.labeled_non_provider,
+            'total_labeled': row.total_labeled
         }
 
     finally:
         session.close()
 
 
-def mark_company_label(company_id: int, label: str):
+def get_training_label_stats() -> Dict:
+    """Get per-label statistics for training data."""
+    session = get_db_session()
+
+    try:
+        query = """
+        SELECT
+            parse_metadata->'verification'->>'human_label' as label,
+            COUNT(*) as count
+        FROM companies
+        WHERE parse_metadata->'verification'->>'human_label' IS NOT NULL
+        GROUP BY parse_metadata->'verification'->>'human_label'
+        ORDER BY count DESC
+        """
+
+        result = session.execute(text(query))
+
+        label_counts = {}
+        total = 0
+        for row in result:
+            label_counts[row.label] = row.count
+            total += row.count
+
+        return {
+            'labels': label_counts,
+            'total': total
+        }
+
+    finally:
+        session.close()
+
+
+def mark_company_label(company_id: int, label: str, notes: str = ""):
     """
-    Mark a company as 'target' or 'non_target' for ML training.
+    Mark a company with human verification label.
 
     Args:
         company_id: Company ID
-        label: 'target' or 'non_target'
+        label: One of 'provider', 'non_provider', 'directory', 'agency', 'blog', 'franchise'
+        notes: Optional notes about the decision
     """
     session = get_db_session()
 
     try:
         # Update parse_metadata with label
+        # Note: Using string concatenation for jsonb to avoid ::text cast conflict with SQLAlchemy params
         query = text("""
         UPDATE companies
         SET
             parse_metadata = jsonb_set(
-                COALESCE(parse_metadata, '{}'::jsonb),
-                '{verification,label_human}',
-                to_jsonb(:label::text)
-            ),
-            parse_metadata = jsonb_set(
-                parse_metadata,
-                '{verification,label_updated_at}',
-                to_jsonb(:timestamp::text)
+                jsonb_set(
+                    jsonb_set(
+                        jsonb_set(
+                            COALESCE(parse_metadata, '{}'::jsonb),
+                            '{verification,human_label}',
+                            ('"' || :label || '"')::jsonb
+                        ),
+                        '{verification,human_notes}',
+                        ('"' || :notes || '"')::jsonb
+                    ),
+                    '{verification,reviewed_at}',
+                    ('"' || :timestamp || '"')::jsonb
+                ),
+                '{verification,needs_review}',
+                'false'::jsonb
             ),
             active = CASE
-                WHEN :label = 'target' THEN true
-                WHEN :label = 'non_target' THEN false
-                ELSE active
-            END
+                WHEN :label = 'provider' THEN true
+                ELSE false
+            END,
+            last_updated = NOW()
         WHERE id = :company_id
         """)
 
         session.execute(query, {
             'company_id': company_id,
             'label': label,
+            'notes': notes,
             'timestamp': datetime.now().isoformat()
         })
         session.commit()
@@ -382,9 +439,9 @@ async def refresh_companies_table(container, status_filter):
                 'name': company['name'] or 'N/A',
                 'domain': company['domain'],
                 'tier': verification.get('tier', 'N/A'),
-                'score': f"{verification.get('score', 0.0):.2f}",
+                'score': f"{verification.get('combined_score', verification.get('score', 0.0)):.2f}",
                 'status': verification.get('status', 'N/A'),
-                'label': verification.get('label_human', 'None'),
+                'label': verification.get('human_label', 'None'),
                 'company_data': company  # Store full data for detail view
             })
 
@@ -399,16 +456,25 @@ async def refresh_companies_table(container, status_filter):
         # Add row click handler to show detail view
         def on_row_click(e):
             company_data = e.args[1]['company_data']
-            show_company_detail(company_data)
+            # Pass refresh callback to auto-refresh table after labeling
+            async def refresh():
+                await refresh_companies_table(container, status_filter)
+            show_company_detail(company_data, refresh_callback=refresh)
 
         table.on('row-click', on_row_click)
 
 
-def show_company_detail(company: Dict):
-    """Show detailed verification information for a company in a dialog."""
-    verification = company.get('parse_metadata', {}).get('verification', {})
+def show_company_detail(company: Dict, refresh_callback=None):
+    """Show detailed verification information for a company in a dialog.
 
-    with ui.dialog() as dialog, ui.card().classes('w-full max-w-4xl'):
+    Args:
+        company: Company data dictionary
+        refresh_callback: Optional callback to refresh the companies table after labeling
+    """
+    verification = company.get('parse_metadata', {}).get('verification', {})
+    llm_class = verification.get('llm_classification', {})
+
+    with ui.dialog() as dialog, ui.card().classes('w-full max-w-4xl max-h-screen overflow-y-auto'):
         # Header
         with ui.row().classes('w-full items-center justify-between mb-4'):
             ui.label(f'{company["name"]}').classes('text-2xl font-bold')
@@ -419,21 +485,40 @@ def show_company_detail(company: Dict):
         # Company info
         with ui.card().classes('w-full bg-gray-800 mb-4'):
             ui.label('Company Information').classes('text-lg font-bold mb-2')
-            ui.label(f'Website: {company["website"]}').classes('text-sm')
-            ui.label(f'Domain: {company["domain"]}').classes('text-sm')
-            if company['phone']:
-                ui.label(f'Phone: {company["phone"]}').classes('text-sm')
-            if company['email']:
-                ui.label(f'Email: {company["email"]}').classes('text-sm')
-            if company['service_area']:
-                ui.label(f'Service Area: {company["service_area"]}').classes('text-sm')
+            with ui.row().classes('gap-4'):
+                with ui.column():
+                    ui.label(f'Website: {company["website"]}').classes('text-sm')
+                    ui.label(f'Domain: {company["domain"]}').classes('text-sm')
+                    ui.label(f'Source: {company.get("source", "N/A")}').classes('text-sm')
+                with ui.column():
+                    if company.get('phone'):
+                        ui.label(f'Phone: {company["phone"]}').classes('text-sm text-green-300')
+                    if company.get('email'):
+                        ui.label(f'Email: {company["email"]}').classes('text-sm text-green-300')
+                    if company.get('service_area'):
+                        ui.label(f'Service Area: {company["service_area"]}').classes('text-sm')
 
-        # Verification details
+        # Verification scores (expanded)
         with ui.row().classes('w-full gap-4 mb-4'):
             # Score card
             with ui.card().classes('bg-blue-900 p-4'):
-                ui.label('Verification Score').classes('text-sm text-gray-300')
-                ui.label(f'{verification.get("score", 0.0):.2%}').classes('text-3xl font-bold text-blue-200')
+                ui.label('Web Score').classes('text-sm text-gray-300')
+                ui.label(f'{verification.get("score", 0.0):.2%}').classes('text-2xl font-bold text-blue-200')
+
+            # Combined score
+            with ui.card().classes('bg-purple-900 p-4'):
+                ui.label('Combined Score').classes('text-sm text-gray-300')
+                ui.label(f'{verification.get("combined_score", 0.0):.2%}').classes('text-2xl font-bold text-purple-200')
+
+            # Final score (if ML is active)
+            final_score = verification.get('final_score')
+            ml_prob = verification.get('ml_prob')
+            if final_score is not None:
+                with ui.card().classes('bg-indigo-900 p-4'):
+                    ui.label('Final Score').classes('text-sm text-gray-300')
+                    ui.label(f'{final_score:.2%}').classes('text-2xl font-bold text-indigo-200')
+                    if ml_prob is not None:
+                        ui.label(f'ML: {ml_prob:.0%}').classes('text-xs text-indigo-300')
 
             # Status card
             status = verification.get('status', 'unknown')
@@ -441,6 +526,42 @@ def show_company_detail(company: Dict):
             with ui.card().classes(f'bg-{status_colors.get(status, "gray")}-900 p-4'):
                 ui.label('Status').classes('text-sm text-gray-300')
                 ui.label(status.upper()).classes('text-2xl font-bold')
+                if verification.get('needs_review'):
+                    ui.badge('NEEDS REVIEW', color='orange').classes('mt-1')
+
+            # LLM Legitimate
+            is_legit = verification.get('is_legitimate', False)
+            with ui.card().classes(f'bg-{"green" if is_legit else "red"}-900 p-4'):
+                ui.label('LLM Legitimate').classes('text-sm text-gray-300')
+                ui.label('YES' if is_legit else 'NO').classes('text-2xl font-bold')
+
+        # Triage reason (if available)
+        triage_reason = verification.get('triage_reason')
+        if triage_reason:
+            with ui.card().classes('w-full bg-yellow-900 mb-4 p-3'):
+                ui.label('Triage Reason').classes('text-sm font-bold text-yellow-200')
+                ui.label(triage_reason).classes('text-sm text-yellow-100')
+
+        # LLM Classification details
+        if llm_class:
+            with ui.card().classes('w-full bg-gray-800 mb-4'):
+                ui.label('LLM Classification').classes('text-lg font-bold mb-2')
+                with ui.grid(columns=4).classes('w-full gap-2'):
+                    # Type
+                    type_labels = {1: 'Provider', 2: 'Equipment', 3: 'Training', 4: 'Directory', 5: 'Blog', 6: 'Lead Gen'}
+                    llm_type = llm_class.get('type', 0)
+                    ui.label(f'Type: {type_labels.get(llm_type, "Unknown")}').classes('text-sm')
+                    ui.label(f'Confidence: {llm_class.get("confidence", 0):.0%}').classes('text-sm')
+
+                    # Services
+                    pw = '✓' if llm_class.get('pressure_washing') else '✗'
+                    wc = '✓' if llm_class.get('window_cleaning') else '✗'
+                    wr = '✓' if llm_class.get('wood_restoration') else '✗'
+                    ui.label(f'Pressure: {pw} | Window: {wc} | Wood: {wr}').classes('text-sm')
+
+                    # Scope
+                    scope_labels = {1: 'Both', 2: 'Residential', 3: 'Commercial', 4: 'Unclear'}
+                    ui.label(f'Scope: {scope_labels.get(llm_class.get("scope", 4), "N/A")}').classes('text-sm')
 
         # Services detected
         with ui.card().classes('w-full bg-gray-800 mb-4'):
@@ -464,48 +585,117 @@ def show_company_detail(company: Dict):
             else:
                 ui.label('No services detected').classes('text-gray-400 italic')
 
-        # Positive signals
-        with ui.card().classes('w-full bg-gray-800 mb-4'):
-            ui.label('Positive Signals').classes('text-lg font-bold mb-2 text-green-400')
-            positive_signals = verification.get('positive_signals', [])
-            if positive_signals:
-                for signal in positive_signals:
-                    ui.label(f'✓ {signal}').classes('text-sm text-green-300')
-            else:
-                ui.label('None').classes('text-gray-400 italic')
+        # Red flags (from LLM)
+        red_flags = verification.get('red_flags', [])
+        if red_flags:
+            with ui.card().classes('w-full bg-red-900 mb-4'):
+                ui.label(f'Red Flags ({len(red_flags)})').classes('text-lg font-bold mb-2 text-red-200')
+                for flag in red_flags:
+                    ui.label(f'⚠ {flag}').classes('text-sm text-red-300')
 
-        # Negative signals
-        with ui.card().classes('w-full bg-gray-800 mb-4'):
-            ui.label('Negative Signals').classes('text-lg font-bold mb-2 text-red-400')
-            negative_signals = verification.get('negative_signals', [])
-            if negative_signals:
-                for signal in negative_signals:
-                    ui.label(f'✗ {signal}').classes('text-sm text-red-300')
-            else:
-                ui.label('None').classes('text-gray-400 italic')
+        # Quality signals
+        quality_signals = verification.get('quality_signals', [])
+        if quality_signals:
+            with ui.card().classes('w-full bg-green-900 mb-4'):
+                ui.label(f'Quality Signals ({len(quality_signals)})').classes('text-lg font-bold mb-2 text-green-200')
+                for signal in quality_signals:
+                    ui.label(f'✓ {signal}').classes('text-sm text-green-300')
+
+        # Positive/Negative signals (rule-based)
+        with ui.row().classes('w-full gap-4 mb-4'):
+            with ui.card().classes('flex-1 bg-gray-800'):
+                ui.label('Positive Signals').classes('text-md font-bold mb-2 text-green-400')
+                positive_signals = verification.get('positive_signals', [])
+                if positive_signals:
+                    for signal in positive_signals[:5]:
+                        ui.label(f'+ {signal}').classes('text-xs text-green-300')
+                else:
+                    ui.label('None').classes('text-gray-400 italic text-xs')
+
+            with ui.card().classes('flex-1 bg-gray-800'):
+                ui.label('Negative Signals').classes('text-md font-bold mb-2 text-red-400')
+                negative_signals = verification.get('negative_signals', [])
+                if negative_signals:
+                    for signal in negative_signals[:5]:
+                        ui.label(f'- {signal}').classes('text-xs text-red-300')
+                else:
+                    ui.label('None').classes('text-gray-400 italic text-xs')
 
         # Manual labeling actions
         ui.separator().classes('my-4')
-        ui.label('Manual Override').classes('text-lg font-bold mb-2')
+        ui.label('Human Label').classes('text-lg font-bold mb-2')
 
-        current_label = verification.get('label_human', None)
+        current_label = verification.get('human_label')
         if current_label:
             ui.label(f'Current label: {current_label}').classes('text-sm text-blue-400 mb-2')
+            if verification.get('human_notes'):
+                ui.label(f'Notes: {verification.get("human_notes")}').classes('text-xs text-gray-400 mb-2')
 
-        with ui.row().classes('gap-2'):
-            async def mark_target():
-                mark_company_label(company['id'], 'target')
-                ui.notify(f'Marked as TARGET: {company["name"]}', type='positive')
-                dialog.close()
+        # Label buttons - more granular options
+        with ui.column().classes('w-full gap-2'):
+            with ui.row().classes('gap-2'):
+                async def mark_provider():
+                    mark_company_label(company['id'], 'provider')
+                    ui.notify(f'Labeled as PROVIDER: {company["name"]}', type='positive')
+                    dialog.close()
+                    # Refresh the companies table to remove from review queue
+                    if refresh_callback:
+                        await refresh_callback()
 
-            async def mark_non_target():
-                mark_company_label(company['id'], 'non_target')
-                ui.notify(f'Marked as NON-TARGET: {company["name"]}', type='warning')
-                dialog.close()
+                async def mark_non_provider():
+                    mark_company_label(company['id'], 'non_provider')
+                    ui.notify(f'Labeled as NON-PROVIDER: {company["name"]}', type='warning')
+                    dialog.close()
+                    # Refresh the companies table to remove from review queue
+                    if refresh_callback:
+                        await refresh_callback()
 
-            ui.button('Mark as TARGET', on_click=mark_target, color='positive', icon='check_circle')
-            ui.button('Mark as NON-TARGET', on_click=mark_non_target, color='negative', icon='cancel')
-            ui.button('Close', on_click=dialog.close, color='secondary').props('flat')
+                ui.button('✓ Provider', on_click=mark_provider, color='positive').props('size=sm')
+                ui.button('✗ Non-Provider', on_click=mark_non_provider, color='negative').props('size=sm')
+
+            with ui.row().classes('gap-2'):
+                async def mark_directory():
+                    mark_company_label(company['id'], 'directory')
+                    ui.notify(f'Labeled as DIRECTORY: {company["name"]}', type='info')
+                    dialog.close()
+                    # Refresh the companies table to remove from review queue
+                    if refresh_callback:
+                        await refresh_callback()
+
+                async def mark_agency():
+                    mark_company_label(company['id'], 'agency')
+                    ui.notify(f'Labeled as AGENCY: {company["name"]}', type='info')
+                    dialog.close()
+                    # Refresh the companies table to remove from review queue
+                    if refresh_callback:
+                        await refresh_callback()
+
+                async def mark_blog():
+                    mark_company_label(company['id'], 'blog')
+                    ui.notify(f'Labeled as BLOG: {company["name"]}', type='info')
+                    dialog.close()
+                    # Refresh the companies table to remove from review queue
+                    if refresh_callback:
+                        await refresh_callback()
+
+                async def mark_franchise():
+                    mark_company_label(company['id'], 'franchise')
+                    ui.notify(f'Labeled as FRANCHISE: {company["name"]}', type='info')
+                    dialog.close()
+                    # Refresh the companies table to remove from review queue
+                    if refresh_callback:
+                        await refresh_callback()
+
+                ui.button('Directory', on_click=mark_directory).props('size=sm flat')
+                ui.button('Agency', on_click=mark_agency).props('size=sm flat')
+                ui.button('Blog', on_click=mark_blog).props('size=sm flat')
+                ui.button('Franchise', on_click=mark_franchise).props('size=sm flat')
+
+            # Open website button
+            with ui.row().classes('gap-2 mt-2'):
+                ui.button('Open Website', icon='open_in_new',
+                         on_click=lambda: ui.run_javascript(f'window.open("{company["website"]}", "_blank")')).props('flat')
+                ui.button('Close', on_click=dialog.close, color='secondary').props('flat')
 
     dialog.open()
 
@@ -694,14 +884,140 @@ def verification_page():
                 ui.label('Needs Review').classes('text-xs text-gray-300')
                 ui.label(str(stats['needs_review'])).classes('text-2xl font-bold text-yellow-200')
 
-        with ui.grid(columns=2).classes('w-full gap-4 mt-4'):
+        with ui.grid(columns=3).classes('w-full gap-4 mt-4'):
             with ui.card().classes('p-4 bg-blue-900'):
-                ui.label('Labeled: Target').classes('text-xs text-gray-300')
-                ui.label(str(stats['labeled_target'])).classes('text-2xl font-bold text-blue-200')
+                ui.label('Labeled: Provider').classes('text-xs text-gray-300')
+                ui.label(str(stats['labeled_provider'])).classes('text-2xl font-bold text-blue-200')
 
             with ui.card().classes('p-4 bg-purple-900'):
-                ui.label('Labeled: Non-Target').classes('text-xs text-gray-300')
-                ui.label(str(stats['labeled_non_target'])).classes('text-2xl font-bold text-purple-200')
+                ui.label('Labeled: Non-Provider').classes('text-xs text-gray-300')
+                ui.label(str(stats['labeled_non_provider'])).classes('text-2xl font-bold text-purple-200')
+
+            with ui.card().classes('p-4 bg-gray-700'):
+                ui.label('Total Labeled').classes('text-xs text-gray-300')
+                ui.label(str(stats['total_labeled'])).classes('text-2xl font-bold text-gray-200')
+
+    # Training Stats & ML Model Section
+    with ui.card().classes('w-full mb-4'):
+        ui.label('Training & ML Model').classes('text-xl font-bold mb-4')
+
+        # Get training label stats
+        training_stats = get_training_label_stats()
+        model_info = get_model_info()
+
+        with ui.row().classes('w-full gap-4'):
+            # Label counts per category
+            with ui.card().classes('flex-1 bg-gray-800 p-4'):
+                ui.label('Labeled Training Data').classes('text-md font-bold mb-2')
+
+                if training_stats['labels']:
+                    # Define label colors
+                    label_colors = {
+                        'provider': 'text-green-300',
+                        'non_provider': 'text-red-300',
+                        'directory': 'text-orange-300',
+                        'agency': 'text-yellow-300',
+                        'blog': 'text-blue-300',
+                        'franchise': 'text-purple-300'
+                    }
+
+                    for label, count in training_stats['labels'].items():
+                        color = label_colors.get(label, 'text-gray-300')
+                        with ui.row().classes('justify-between'):
+                            ui.label(label.replace('_', ' ').title()).classes(f'text-sm {color}')
+                            ui.label(str(count)).classes(f'text-sm font-bold {color}')
+
+                    ui.separator().classes('my-2')
+                    with ui.row().classes('justify-between'):
+                        ui.label('Total').classes('text-sm font-bold')
+                        ui.label(str(training_stats['total'])).classes('text-sm font-bold text-white')
+                else:
+                    ui.label('No labeled data yet').classes('text-gray-400 italic')
+                    ui.label('Label companies in the review queue to create training data').classes('text-xs text-gray-500')
+
+            # ML Model Status
+            with ui.card().classes('flex-1 bg-gray-800 p-4'):
+                ui.label('ML Classifier Status').classes('text-md font-bold mb-2')
+
+                if model_info:
+                    ui.label(f"Model Type: {model_info.get('model_type', 'unknown')}").classes('text-sm text-green-300')
+                    ui.label(f"Trained: {model_info.get('trained_at', 'unknown')[:19]}").classes('text-sm')
+                    ui.label(f"Training Samples: {model_info.get('n_train', 'N/A')}").classes('text-sm')
+                    ui.label(f"Validation Samples: {model_info.get('n_val', 'N/A')}").classes('text-sm')
+
+                    accuracy = model_info.get('accuracy')
+                    if accuracy:
+                        ui.label(f"Accuracy: {accuracy:.1%}").classes('text-sm text-blue-300')
+
+                    provider_recall = model_info.get('provider_recall')
+                    if provider_recall:
+                        color = 'text-green-300' if provider_recall >= 0.7 else 'text-yellow-300' if provider_recall >= 0.5 else 'text-red-300'
+                        ui.label(f"Provider Recall: {provider_recall:.1%}").classes(f'text-sm {color}')
+
+                    provider_precision = model_info.get('provider_precision')
+                    if provider_precision:
+                        ui.label(f"Provider Precision: {provider_precision:.1%}").classes('text-sm')
+
+                    ui.badge('ACTIVE', color='positive').classes('mt-2')
+                else:
+                    ui.label('No ML model loaded').classes('text-gray-400 italic')
+                    ui.label('Train a model using the scripts:').classes('text-xs text-gray-500 mt-2')
+                    ui.code('python scripts/export_verification_training_data.py\npython scripts/train_verification_classifier.py').classes('text-xs mt-1')
+
+        # Training actions
+        with ui.row().classes('gap-2 mt-4'):
+            async def export_training_data():
+                """Export training data to JSONL."""
+                ui.notify('Exporting training data...', type='info')
+                try:
+                    import subprocess
+                    result = subprocess.run(
+                        [sys.executable, 'scripts/export_verification_training_data.py'],
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        cwd=os.getcwd()
+                    )
+                    if result.returncode == 0:
+                        # Parse output to get count
+                        output = result.stdout
+                        ui.notify(f'Training data exported successfully!', type='positive')
+                    else:
+                        ui.notify(f'Export failed: {result.stderr}', type='negative')
+                except Exception as e:
+                    ui.notify(f'Export error: {e}', type='negative')
+
+            async def train_classifier():
+                """Train the ML classifier."""
+                if training_stats['total'] < 10:
+                    ui.notify('Need at least 10 labeled examples to train', type='warning')
+                    return
+
+                ui.notify('Training classifier (this may take a moment)...', type='info')
+                try:
+                    import subprocess
+                    result = subprocess.run(
+                        [sys.executable, 'scripts/train_verification_classifier.py', '--binary'],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        cwd=os.getcwd()
+                    )
+                    if result.returncode == 0:
+                        # Reload the model
+                        reload_model()
+                        ui.notify('Classifier trained successfully! Reload page to see updated stats.', type='positive')
+                    else:
+                        ui.notify(f'Training failed: {result.stderr[-500:]}', type='negative')
+                except Exception as e:
+                    ui.notify(f'Training error: {e}', type='negative')
+
+            ui.button('Export Training Data', icon='file_download', on_click=export_training_data).props('flat')
+            ui.button('Train Classifier', icon='model_training', on_click=train_classifier,
+                     color='primary' if training_stats['total'] >= 10 else 'grey').props('flat')
+
+            if training_stats['total'] < 10:
+                ui.label(f"Need {10 - training_stats['total']} more labels to train").classes('text-xs text-yellow-400 self-center')
 
     # Worker Pool Controls (integrated batch verification)
     with ui.card().classes('w-full mb-4'):
@@ -862,6 +1178,21 @@ def verification_page():
 
         # Load last 50 lines on page load
         log_viewer.load_last_n_lines(50)
+
+        # Auto-detect running workers and start tailing
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['pgrep', '-cf', 'verification_worker'],
+                capture_output=True, text=True, timeout=5
+            )
+            worker_count = int(result.stdout.strip()) if result.returncode == 0 else 0
+            if worker_count > 0:
+                verification_state.worker_pool_running = True
+                log_viewer.start_tailing()
+                ui.notify(f'Detected {worker_count} running verification workers', type='info')
+        except Exception:
+            pass
 
     # Companies review table
     with ui.card().classes('w-full'):

@@ -1,121 +1,132 @@
-# URL Verification System – Overview & High‑Level Plan
+# 01 – URL Verification System Overview (Continuous Scrapers Edition)
 
-**Context for Claude**  
-You are working inside a repository that already scrapes URLs and uses an LLM to decide whether a site is a real *service provider* for:
-- Pressure washing
-- Window washing
-- Wood restoration
+**Audience:** Claude (or another AI dev) working inside the `washdb-bot` repo.  
+**Goal:** Explain how the new continuous Yellow Pages + Google scrapers fit with the verification pipeline, and where to implement improvements.
 
-The current issues to fix:
+Repo highlights relevant to verification:
 
-- **False negatives**
-  - Tiny / minimal sites (one‑page, little text)
-  - Sites with JS‑rendered content or contact info
-  - Niche / local terminology not in generic corpora
-- **False positives**
-  - Blogs & tutorials
-  - Marketing / SEO agencies
-  - Franchise opportunity & “work for us” microsites
-  - Generic templates or placeholder business pages
+- **Continuous discovery**
+  - `scrape_yp/` + `cli_crawl_yp.py` + `washbot-yp-scraper.service`
+  - `scrape_google/` + `cli_crawl_google_city_first.py` + `washbot-google-scraper.service`
+  - These run 24/7 and upsert companies into the `companies` table via `db/save_discoveries.py` and SQLAlchemy models in `db/models.py`.
+- **Verification pipeline (current)**
+  - Manual / batch: `db/verify_company_urls.py`
+  - Continuous worker(s): `verification/verification_worker.py` + `verification/verification_worker_pool.py`
+  - LLM stack: `scrape_site/llm_verifier.py` + `scrape_site/service_verifier.py`
+  - Shared GPU queue: `verification/llm_service.py` + `verification/llm_queue.py`
+  - Website scraping & parsing: `scrape_site/site_scraper.py` + `scrape_site/site_parse.py`
 
-The owner is OK with:
+The **plan from the previous docs is still correct** in spirit:
 
-- Adding a **“needs_review”** state for borderline cases  
-- A **slower, gold‑standard path** for tricky URLs  
-- Logging cases for **human review + future training**  
-- Using an LLM more heavily if that improves accuracy
+- Crawl website → extract rich signals → heuristics → LLM JSON classification → final triage (`accept / reject / needs_review`) → human review loop → training + evaluation.
+
+But now we need to **anchor it to this repo’s actual code** and the fact that YP + Google run continuously.
 
 ---
 
-## 1. Target Architecture (high level)
+## 1. High-Level Data Flow (as it exists now)
 
-Implement a **multi‑stage verification pipeline** for each URL:
+1. **Continuous discovery (YP + Google)**
+   - YP and Google crawlers run as systemd services:
+     - `washbot-yp-scraper.service`
+     - `washbot-google-scraper.service`
+   - They write discovered businesses into `companies` via `db/models.Company` and helpers in `db/save_discoveries.py`.
+   - Discovery metadata lives in `Company.parse_metadata` JSONB:
+     - `parse_metadata['yp_filter']`
+     - `parse_metadata['google_filter']`
+     - etc.
 
-1. **Fetch & Extract**
-   - Fetch main page (and a few key internal pages).
-   - Handle JS‑rendered sites using a headless browser fallback.
-   - Normalize & store:
-     - Main text content (cleaned)
-     - Title, meta description, headings
-     - Outgoing & internal links
-     - Contact info blocks, address, phone, email
-     - Basic HTML features (forms, CTAs, menu labels).
+2. **Verification workers (continuous)**
+   - `verification/verification_worker.py`:
+     - `acquire_company_for_verification(...)` selects rows from `companies` where:
+       - `website IS NOT NULL`
+       - `parse_metadata['verification']` is missing or incomplete.
+     - Marks them as `status = 'in_progress'` in `parse_metadata['verification']`.
+     - Fetches homepage HTML via `scrape_site.site_scraper.fetch_page`.
+     - Parses HTML via `scrape_site.site_parse.parse_site_content`.
+     - Runs service verification via `scrape_site.service_verifier.create_verifier().verify_company(...)`.
+     - Combines discovery + website + reviews via `db.verify_company_urls.calculate_combined_score`.
+     - Calls `verification.update_company_verification(...)` to write back:
+       - `parse_metadata['verification'] = { ... }`
+       - `companies.active` flag.
 
-2. **Feature & Heuristic Scoring (lightweight, deterministic)**
-   - Compute structured features:
-     - Domain patterns & URL path patterns
-     - Presence of service‑intent phrases vs blog/agency/franchise cues
-     - Presence of pricing, “Get a quote / schedule service”, service area, service list
-     - Presence of lead‑gen or “find a pro” aggregator language.
-   - Produce a **heuristic_score** and a preliminary label
-     - `HEUR_PROBABLY_PROVIDER`
-     - `HEUR_PROBABLY_NOT_PROVIDER`
-     - `HEUR_UNCERTAIN`
+   - `verification/verification_worker_pool.py` manages multiple workers and uses `llm_queue` to keep the GPU busy.
 
-3. **LLM Classification (rich, JSON output)**
-   - Build a structured prompt with:
-     - Summarized page content
-     - Extracted features
-     - Business‑like signals (NAP, CTAs, service list)
-   - Ask the LLM for a **strict JSON** classification with fields like:
-     - `is_pressure_washing_provider`
-     - `is_window_cleaning_provider`
-     - `is_wood_restoration_provider`
-     - `is_directory_or_aggregator`
-     - `is_marketing_or_agency`
-     - `is_blog_or_content_only`
-     - `is_franchise_opportunity`
-     - `overall_label` (one of: `service_provider`, `directory`, `agency`, `blog`, `franchise`, `unknown`)
-     - `confidence_score` (0–1)
-     - `needs_review` (bool)
-     - `reason_short` (one short sentence).
-
-4. **Decision Logic & “Needs Review”**
-   - Combine **heuristics + LLM**:
-     - If both strongly agree → auto decision.
-     - If they disagree or confidence < threshold → `needs_review = true`.
-   - Final states:
-     - `ACCEPTED_PROVIDER`
-     - `REJECTED_NON_PROVIDER`
-     - `NEEDS_REVIEW`
-
-5. **Human Review + Training Data**
-   - Store all inputs & outputs for URLs, especially ones marked `needs_review` or mis‑classified.
-   - Provide a simple way (CLI, admin script, or UI) to:
-     - See pending reviews
-     - Set final human label
-     - Optionally correct categories (e.g. “actually a franchise microsite”).
-   - Persist this as a **labeled dataset** (ideal for fine‑tuning or training a smaller classifier).
-
-6. **Evaluation & Monitoring**
-   - Add an offline evaluation script:
-     - Run the pipeline on a labeled dataset.
-     - Compute precision/recall for each class and per‑segment (tiny sites vs JS sites vs directories).
-   - Log & track:
-     - Confusion between `service_provider` vs `agency` vs `directory`
-     - False negatives on small sites
-     - False positives on content sites.
+3. **Batch / manual verification**
+   - `db/verify_company_urls.py` provides a CLI job that does a similar flow as the worker, but in batch.
+   - This is now effectively **part of the test suite / manual tools**, not 24/7.
 
 ---
 
-## 2. Implementation Steps (what other docs will cover)
+## 2. What needs to change (conceptually)
 
-The remaining Markdown docs in this folder break implementation into clear chunks:
+The main architectural improvements we still want (adapted to this repo):
+
+1. **Richer website context for the LLM**
+   - Use more than just naïve truncation of the services/about/homepage text in `scrape_site/llm_verifier.py::_build_context`.
+   - Optionally use `scrape_site/site_scraper.scrape_website` to pull Contact/About/Services pages when the homepage is too thin.
+
+2. **Explicit heuristics + triage logic**
+   - Today, `scrape_site/service_verifier.py` already has:
+     - Rule-based scoring
+     - LLM integration
+     - Red flags for agencies / blogs / directories / franchise-type sites
+     - A `status` field and `score` field.
+   - But the DB update functions (`db/verify_company_urls.update_company_verification` and `verification.verification_worker.update_company_verification`) **throw away** this status and rely only on `is_legitimate`.
+   - We want:
+     - A true three-way outcome:
+       - `accepted_provider` → `active = true`
+       - `rejected_non_provider` → `active = false`
+       - `needs_review` → `active = false`, `parse_metadata['verification']['needs_review'] = true`
+     - Thresholds that use:
+       - `verification_result['score']`
+       - `calculate_combined_score(...)`
+       - LLM legitimacy + red flags.
+
+3. **“Needs review” + training loop**
+   - Log every decision (especially `needs_review`) into `parse_metadata['verification']`.
+   - Expose them in your GUI / CLI review tools (this repo already has NiceGUI and diagnostics wiring).
+   - Add scripts to export labeled data for training a small classifier or for prompt refinement.
+
+4. **Evaluation + monitoring**
+   - Leverage the existing logging and test infrastructure (`tests/`, `test_hybrid_verification.py`, etc.) to build an evaluation harness that runs the full pipeline against labeled companies.
+
+---
+
+## 3. How the updated docs map to this repo
+
+The rest of the Markdown files in this zip are updated specifically for this codebase:
 
 1. **02-crawling-and-content-extraction-improvements.md**
-   - Make sure we get enough usable text & signals per domain.
-   - Add JS‑rendering fallback for pages where static HTML is too empty.
+   - Talks about tightening `fetch_page`, `parse_site_content`, and optionally using `scrape_site.site_scraper.scrape_website` when the homepage is too thin.
+   - Explains how to reuse the existing multi-page discovery (contact/about/services) only where it adds value.
 
 2. **03-heuristics-and-rule-based-filtering.md**
-   - Implement deterministic rules that quickly eliminate obvious non‑providers and boost obvious providers.
+   - Maps heuristic ideas to the actual `scrape_site/service_verifier.py` module:
+     - Where to add / adjust positive/negative signals.
+     - How to ensure blogs, agencies, directories, and franchise sites are penalized consistently.
 
 3. **04-llm-verification-and-scoring-pipeline.md**
-   - Design the LLM prompts, JSON schema, validation, retry logic, and scoring fusion with heuristics.
+   - Grounded in `scrape_site/llm_verifier.py`, `verification/llm_service.py`, and `verification/llm_queue.py`.
+   - Shows how to:
+     - Improve `_build_context`.
+     - Keep using the queue-based LLM service.
+     - Combine LLM outputs with heuristics + discovery to get a final triage decision.
 
 4. **05-human-review-loop-and-training-data.md**
-   - Implement logging of decisions, a review queue, and storage of human labels for training.
+   - Uses `parse_metadata['verification']` as the canonical store of decisions + notes.
+   - Shows how to extend that JSON and add scripts for:
+     - Review queues.
+     - Exporting labeled datasets.
 
 5. **06-evaluation-monitoring-and-configuration.md**
-   - Build test harnesses, metrics, and configuration toggles (thresholds, rendering limits, etc.).
+   - Focuses on:
+     - Configuration via `.env` and constants used in the workers.
+     - Evaluation scripts you can add under `scripts/` or `tests/`.
+     - Logging and monitoring patterns that fit your systemd services and logrotate config.
 
-Each doc is written so you can open it next to the codebase and implement the changes step‑by‑step.
+You can drop this zip into Claude, say:
+
+> “You’re working in `washdb-bot`. Use these docs to implement the verification upgrades,”
+
+and it will have repo-specific guidance instead of generic pseudo-architecture.

@@ -66,6 +66,9 @@ def worker_main(
     # Set up worker-specific logger
     worker_logger = setup_logging(f"worker_{worker_id}", log_file=f"logs/state_worker_{worker_id}.log")
 
+    # Set WORKER_ID environment variable for browser pool isolation
+    os.environ["WORKER_ID"] = str(worker_id)
+
     worker_logger.info("="*70)
     worker_logger.info(f"WORKER {worker_id} STARTING")
     worker_logger.info("="*70)
@@ -133,7 +136,8 @@ def worker_main(
                         min_score=config.get("min_confidence_score", 40.0),
                         include_sponsored=config.get("include_sponsored", False),
                         use_fallback_on_404=True,
-                        monitor=monitor
+                        monitor=monitor,
+                        worker_id=worker_id
                     )
 
                     # Save results to database

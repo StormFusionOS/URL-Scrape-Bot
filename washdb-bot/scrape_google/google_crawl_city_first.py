@@ -40,6 +40,8 @@ from scrape_google.google_stealth import (
     get_scroll_delays,
     SessionBreakManager,
 )
+from scrape_google.browser_pool import get_browser_pool
+from scrape_google.html_cache import get_html_cache
 
 # Initialize logger
 logger = get_logger("google_crawl_city_first")
@@ -48,15 +50,17 @@ logger = get_logger("google_crawl_city_first")
 async def fetch_google_maps_search(
     search_query: str,
     max_results: int = 20,
-    max_retries: int = 3
+    max_retries: int = 3,
+    worker_id: int = 0
 ) -> tuple[str, list[dict]]:
     """
-    Fetch Google Maps search results for a query using Playwright.
+    Fetch Google Maps search results for a query using Playwright with browser pooling.
 
     Args:
         search_query: Full search query (e.g., "car wash near Seattle, WA")
         max_results: Maximum number of results to extract
         max_retries: Maximum number of retry attempts
+        worker_id: Worker ID for browser pool isolation (default: 0)
 
     Returns:
         Tuple of (html_content, results_list)
@@ -78,112 +82,73 @@ async def fetch_google_maps_search(
     last_exception = None
 
     for attempt in range(max_retries):
+        # Get browser pool (persistent browsers)
+        pool = await get_browser_pool()
+        page, context = await pool.get_page(worker_id)
+
         try:
-            async with async_playwright() as p:
-                # Launch browser with anti-detection flags
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=[
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-features=IsolateOrigins,site-per-process',
-                        '--disable-web-security',
-                        '--no-sandbox',
-                    ]
-                )
+            # Navigate to Google Maps search
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-                # Get randomized context parameters
-                context_params = get_playwright_context_params()
-                context = await browser.new_context(**context_params)
+            # Wait for search results to load
+            try:
+                # Wait for the results container
+                await page.wait_for_selector('div[role="feed"]', timeout=10000)
+            except PlaywrightTimeoutError:
+                logger.warning("Search results container not found")
+                # Continue anyway, might still have results
 
-                # Add all enhanced anti-detection scripts
-                init_scripts = get_enhanced_playwright_init_scripts()
-                for script in init_scripts:
-                    await context.add_init_script(script)
+            # Simulate human behavior: scroll to load more results
+            scroll_delays = get_scroll_delays()
+            results_loaded = 0
 
-                page = await context.new_page()
-
+            for i, scroll_delay in enumerate(scroll_delays):
+                # Scroll within the results feed
                 try:
-                    # Navigate to Google Maps search
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    feed = await page.query_selector('div[role="feed"]')
+                    if feed:
+                        # Scroll to bottom of feed
+                        await page.evaluate('''
+                            (feed) => {
+                                const scrollEl = feed.parentElement;
+                                if (scrollEl) {
+                                    scrollEl.scrollTop = scrollEl.scrollHeight;
+                                }
+                            }
+                        ''', feed)
 
-                    # Wait for search results to load
-                    try:
-                        # Wait for the results container
-                        await page.wait_for_selector('div[role="feed"]', timeout=10000)
-                    except PlaywrightTimeoutError:
-                        logger.warning("Search results container not found")
-                        # Continue anyway, might still have results
+                    # Wait for new results to load
+                    await asyncio.sleep(scroll_delay)
 
-                    # Simulate human behavior: scroll to load more results
-                    scroll_delays = get_scroll_delays()
-                    results_loaded = 0
+                    # Count current results
+                    result_cards = await page.query_selector_all('div[role="feed"] > div > div > a')
+                    results_loaded = len(result_cards)
 
-                    for i, scroll_delay in enumerate(scroll_delays):
-                        # Scroll within the results feed
-                        try:
-                            feed = await page.query_selector('div[role="feed"]')
-                            if feed:
-                                # Scroll to bottom of feed
-                                await page.evaluate('''
-                                    (feed) => {
-                                        const scrollEl = feed.parentElement;
-                                        if (scrollEl) {
-                                            scrollEl.scrollTop = scrollEl.scrollHeight;
-                                        }
-                                    }
-                                ''', feed)
+                    logger.debug(f"Scroll {i+1}: {results_loaded} results loaded")
 
-                            # Wait for new results to load
-                            await asyncio.sleep(scroll_delay)
+                    # Stop scrolling if we have enough results
+                    if results_loaded >= max_results:
+                        break
 
-                            # Count current results
-                            result_cards = await page.query_selector_all('div[role="feed"] > div > div > a')
-                            results_loaded = len(result_cards)
+                except Exception as e:
+                    logger.warning(f"Error during scroll {i+1}: {e}")
+                    break
 
-                            logger.debug(f"Scroll {i+1}: {results_loaded} results loaded")
+            # Simulate reading the page
+            html_preview = await page.content()
+            content_length = len(html_preview) // 2
+            reading_delay = get_human_reading_delay(min(content_length, 2000))
+            await asyncio.sleep(reading_delay * random.uniform(0.3, 0.6))
 
-                            # Stop scrolling if we have enough results
-                            if results_loaded >= max_results:
-                                break
+            # Extract business cards from search results
+            results = await extract_search_results(page, max_results)
 
-                        except Exception as e:
-                            logger.warning(f"Error during scroll {i+1}: {e}")
-                            break
+            # Get final HTML
+            html = await page.content()
 
-                    # Simulate reading the page
-                    html_preview = await page.content()
-                    content_length = len(html_preview) // 2
-                    reading_delay = get_human_reading_delay(min(content_length, 2000))
-                    await asyncio.sleep(reading_delay * random.uniform(0.3, 0.6))
+            logger.info(f"Extracted {len(results)} business cards from search")
 
-                    # Extract business cards from search results
-                    results = await extract_search_results(page, max_results)
-
-                    # Get final HTML
-                    html = await page.content()
-
-                    logger.info(f"Extracted {len(results)} business cards from search")
-
-                    return html, results
-
-                finally:
-                    # Close resources in correct order: page → context → browser
-                    try:
-                        if page:
-                            await page.close()
-                    except Exception as e:
-                        logger.debug(f"Error closing page: {e}")
-
-                    try:
-                        if context:
-                            await context.close()
-                    except Exception as e:
-                        logger.debug(f"Error closing context: {e}")
-
-                    try:
-                        await browser.close()
-                    except Exception as e:
-                        logger.debug(f"Error closing browser: {e}")
+            return html, results
 
         except Exception as e:
             last_exception = e
@@ -198,6 +163,19 @@ async def fetch_google_maps_search(
                 # Last attempt failed
                 logger.error(f"All {max_retries} fetch attempts failed")
                 raise last_exception
+        finally:
+            # Close context and page (browser persists in pool)
+            try:
+                if page:
+                    await page.close()
+            except Exception as e:
+                logger.debug(f"Error closing page: {e}")
+
+            try:
+                if context:
+                    await context.close()
+            except Exception as e:
+                logger.debug(f"Error closing context: {e}")
 
 
 async def extract_search_results(page, max_results: int) -> list[dict]:
@@ -410,13 +388,14 @@ async def crawl_single_target(
     session,
     scrape_details: bool = True,
     save_to_db: bool = True,
+    worker_id: int = 0,
 ) -> tuple[list[dict], dict]:
     """
-    Crawl a single target (city × category).
+    Crawl a single target (city × category) with browser pooling.
 
     Process:
     1. Update target status to IN_PROGRESS
-    2. Fetch Google Maps search results
+    2. Fetch Google Maps search results using persistent browser pool
     3. Extract business cards
     4. Optionally scrape detailed info for each business
     5. Check for duplicates by place_id
@@ -428,6 +407,7 @@ async def crawl_single_target(
         session: SQLAlchemy session
         scrape_details: Whether to scrape detailed info for each business
         save_to_db: Whether to save results to database
+        worker_id: Worker ID for browser pool isolation (default: 0)
 
     Returns:
         Tuple of (accepted_results, stats_dict)
@@ -456,10 +436,11 @@ async def crawl_single_target(
     business_filter = GoogleFilter()
 
     try:
-        # Fetch search results
+        # Fetch search results (using browser pool)
         html, search_results = await fetch_google_maps_search(
             search_query=target.search_query,
-            max_results=target.max_results
+            max_results=target.max_results,
+            worker_id=worker_id
         )
 
         total_found = len(search_results)

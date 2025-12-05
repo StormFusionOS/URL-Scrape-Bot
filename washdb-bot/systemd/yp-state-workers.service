@@ -1,0 +1,26 @@
+[Unit]
+Description=YP State Worker Pool (Optimized with Browser Pooling)
+After=network.target postgresql.service redis.service
+
+[Service]
+Type=simple
+User=rivercityscrape
+Group=rivercityscrape
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+Environment="PATH=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+
+# Run the new optimized state worker pool
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python -m scrape_yp.state_worker_pool
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Logging (both journal and file for GUI live output)
+StandardOutput=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/yp_workers.log
+StandardError=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/yp_workers.log
+SyslogIdentifier=yp-state-workers
+
+[Install]
+WantedBy=multi-user.target

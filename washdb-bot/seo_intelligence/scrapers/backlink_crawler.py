@@ -10,16 +10,20 @@ Features:
 - Store in backlinks and referring_domains tables
 
 Per SCRAPING_NOTES.md:
-- Use Tier C rate limits for general web crawling
+- Use YP-style stealth tactics (2-5s delays, human behavior simulation)
 - Track anchor text and link context
 - Aggregate at domain level for LAS calculation
 """
 
 import os
 import json
+import sys
+import time
+import random
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
+from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
@@ -28,6 +32,18 @@ from sqlalchemy.orm import Session
 from seo_intelligence.scrapers.base_scraper import BaseScraper
 from seo_intelligence.services import get_task_logger
 from runner.logging_setup import get_logger
+
+# Import YP stealth features for anti-detection
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from scrape_yp.yp_stealth import (
+    get_playwright_context_params,
+    human_delay,
+    get_exponential_backoff_delay,
+    get_enhanced_playwright_init_scripts,
+    get_human_reading_delay,
+    get_scroll_delays,
+    SessionBreakManager,
+)
 
 # Load environment
 load_dotenv()
@@ -49,7 +65,7 @@ class BacklinkCrawler(BaseScraper):
         use_proxy: bool = False,  # Disabled: datacenter proxies get detected
     ):
         """
-        Initialize backlink crawler.
+        Initialize backlink crawler with YP-style stealth features.
 
         Args:
             headless: Run browser in headless mode
@@ -57,7 +73,7 @@ class BacklinkCrawler(BaseScraper):
         """
         super().__init__(
             name="backlink_crawler",
-            tier="C",  # Standard rate limits
+            tier="D",  # Using Tier D (8-15s) but will override with custom YP-style delays
             headless=headless,
             respect_robots=False,  # Disabled: need to crawl all sources
             use_proxy=use_proxy,
@@ -73,7 +89,36 @@ class BacklinkCrawler(BaseScraper):
             self.engine = None
             logger.warning("DATABASE_URL not set - database storage disabled")
 
-        logger.info("BacklinkCrawler initialized (tier=C)")
+        # Session break manager (take breaks after N requests to appear human)
+        self.session_manager = SessionBreakManager(
+            requests_per_session=50,  # Take break after 50 requests
+            short_break_range=(30, 60),  # 30-60 second breaks
+            long_break_range=(120, 300),  # 2-5 minute breaks every 5 sessions
+        )
+        self.request_count = 0
+
+        logger.info("BacklinkCrawler initialized with YP-style stealth features")
+
+    def _get_stealth_context_options(self) -> dict:
+        """
+        Override base method to use YP-style randomized context parameters.
+
+        Returns:
+            dict: Playwright context options with YP-style stealth features
+        """
+        # Use YP stealth module for consistent anti-detection across crawlers
+        yp_context_params = get_playwright_context_params()
+
+        # Merge with any additional base scraper params
+        base_options = super()._get_stealth_context_options()
+
+        # YP params take precedence for key stealth features
+        merged_options = {**base_options, **yp_context_params}
+
+        logger.debug(f"Using YP-style context: viewport={merged_options.get('viewport')}, "
+                    f"timezone={merged_options.get('timezone_id')}")
+
+        return merged_options
 
     def _get_or_create_referring_domain(
         self,
@@ -416,7 +461,7 @@ class BacklinkCrawler(BaseScraper):
         target_domains: List[str],
     ) -> List[Dict[str, Any]]:
         """
-        Check a single page for backlinks to target domains.
+        Check a single page for backlinks to target domains using YP-style stealth.
 
         Args:
             source_url: URL to check for backlinks
@@ -427,8 +472,21 @@ class BacklinkCrawler(BaseScraper):
         """
         logger.info(f"Checking {source_url} for backlinks to {target_domains}")
 
+        # Check if we need a session break (YP-style human behavior)
+        self.request_count += 1
+        self.session_manager.check_break(self.request_count)
+
+        # Apply YP-style human delay BEFORE creating browser (2-5 seconds + jitter)
+        human_delay(min_seconds=2.0, max_seconds=5.0, jitter=0.5)
+
         try:
             with self.browser_session() as (browser, context, page):
+                # Add YP-style enhanced anti-detection scripts to the page
+                init_scripts = get_enhanced_playwright_init_scripts()
+                for script in init_scripts:
+                    page.add_init_script(script)
+
+                # Fetch page
                 html = self.fetch_page(
                     url=source_url,
                     page=page,
@@ -440,6 +498,28 @@ class BacklinkCrawler(BaseScraper):
                     logger.warning(f"Failed to fetch {source_url}")
                     return []
 
+                # Simulate human behavior: scroll through page (YP-style)
+                try:
+                    scroll_delays = get_scroll_delays()
+                    for i, scroll_delay in enumerate(scroll_delays):
+                        # Scroll down in increments (simulate reading)
+                        scroll_amount = random.randint(200, 600)
+                        page.evaluate(f"window.scrollBy(0, {scroll_amount})")
+                        time.sleep(scroll_delay)
+
+                    # Simulate human reading the page (YP-style)
+                    content_length = len(html) // 2  # Rough estimate of visible content
+                    reading_delay = get_human_reading_delay(min(content_length, 2000))
+
+                    # Take a portion of the reading delay (we already scrolled)
+                    remaining_delay = reading_delay * random.uniform(0.3, 0.6)
+                    time.sleep(remaining_delay)
+
+                except Exception as e:
+                    logger.debug(f"Error during human behavior simulation: {e}")
+                    # Continue even if simulation fails
+
+                # Extract backlinks
                 backlinks = self._extract_backlinks_from_page(
                     html, source_url, target_domains
                 )
