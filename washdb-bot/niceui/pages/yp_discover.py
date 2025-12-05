@@ -950,7 +950,7 @@ def build_multiworker_yp_ui(container):
                 # All workers merged view - shows main orchestrator log
                 with ui.tab_panel(yp_tab_all):
                     ui.label('📊 Live crawling activity from orchestrator').classes('text-xs text-gray-400 mb-2')
-                    log_viewer_all = LiveLogViewer('logs/YPContinuous5Workers.log', max_lines=400, auto_scroll=True)
+                    log_viewer_all = LiveLogViewer('logs/yp_workers.log', max_lines=400, auto_scroll=True)
                     log_viewer_all.create()
                     log_viewer_all.load_last_n_lines(100)
                     log_viewer_all.start_tailing()
@@ -961,7 +961,7 @@ def build_multiworker_yp_ui(container):
                     with ui.tab_panel(yp_worker_tabs[i]):
                         states = yp_worker_states[i]
                         ui.label(f"🌎 States: {', '.join(states)}").classes('text-xs text-gray-400 mb-2')
-                        log_viewer = LiveLogViewer(f'logs/yp_worker_{i + 1}.log', max_lines=300, auto_scroll=True)
+                        log_viewer = LiveLogViewer(f'logs/state_worker_{i}.log', max_lines=300, auto_scroll=True)
                         log_viewer.create()
                         log_viewer.load_last_n_lines(100)
                         log_viewer.start_tailing()

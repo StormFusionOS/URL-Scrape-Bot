@@ -583,14 +583,12 @@ def update_company_verification(
         # - Final score >= threshold (e.g., 0.75)
         # - LLM says legitimate
         # - Service verifier passed
-        # - No red flags
         if (final_score >= COMBINED_HIGH_THRESHOLD and
             is_legitimate and
-            svc_status == 'passed' and
-            len(red_flags) == 0):
+            svc_status == 'passed'):
             active = True
             final_status = 'passed'
-            logger.info(f"ACCEPTED: final_score={final_score:.2f}, legitimate=True, no red flags")
+            logger.info(f"ACCEPTED: final_score={final_score:.2f}, legitimate=True, red_flags={len(red_flags)}")
 
         # LOW: Auto-reject conditions
         # - Final score <= threshold (e.g., 0.35)

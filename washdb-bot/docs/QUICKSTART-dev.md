@@ -173,13 +173,25 @@ Open your browser and navigate to: **http://localhost:8080**
 
 ### Via CLI (Alternative)
 
+**Optimized Multi-Worker (Recommended)**:
 ```bash
+# Run 5-worker pool with persistent browsers (2-3x faster)
+python -m scrape_yp.state_worker_pool
+```
+
+**Legacy Single Worker**:
+```bash
+# Deprecated - use state_worker_pool for better performance
 python cli_crawl_yp.py --states RI --categories "pressure washing" --max-targets 10
 ```
 
 Watch the logs in real-time:
 ```bash
-tail -f logs/yp_crawl_city_first.log
+# New workers
+tail -f logs/state_worker_*.log
+
+# Or main pool log
+tail -f logs/yp_workers.log
 ```
 
 ## Step 9: View Results

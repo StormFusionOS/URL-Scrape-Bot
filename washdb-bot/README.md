@@ -200,13 +200,27 @@ python niceui/main.py
 
 ### Run Scrapers via CLI
 
-**Yellow Pages Discovery**:
+**Yellow Pages Discovery (Optimized Multi-Worker)**:
 ```bash
+# Run 5-worker pool with persistent browsers and caching
+python -m scrape_yp.state_worker_pool
+```
+
+**Yellow Pages Discovery (Legacy Single Worker)**:
+```bash
+# Legacy CLI (deprecated - use state_worker_pool for better performance)
 python cli_crawl_yp.py --states RI --max-targets 500 --categories "pressure washing"
 ```
 
-**Google Maps Discovery**:
+**Google Maps Discovery (Optimized Multi-Worker)**:
 ```bash
+# Run 5-worker pool with persistent browsers and caching (2-3x faster)
+python -m scrape_google.state_worker_pool
+```
+
+**Google Maps Discovery (Legacy CLI)**:
+```bash
+# Legacy CLI (deprecated - use state_worker_pool for better performance)
 python cli_crawl_google_city_first.py --states RI --max-workers 2
 ```
 

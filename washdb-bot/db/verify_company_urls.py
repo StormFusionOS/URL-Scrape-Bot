@@ -285,11 +285,10 @@ def update_company_verification(
     # HIGH: Auto-accept conditions
     if (combined_score >= COMBINED_HIGH_THRESHOLD and
         is_legitimate and
-        svc_status == 'passed' and
-        len(red_flags) == 0):
+        svc_status == 'passed'):
         active = True
         final_status = 'passed'
-        logger.info(f"Company {company_id} ACCEPTED: score={combined_score:.2f}, legitimate=True")
+        logger.info(f"Company {company_id} ACCEPTED: score={combined_score:.2f}, legitimate=True, red_flags={len(red_flags)}")
 
     # LOW: Auto-reject conditions
     elif (combined_score <= COMBINED_LOW_THRESHOLD or

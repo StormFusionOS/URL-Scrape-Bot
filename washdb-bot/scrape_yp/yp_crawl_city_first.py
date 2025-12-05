@@ -41,12 +41,13 @@ from scrape_yp.yp_checkpoint import (
     save_progress_checkpoint,
     load_progress_checkpoint,
 )
+from scrape_yp.browser_pool import get_browser_pool
 
 # Initialize logger
 logger = get_logger("yp_crawl_city_first")
 
 
-def fetch_city_category_page(url: str, page: int = 1, use_playwright: bool = True, max_retries: int = 3) -> str:
+def fetch_city_category_page(url: str, page: int = 1, use_playwright: bool = True, max_retries: int = 3, worker_id: int = 0) -> str:
     """
     Fetch a city-category page from Yellow Pages with retry logic.
 
@@ -55,6 +56,7 @@ def fetch_city_category_page(url: str, page: int = 1, use_playwright: bool = Tru
         page: Page number (default: 1)
         use_playwright: Use Playwright for fetching (default: True)
         max_retries: Maximum number of retry attempts (default: 3)
+        worker_id: Worker ID for browser pool isolation (default: 0)
 
     Returns:
         HTML content as string
@@ -77,7 +79,7 @@ def fetch_city_category_page(url: str, page: int = 1, use_playwright: bool = Tru
         try:
             # Use Playwright if enabled
             if use_playwright:
-                return _fetch_url_playwright(url)
+                return _fetch_url_playwright(url, worker_id=worker_id)
             else:
                 # Fallback: Use requests library
                 import requests
@@ -111,80 +113,69 @@ def fetch_city_category_page(url: str, page: int = 1, use_playwright: bool = Tru
                 raise last_exception
 
 
-def _fetch_url_playwright(url: str) -> str:
+def _fetch_url_playwright(url: str, worker_id: int = 0) -> str:
     """
-    Fetch a URL using Playwright (headless browser) with anti-detection measures.
+    Fetch a URL using persistent Playwright browser pool with anti-detection measures.
+
+    Uses the global browser pool to eliminate browser startup overhead.
+    Creates a fresh context for each request but reuses the persistent browser.
 
     Args:
         url: Full URL to fetch
+        worker_id: Worker ID for browser pool isolation (default: 0)
 
     Returns:
         HTML content as string
     """
-    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
     # Add human-like random delay with jitter (2-5 seconds + jitter)
     human_delay(min_seconds=2.0, max_seconds=5.0, jitter=0.5)
 
-    with sync_playwright() as p:
-        # Launch browser with anti-detection flags
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                '--disable-blink-features=AutomationControlled',  # Hide automation
-                '--disable-features=IsolateOrigins,site-per-process',
-                '--disable-web-security',
-                '--no-sandbox',
-            ]
-        )
+    # Get page from browser pool (persistent browser, fresh context)
+    pool = get_browser_pool()
+    page, context = pool.get_page(worker_id)
 
-        # Get randomized context parameters (user agent, viewport, timezone, etc.)
-        context_params = get_playwright_context_params()
-        context = browser.new_context(**context_params)
+    try:
+        # Navigate to URL with timeout
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-        # Add all enhanced anti-detection scripts
-        init_scripts = get_enhanced_playwright_init_scripts()
-        for script in init_scripts:
-            context.add_init_script(script)
-
-        page = context.new_page()
-
+        # Wait for results to load
         try:
-            # Navigate to URL with timeout
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_selector("div.result, div.srp-listing, div.organic", timeout=5000)
+        except PlaywrightTimeoutError:
+            # No results found, but page loaded
+            pass
 
-            # Wait for results to load
-            try:
-                page.wait_for_selector("div.result, div.srp-listing, div.organic", timeout=5000)
-            except PlaywrightTimeoutError:
-                # No results found, but page loaded
-                pass
+        # Simulate human behavior: scroll through page
+        scroll_delays = get_scroll_delays()
+        for i, scroll_delay in enumerate(scroll_delays):
+            # Scroll down in increments (simulate reading)
+            scroll_amount = random.randint(200, 600)
+            page.evaluate(f"window.scrollBy(0, {scroll_amount})")
+            time.sleep(scroll_delay)
 
-            # Simulate human behavior: scroll through page
-            scroll_delays = get_scroll_delays()
-            for i, scroll_delay in enumerate(scroll_delays):
-                # Scroll down in increments (simulate reading)
-                scroll_amount = random.randint(200, 600)
-                page.evaluate(f"window.scrollBy(0, {scroll_amount})")
-                time.sleep(scroll_delay)
+        # Simulate human reading the page
+        # Estimate content length for reading delay
+        html_preview = page.content()
+        content_length = len(html_preview) // 2  # Rough estimate of visible content
+        reading_delay = get_human_reading_delay(min(content_length, 2000))
 
-            # Simulate human reading the page
-            # Estimate content length for reading delay
-            html_preview = page.content()
-            content_length = len(html_preview) // 2  # Rough estimate of visible content
-            reading_delay = get_human_reading_delay(min(content_length, 2000))
+        # Take a portion of the reading delay (we already scrolled)
+        remaining_delay = reading_delay * random.uniform(0.3, 0.6)
+        time.sleep(remaining_delay)
 
-            # Take a portion of the reading delay (we already scrolled)
-            remaining_delay = reading_delay * random.uniform(0.3, 0.6)
-            time.sleep(remaining_delay)
+        # Get HTML content
+        html = page.content()
 
-            # Get HTML content
-            html = page.content()
+        return html
 
-            return html
-
-        finally:
-            browser.close()
+    finally:
+        # Close context (but keep browser alive in pool)
+        try:
+            context.close()
+        except Exception as e:
+            logger.warning(f"Error closing context: {e}")
 
 
 def crawl_single_target(
@@ -195,6 +186,7 @@ def crawl_single_target(
     include_sponsored: bool = False,
     use_fallback_on_404: bool = True,
     monitor: Optional[ScraperMonitor] = None,
+    worker_id: int = 0,
 ) -> tuple[list[dict], dict]:
     """
     Crawl a single target (city × category).
@@ -212,6 +204,8 @@ def crawl_single_target(
         min_score: Minimum confidence score (0-100)
         include_sponsored: Include sponsored/ad listings
         use_fallback_on_404: Use fallback URL if primary fails
+        monitor: Optional monitor for tracking
+        worker_id: Worker ID for browser pool isolation (default: 0)
 
     Returns:
         Tuple of (accepted_results, stats_dict)
@@ -241,7 +235,7 @@ def crawl_single_target(
 
             try:
                 # Fetch page HTML
-                html = fetch_city_category_page(url_to_use, page)
+                html = fetch_city_category_page(url_to_use, page, worker_id=worker_id)
 
                 # Record successful request
                 if monitor:
@@ -258,7 +252,7 @@ def crawl_single_target(
                         logger.info(f"  Trying fallback URL...")
                         url_to_use = target.fallback_url
                         used_fallback = True
-                        html = fetch_city_category_page(url_to_use, page)
+                        html = fetch_city_category_page(url_to_use, page, worker_id=worker_id)
 
                         # Record fallback request
                         if monitor:

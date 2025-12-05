@@ -59,7 +59,7 @@ def check_google_workers_running() -> bool:
 
     # Method 2: Fallback - Use pgrep to find external workers
     try:
-        patterns = ['google_continuous', 'cli_crawl_google']
+        patterns = ['google_continuous', 'cli_crawl_google', 'scrape_google.state_worker_pool']
         for pattern in patterns:
             result = subprocess.run(
                 ['pgrep', '-f', pattern],
@@ -74,15 +74,26 @@ def check_google_workers_running() -> bool:
 
 
 def check_yp_workers_running() -> bool:
-    """Check if YP workers are running by looking for cli_crawl_yp processes."""
+    """Check if YP workers are running (both old CLI and new state_worker_pool)."""
     import subprocess
     try:
-        result = subprocess.run(
+        # Check for old-style CLI workers
+        result1 = subprocess.run(
             ['pgrep', '-f', 'cli_crawl_yp'],
             capture_output=True,
             text=True
         )
-        return result.returncode == 0 and bool(result.stdout.strip())
+        cli_running = result1.returncode == 0 and bool(result1.stdout.strip())
+
+        # Check for new state_worker_pool workers
+        result2 = subprocess.run(
+            ['pgrep', '-f', 'state_worker_pool'],
+            capture_output=True,
+            text=True
+        )
+        pool_running = result2.returncode == 0 and bool(result2.stdout.strip())
+
+        return cli_running or pool_running
     except Exception:
         return False
 
@@ -102,32 +113,56 @@ def check_yelp_workers_running() -> bool:
 
 
 def count_google_workers() -> int:
-    """Count the number of running Google workers."""
+    """Count the number of running Google workers (both old CLI and new state_worker_pool)."""
     import subprocess
     try:
-        result = subprocess.run(
+        # Count old-style CLI workers
+        result1 = subprocess.run(
             ['pgrep', '-cf', 'cli_crawl_google_city_first'],
             capture_output=True,
             text=True
         )
-        if result.returncode == 0:
-            return int(result.stdout.strip())
+        cli_count = int(result1.stdout.strip()) if result1.returncode == 0 else 0
+
+        # Count new state_worker_pool workers (subtract 1 for manager process)
+        result2 = subprocess.run(
+            ['pgrep', '-cf', 'scrape_google.state_worker_pool'],
+            capture_output=True,
+            text=True
+        )
+        pool_count = int(result2.stdout.strip()) if result2.returncode == 0 else 0
+        # Subtract 1 for the manager process, only count actual workers
+        pool_workers = max(0, pool_count - 1)
+
+        return cli_count + pool_workers
     except Exception:
         pass
     return 0
 
 
 def count_yp_workers() -> int:
-    """Count the number of running YP workers."""
+    """Count the number of running YP workers (both old CLI and new state_worker_pool)."""
     import subprocess
     try:
-        result = subprocess.run(
+        # Count old-style CLI workers
+        result1 = subprocess.run(
             ['pgrep', '-cf', 'cli_crawl_yp'],
             capture_output=True,
             text=True
         )
-        if result.returncode == 0:
-            return int(result.stdout.strip())
+        cli_count = int(result1.stdout.strip()) if result1.returncode == 0 else 0
+
+        # Count new state_worker_pool workers (subtract 1 for manager process)
+        result2 = subprocess.run(
+            ['pgrep', '-cf', 'scrape_yp.state_worker_pool'],
+            capture_output=True,
+            text=True
+        )
+        pool_count = int(result2.stdout.strip()) if result2.returncode == 0 else 0
+        # Subtract 1 for the manager process, only count actual workers
+        pool_workers = max(0, pool_count - 1)
+
+        return cli_count + pool_workers
     except Exception:
         pass
     return 0

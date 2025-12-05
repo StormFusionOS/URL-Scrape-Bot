@@ -519,6 +519,8 @@ def parse_yp_results_enhanced(html: str, source_page_url: Optional[str] = None) 
     """
     Parse Yellow Pages search results with enhanced extraction.
 
+    Uses LRU cache to avoid redundant parsing of identical HTML.
+
     Args:
         html: HTML content from Yellow Pages search page
         source_page_url: URL of the page being parsed (for traceability)
@@ -526,6 +528,16 @@ def parse_yp_results_enhanced(html: str, source_page_url: Optional[str] = None) 
     Returns:
         List of dicts with enhanced business information
     """
+    # Check cache first (avoid redundant lxml parsing)
+    from scrape_yp.html_cache import get_html_cache
+    cache = get_html_cache()
+
+    cached_results = cache.get(html)
+    if cached_results is not None:
+        # Cache hit - return cached results
+        return cached_results
+
+    # Cache miss - parse HTML
     soup = BeautifulSoup(html, "lxml")
     results = []
 
@@ -551,6 +563,9 @@ def parse_yp_results_enhanced(html: str, source_page_url: Optional[str] = None) 
             # Skip individual listing errors
             print(f"Warning: Failed to parse listing: {e}")
             continue
+
+    # Store results in cache before returning
+    cache.put(html, results)
 
     return results
 

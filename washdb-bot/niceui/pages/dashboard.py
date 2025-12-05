@@ -9,6 +9,8 @@ from ..backend_facade import backend
 from ..widgets.kpi import create_kpi_card
 from ..theme import COLORS
 from .verification import verification_state, get_verification_stats
+from ..utils.system_temps import get_system_temps, format_temp, get_temp_color
+from runner.memory_monitor import get_memory_monitor
 
 
 def create_sparkline_chart(title: str, data: list, color: str = None):
@@ -359,6 +361,77 @@ def build_discovery_status_cards(status_container):
                 ui.label('Total Companies').classes('text-sm text-gray-200 mb-2')
                 kpis = backend.kpis()
                 ui.label(str(kpis['total_companies'])).classes('text-2xl font-bold text-white')
+
+            # System Temperatures
+            with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
+                ui.label('🌡️ System Temps').classes('text-sm text-gray-200 mb-2 font-bold')
+                temps = get_system_temps()
+
+                # CPU Temperature
+                cpu_temp = temps['cpu_package']
+                cpu_color = get_temp_color(cpu_temp, warn_threshold=70.0, critical_threshold=85.0)
+                with ui.row().classes('items-center gap-2'):
+                    ui.label('CPU:').classes('text-xs text-gray-300')
+                    ui.label(format_temp(cpu_temp)).classes(f'text-sm font-bold {cpu_color}')
+
+                # GPU Temperature
+                gpu_temp = temps['gpu']
+                gpu_color = get_temp_color(gpu_temp, warn_threshold=70.0, critical_threshold=85.0)
+                with ui.row().classes('items-center gap-2'):
+                    ui.label('GPU:').classes('text-xs text-gray-300')
+                    ui.label(format_temp(gpu_temp)).classes(f'text-sm font-bold {gpu_color}')
+
+                # NVMe Temperature
+                nvme_temp = temps['nvme_max']
+                nvme_color = get_temp_color(nvme_temp, warn_threshold=60.0, critical_threshold=75.0)
+                with ui.row().classes('items-center gap-2'):
+                    ui.label('NVMe:').classes('text-xs text-gray-300')
+                    ui.label(format_temp(nvme_temp)).classes(f'text-sm font-bold {nvme_color}')
+
+            # Memory Usage
+            with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
+                ui.label('💾 Memory Usage').classes('text-sm text-gray-200 mb-2 font-bold')
+
+                try:
+                    monitor = get_memory_monitor()
+                    stats = monitor.get_stats()
+                    sys_mem = stats.get('system', {})
+                    comp_mem = stats.get('components', {})
+
+                    # System memory
+                    used_gb = sys_mem.get('used_gb', 0)
+                    total_gb = sys_mem.get('total_gb', 128)
+                    percent = sys_mem.get('percent', 0)
+
+                    mem_color = 'text-green-400'
+                    if percent >= 90:
+                        mem_color = 'text-red-400'
+                    elif percent >= 75:
+                        mem_color = 'text-yellow-400'
+
+                    with ui.row().classes('items-center gap-2'):
+                        ui.label('System:').classes('text-xs text-gray-300')
+                        ui.label(f'{used_gb:.1f}/{total_gb:.0f} GB ({percent:.0f}%)').classes(f'text-sm font-bold {mem_color}')
+
+                    # Browser pool
+                    bp = comp_mem.get('browser_pool', {})
+                    if 'error' not in bp:
+                        browsers = bp.get('active_browsers', 0)
+                        with ui.row().classes('items-center gap-2'):
+                            ui.label('Browsers:').classes('text-xs text-gray-300')
+                            ui.label(f'{browsers} (~{bp.get("estimated_memory_gb", 0):.1f} GB)').classes('text-sm font-bold text-blue-400')
+
+                    # HTML cache
+                    hc = comp_mem.get('html_cache', {})
+                    if 'error' not in hc:
+                        cache_size = hc.get('size', 0)
+                        hit_rate = hc.get('hit_rate_pct', 0)
+                        with ui.row().classes('items-center gap-2'):
+                            ui.label('Cache:').classes('text-xs text-gray-300')
+                            ui.label(f'{cache_size} entries ({hit_rate:.0f}% hit)').classes('text-sm font-bold text-purple-400')
+
+                except Exception as e:
+                    ui.label(f'Error: {str(e)[:30]}...').classes('text-xs text-red-400')
 
 
 def dashboard_page():
