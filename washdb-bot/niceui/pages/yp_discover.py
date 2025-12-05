@@ -842,7 +842,7 @@ def build_multiworker_yp_ui(container):
         try:
             # Check systemd service status first
             result = subprocess.run(
-                ['systemctl', 'is-active', 'yp-5workers.service'],
+                ['systemctl', 'is-active', 'yp-state-workers.service'],
                 capture_output=True, text=True, timeout=5
             )
             if result.stdout.strip() == 'active':
@@ -976,7 +976,7 @@ def build_multiworker_yp_ui(container):
                 # Check systemd service status first
                 try:
                     result = subprocess.run(
-                        ['systemctl', 'is-active', 'yp-5workers.service'],
+                        ['systemctl', 'is-active', 'yp-state-workers.service'],
                         capture_output=True, text=True, timeout=5
                     )
                     if result.stdout.strip() == 'active':

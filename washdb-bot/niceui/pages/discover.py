@@ -911,7 +911,7 @@ async def stop_discovery():
     # Step 1: Stop the systemd service (this handles auto-restart)
     try:
         result = subprocess.run(
-            ['sudo', 'systemctl', 'stop', 'google-5workers.service'],
+            ['sudo', 'systemctl', 'stop', 'google-state-workers.service'],
             capture_output=True,
             text=True,
             timeout=10
@@ -1073,7 +1073,7 @@ def detect_running_yp_workers():
     # Method 1: Check systemd service status
     try:
         result = subprocess.run(
-            ['systemctl', 'is-active', 'yp-5workers.service'],
+            ['systemctl', 'is-active', 'yp-state-workers.service'],
             capture_output=True,
             text=True,
             timeout=5
@@ -1149,7 +1149,7 @@ def detect_running_google_workers():
     # Method 1: Check systemd service status
     try:
         result = subprocess.run(
-            ['systemctl', 'is-active', 'google-5workers.service'],
+            ['systemctl', 'is-active', 'google-state-workers.service'],
             capture_output=True,
             text=True,
             timeout=5
@@ -1334,7 +1334,7 @@ def build_yellow_pages_ui(container):
                 # Method 1: Check systemd service status first
                 try:
                     result = subprocess.run(
-                        ['systemctl', 'is-active', 'yp-5workers.service'],
+                        ['systemctl', 'is-active', 'yp-state-workers.service'],
                         capture_output=True,
                         text=True,
                         timeout=5
@@ -1885,7 +1885,7 @@ def build_google_maps_ui(container):
                 # Method 1: Check systemd service status first
                 try:
                     result = subprocess.run(
-                        ['systemctl', 'is-active', 'google-5workers.service'],
+                        ['systemctl', 'is-active', 'google-state-workers.service'],
                         capture_output=True,
                         text=True,
                         timeout=5
