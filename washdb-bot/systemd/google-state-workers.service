@@ -17,9 +17,9 @@ ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python -m scr
 Restart=always
 RestartSec=10
 
-# Logging
-StandardOutput=journal
-StandardError=journal
+# Logging (both journal and file for GUI live output)
+StandardOutput=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/google_workers.log
+StandardError=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/google_workers.log
 SyslogIdentifier=google-state-workers
 
 [Install]
