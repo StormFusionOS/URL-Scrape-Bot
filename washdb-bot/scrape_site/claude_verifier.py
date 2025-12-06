@@ -110,7 +110,7 @@ class ClaudeVerifier:
 
 Provide your analysis in this EXACT format (use these exact labels):
 
-TYPE: [Choose ONE: service_provider, equipment_seller, training_company, directory, blog, lead_generation, marketing_agency]
+TYPE: [Choose ONE: service_provider, equipment_seller, training_company, directory, blog, lead_generation, marketing_agency, automotive_service]
 
 SERVICES:
 - Pressure washing: [yes/no]
@@ -131,15 +131,35 @@ CONFIDENCE: [0.0 to 1.0 - How confident are you in this assessment?]
 
 REASONING: [Brief explanation of your decision]
 
-IMPORTANT DISTINCTIONS:
-1. SERVICE PROVIDER = Directly performs services for customers (this is what we want)
-2. EQUIPMENT SELLER = Sells pressure washers, cleaning supplies, etc. (NOT what we want)
-3. TRAINING = Teaches how to start a business (NOT what we want)
-4. DIRECTORY = Lists other companies (NOT what we want)
-5. LEAD GEN = Sells leads to contractors (NOT what we want)
-6. BLOG = Informational content only (NOT what we want)
+CRITICAL: WE ARE LOOKING FOR EXTERIOR BUILDING/PROPERTY CLEANING SERVICES ONLY
 
-Focus on whether they DIRECTLY PROVIDE SERVICES to customers."""
+✓ INCLUDE (what we want):
+- Pressure washing for BUILDINGS, HOMES, DRIVEWAYS, PARKING LOTS, DECKS, PATIOS, FENCES
+- Commercial/residential exterior cleaning
+- Window cleaning for BUILDINGS (homes, offices, storefronts)
+- Roof cleaning, gutter cleaning
+- Wood restoration for DECKS, FENCES, SIDING
+- Soft washing, house washing
+- Concrete cleaning
+
+✗ EXCLUDE (what we DO NOT want):
+- CAR WASHES (automatic, self-serve, hand wash) → TYPE: automotive_service
+- AUTO DETAILING (interior/exterior car cleaning) → TYPE: automotive_service
+- MOBILE CAR WASHING → TYPE: automotive_service
+- VEHICLE DETAILING → TYPE: automotive_service
+- TRUCK WASHING → TYPE: automotive_service
+- Fleet washing (unless they ALSO do building/property cleaning)
+
+IMPORTANT DISTINCTIONS:
+1. SERVICE PROVIDER = Directly performs BUILDING/PROPERTY cleaning services (this is what we want)
+2. AUTOMOTIVE_SERVICE = Car washes, auto detailing, vehicle cleaning (NOT what we want)
+3. EQUIPMENT SELLER = Sells pressure washers, cleaning supplies, etc. (NOT what we want)
+4. TRAINING = Teaches how to start a business (NOT what we want)
+5. DIRECTORY = Lists other companies (NOT what we want)
+6. LEAD GEN = Sells leads to contractors (NOT what we want)
+7. BLOG = Informational content only (NOT what we want)
+
+If the company name contains "car wash", "auto detail", "mobile detail", "vehicle wash", or similar automotive terms, classify as TYPE: automotive_service."""
 
     def _parse_response(self, response: str) -> Dict:
         """Parse Claude's response into structured format matching Ollama output."""
@@ -171,7 +191,8 @@ Focus on whether they DIRECTLY PROVIDE SERVICES to customers."""
                     'directory': 4,
                     'blog': 5,
                     'lead_generation': 6,
-                    'marketing_agency': 6
+                    'marketing_agency': 6,
+                    'automotive_service': 7  # Car washes, auto detailing - EXCLUDE
                 }
                 result['type'] = type_map.get(type_str, 1)
 

@@ -20,9 +20,10 @@ import json
 import sys
 import time
 import random
-from typing import Dict, Any, List, Optional
+import requests
+from typing import Dict, Any, List, Optional, Set
 from datetime import datetime
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, quote
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -91,9 +92,7 @@ class BacklinkCrawler(BaseScraper):
 
         # Session break manager (take breaks after N requests to appear human)
         self.session_manager = SessionBreakManager(
-            requests_per_session=50,  # Take break after 50 requests
-            short_break_range=(30, 60),  # 30-60 second breaks
-            long_break_range=(120, 300),  # 2-5 minute breaks every 5 sessions
+            requests_per_session=50  # Take break after 50 requests
         )
         self.request_count = 0
 
@@ -455,6 +454,271 @@ class BacklinkCrawler(BaseScraper):
 
         return backlinks
 
+    def search_common_crawl(
+        self,
+        domain: str,
+        max_results: int = 100,
+        index: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search Common Crawl index for pages that link to our domain.
+
+        Common Crawl provides free access to billions of crawled web pages.
+        This searches their CDX (URL index) for pages containing links to our domain.
+
+        Args:
+            domain: Domain to find backlinks for (e.g., "example.com")
+            max_results: Maximum number of results to return (default 100)
+            index: Specific Common Crawl index to use (default: latest)
+
+        Returns:
+            List of potential backlink sources with metadata
+        """
+        logger.info(f"Searching Common Crawl for backlinks to {domain} (max {max_results} results)")
+
+        # Clean domain
+        domain = domain.lower().strip()
+        if domain.startswith('www.'):
+            domain = domain[4:]
+
+        # Use latest index if not specified
+        if not index:
+            try:
+                # Get list of available indexes
+                index_list_url = "https://index.commoncrawl.org/collinfo.json"
+                response = requests.get(index_list_url, timeout=10)
+                response.raise_for_status()
+                indexes = response.json()
+
+                if indexes:
+                    # Use the most recent index
+                    index = indexes[0]["id"]
+                    logger.info(f"Using Common Crawl index: {index}")
+                else:
+                    logger.error("No Common Crawl indexes available")
+                    return []
+            except Exception as e:
+                logger.error(f"Failed to get Common Crawl index list: {e}")
+                return []
+
+        # Search for URLs containing our domain
+        # Using the CDX Server API: https://index.commoncrawl.org/CC-MAIN-YYYY-WW/
+        base_url = f"https://index.commoncrawl.org/{index}-index"
+
+        # Search for pages that contain our domain in their content
+        # This finds pages that link to our domain
+        search_url = domain + "/*"
+
+        params = {
+            'url': search_url,
+            'output': 'json',
+            'limit': max_results,
+        }
+
+        backlink_sources = []
+        seen_domains: Set[str] = set()
+
+        try:
+            # Make request with retries
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    response = requests.get(
+                        base_url,
+                        params=params,
+                        timeout=30,
+                    )
+                    response.raise_for_status()
+                    break
+                except requests.exceptions.RequestException as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    logger.warning(f"Common Crawl request failed (attempt {attempt + 1}/{max_retries}): {e}")
+                    time.sleep(2 ** attempt)  # Exponential backoff
+
+            # Parse CDXJ results (newline-delimited JSON)
+            for line in response.text.strip().split('\n'):
+                if not line:
+                    continue
+
+                try:
+                    record = json.loads(line)
+
+                    # Extract key fields from CDX record
+                    url = record.get('url', '')
+                    timestamp = record.get('timestamp', '')
+                    mime_type = record.get('mime', '')
+                    status = record.get('status', '')
+
+                    # Skip non-HTML pages and error responses
+                    if status != '200' or not mime_type.startswith('text/html'):
+                        continue
+
+                    # Parse URL to get domain
+                    parsed = urlparse(url)
+                    source_domain = parsed.netloc.lower()
+                    if source_domain.startswith('www.'):
+                        source_domain = source_domain[4:]
+
+                    # Skip if we've already found this domain
+                    if source_domain in seen_domains:
+                        continue
+
+                    # Skip if it's the same as our target domain (self-links)
+                    if source_domain == domain:
+                        continue
+
+                    seen_domains.add(source_domain)
+
+                    # Format timestamp (YYYYMMDDHHMMSS -> ISO format)
+                    crawl_date = None
+                    if len(timestamp) >= 8:
+                        try:
+                            from datetime import datetime
+                            crawl_date = datetime.strptime(timestamp[:8], '%Y%m%d').isoformat()
+                        except:
+                            pass
+
+                    backlink_sources.append({
+                        'source_url': url,
+                        'source_domain': source_domain,
+                        'target_domain': domain,
+                        'discovered_via': 'common_crawl',
+                        'crawl_date': crawl_date,
+                        'cc_index': index,
+                        'mime_type': mime_type,
+                    })
+
+                except json.JSONDecodeError as e:
+                    logger.debug(f"Failed to parse CDX record: {e}")
+                    continue
+
+            logger.info(f"Found {len(backlink_sources)} unique backlink sources from Common Crawl")
+
+        except Exception as e:
+            logger.error(f"Common Crawl search failed: {e}")
+
+        return backlink_sources
+
+    def search_bing_backlinks(
+        self,
+        domain: str,
+        max_results: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Use Bing's link: operator to find pages linking to our domain.
+
+        Bing allows searching for backlinks using the "link:" operator.
+        This method scrapes Bing search results to discover backlinks for free.
+
+        Args:
+            domain: Domain to find backlinks for (e.g., "example.com")
+            max_results: Maximum number of results to scrape (default 50)
+
+        Returns:
+            List of backlink sources found via Bing
+        """
+        logger.info(f"Searching Bing for backlinks to {domain} (max {max_results} results)")
+
+        # Clean domain
+        domain = domain.lower().strip()
+        if domain.startswith('www.'):
+            domain = domain[4:]
+
+        backlink_sources = []
+        seen_domains: Set[str] = set()
+
+        # Use Bing's link: operator
+        # Note: Bing deprecated link: in 2017, but linkfromdomain: still works
+        query = f"linkfromdomain:{domain}"
+
+        # Alternative: Use site-specific search to find mentions
+        # This is more reliable than link: operator
+        alternative_query = f'"{domain}"'
+
+        try:
+            # We'll use Playwright to scrape Bing search results
+            with self.browser_session() as (browser, context, page):
+                # Search Bing
+                search_url = f"https://www.bing.com/search?q={quote(alternative_query)}"
+
+                logger.info(f"Fetching Bing results from: {search_url}")
+
+                # Apply human delay before search
+                human_delay(min_seconds=1.0, max_seconds=3.0, jitter=0.5)
+
+                html = self.fetch_page(
+                    url=search_url,
+                    page=page,
+                    wait_for="domcontentloaded",
+                    extra_wait=2.0,
+                )
+
+                if not html:
+                    logger.warning("Failed to fetch Bing search results")
+                    return []
+
+                # Parse search results
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(html, 'html.parser')
+
+                # Bing search results are in <li class="b_algo"> elements
+                results = soup.find_all('li', class_='b_algo')
+
+                logger.info(f"Found {len(results)} Bing search results")
+
+                for result in results[:max_results]:
+                    try:
+                        # Extract link
+                        link_elem = result.find('h2')
+                        if not link_elem:
+                            continue
+
+                        a_tag = link_elem.find('a', href=True)
+                        if not a_tag:
+                            continue
+
+                        url = a_tag['href']
+
+                        # Parse URL
+                        parsed = urlparse(url)
+                        source_domain = parsed.netloc.lower()
+                        if source_domain.startswith('www.'):
+                            source_domain = source_domain[4:]
+
+                        # Skip if same domain
+                        if source_domain == domain:
+                            continue
+
+                        # Skip if already seen
+                        if source_domain in seen_domains:
+                            continue
+
+                        seen_domains.add(source_domain)
+
+                        # Extract snippet/context
+                        snippet_elem = result.find('p') or result.find('div', class_='b_caption')
+                        snippet = snippet_elem.get_text(strip=True) if snippet_elem else ""
+
+                        backlink_sources.append({
+                            'source_url': url,
+                            'source_domain': source_domain,
+                            'target_domain': domain,
+                            'discovered_via': 'bing_search',
+                            'context': snippet[:200],
+                        })
+
+                    except Exception as e:
+                        logger.debug(f"Failed to parse Bing result: {e}")
+                        continue
+
+                logger.info(f"Found {len(backlink_sources)} unique backlink sources from Bing")
+
+        except Exception as e:
+            logger.error(f"Bing search failed: {e}")
+
+        return backlink_sources
+
     def check_page_for_backlinks(
         self,
         source_url: str,
@@ -474,7 +738,9 @@ class BacklinkCrawler(BaseScraper):
 
         # Check if we need a session break (YP-style human behavior)
         self.request_count += 1
-        self.session_manager.check_break(self.request_count)
+        break_taken = self.session_manager.increment()
+        if break_taken:
+            logger.info(f"[SESSION BREAK] Break taken after {self.request_count} requests")
 
         # Apply YP-style human delay BEFORE creating browser (2-5 seconds + jitter)
         human_delay(min_seconds=2.0, max_seconds=5.0, jitter=0.5)

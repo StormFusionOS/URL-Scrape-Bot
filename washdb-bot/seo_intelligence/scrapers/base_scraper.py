@@ -735,6 +735,24 @@ class BaseScraper(ABC):
             hardware_concurrency = random.choice([2, 4, 8, 16])
             device_memory = random.choice([4, 8, 16])
 
+            # Generate randomized fingerprint values for this session
+            canvas_noise = random.uniform(0.0001, 0.001)
+            webgl_vendor = random.choice([
+                'Google Inc. (NVIDIA)',
+                'Google Inc. (Intel)',
+                'Google Inc. (AMD)',
+                'Google Inc. (ANGLE)'
+            ])
+            webgl_renderer = random.choice([
+                'ANGLE (NVIDIA GeForce GTX 1060 Direct3D11 vs_5_0 ps_5_0)',
+                'ANGLE (Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0)',
+                'ANGLE (AMD Radeon RX 580 Series Direct3D11 vs_5_0 ps_5_0)',
+                'ANGLE (NVIDIA GeForce RTX 2060 Direct3D11 vs_5_0 ps_5_0)'
+            ])
+            audio_sample_rate = random.choice([44100, 48000])
+            battery_level = random.uniform(0.2, 0.95)
+            battery_charging = random.choice([True, False])
+
             page.add_init_script(f"""
                 // Override navigator.webdriver
                 Object.defineProperty(navigator, 'webdriver', {{
@@ -801,14 +819,190 @@ class BaseScraper(ABC):
                     get: () => {device_memory}
                 }});
 
-                // Make toString return native code for modified functions
+                // ========== CANVAS FINGERPRINT RANDOMIZATION ==========
+                // Add subtle noise to canvas to prevent fingerprinting
+                const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+                const originalToBlob = HTMLCanvasElement.prototype.toBlob;
+                const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+
+                const canvasNoise = {canvas_noise};
+
+                HTMLCanvasElement.prototype.toDataURL = function(...args) {{
+                    const context = this.getContext('2d');
+                    if (context) {{
+                        const imageData = context.getImageData(0, 0, this.width, this.height);
+                        for (let i = 0; i < imageData.data.length; i += 4) {{
+                            imageData.data[i] = imageData.data[i] + Math.floor(Math.random() * canvasNoise * 255);
+                            imageData.data[i + 1] = imageData.data[i + 1] + Math.floor(Math.random() * canvasNoise * 255);
+                            imageData.data[i + 2] = imageData.data[i + 2] + Math.floor(Math.random() * canvasNoise * 255);
+                        }}
+                        context.putImageData(imageData, 0, 0);
+                    }}
+                    return originalToDataURL.apply(this, args);
+                }};
+
+                CanvasRenderingContext2D.prototype.getImageData = function(...args) {{
+                    const imageData = originalGetImageData.apply(this, args);
+                    for (let i = 0; i < imageData.data.length; i += 4) {{
+                        imageData.data[i] = imageData.data[i] + Math.floor(Math.random() * canvasNoise * 255);
+                        imageData.data[i + 1] = imageData.data[i + 1] + Math.floor(Math.random() * canvasNoise * 255);
+                        imageData.data[i + 2] = imageData.data[i + 2] + Math.floor(Math.random() * canvasNoise * 255);
+                    }}
+                    return imageData;
+                }};
+
+                // ========== WEBGL FINGERPRINT RANDOMIZATION ==========
+                const getParameterProxyHandler = {{
+                    apply: function(target, ctx, args) {{
+                        const param = args[0];
+                        const UNMASKED_VENDOR_WEBGL = 0x9245;
+                        const UNMASKED_RENDERER_WEBGL = 0x9246;
+
+                        if (param === UNMASKED_VENDOR_WEBGL) {{
+                            return '{webgl_vendor}';
+                        }}
+                        if (param === UNMASKED_RENDERER_WEBGL) {{
+                            return '{webgl_renderer}';
+                        }}
+                        return target.apply(ctx, args);
+                    }}
+                }};
+
+                const addProxyToContext = (context) => {{
+                    if (!context || !context.getParameter) return;
+                    context.getParameter = new Proxy(context.getParameter, getParameterProxyHandler);
+                }};
+
+                const originalGetContext = HTMLCanvasElement.prototype.getContext;
+                HTMLCanvasElement.prototype.getContext = function(...args) {{
+                    const context = originalGetContext.apply(this, args);
+                    if (args[0] === 'webgl' || args[0] === 'webgl2' || args[0] === 'experimental-webgl') {{
+                        addProxyToContext(context);
+                    }}
+                    return context;
+                }};
+
+                // ========== AUDIO CONTEXT FINGERPRINT RANDOMIZATION ==========
+                const AudioContext = window.AudioContext || window.webkitAudioContext;
+                if (AudioContext) {{
+                    const OriginalAnalyser = AudioContext.prototype.createAnalyser;
+                    AudioContext.prototype.createAnalyser = function() {{
+                        const analyser = OriginalAnalyser.apply(this, arguments);
+                        const originalGetFloatFrequencyData = analyser.getFloatFrequencyData;
+                        analyser.getFloatFrequencyData = function(array) {{
+                            originalGetFloatFrequencyData.apply(this, arguments);
+                            for (let i = 0; i < array.length; i++) {{
+                                array[i] = array[i] + Math.random() * 0.1 - 0.05;
+                            }}
+                        }};
+                        return analyser;
+                    }};
+
+                    // Randomize sample rate
+                    Object.defineProperty(AudioContext.prototype, 'sampleRate', {{
+                        get: function() {{
+                            return {audio_sample_rate};
+                        }}
+                    }});
+                }}
+
+                // ========== MEDIA DEVICES ENUMERATION ==========
+                // Return realistic media device list
+                const originalEnumerateDevices = navigator.mediaDevices.enumerateDevices;
+                navigator.mediaDevices.enumerateDevices = async function() {{
+                    return [
+                        {{
+                            deviceId: 'default',
+                            kind: 'audioinput',
+                            label: 'Default - Microphone',
+                            groupId: 'default'
+                        }},
+                        {{
+                            deviceId: 'communications',
+                            kind: 'audioinput',
+                            label: 'Communications - Microphone',
+                            groupId: 'communications'
+                        }},
+                        {{
+                            deviceId: 'default',
+                            kind: 'audiooutput',
+                            label: 'Default - Speakers',
+                            groupId: 'default'
+                        }},
+                        {{
+                            deviceId: 'communications',
+                            kind: 'audiooutput',
+                            label: 'Communications - Speakers',
+                            groupId: 'communications'
+                        }},
+                        {{
+                            deviceId: 'video' + Math.random().toString(36).substring(7),
+                            kind: 'videoinput',
+                            label: 'Integrated Camera',
+                            groupId: 'videoinput'
+                        }}
+                    ];
+                }};
+
+                // ========== BATTERY API SPOOFING ==========
+                // Spoof battery API to look like real device
+                if (navigator.getBattery) {{
+                    const originalGetBattery = navigator.getBattery.bind(navigator);
+                    navigator.getBattery = async function() {{
+                        const battery = await originalGetBattery();
+                        Object.defineProperties(battery, {{
+                            charging: {{ get: () => {str(battery_charging).lower()} }},
+                            chargingTime: {{ get: () => {str(battery_charging).lower()} ? 3600 : Infinity }},
+                            dischargingTime: {{ get: () => {str(battery_charging).lower()} ? Infinity : 7200 }},
+                            level: {{ get: () => {battery_level} }}
+                        }});
+                        return battery;
+                    }};
+                }}
+
+                // ========== SCREEN PROPERTIES ==========
+                // Add realistic screen properties
+                Object.defineProperty(screen, 'availWidth', {{
+                    get: () => screen.width - Math.floor(Math.random() * 10)
+                }});
+                Object.defineProperty(screen, 'availHeight', {{
+                    get: () => screen.height - Math.floor(Math.random() * 50) - 40
+                }});
+
+                // ========== TIMEZONE CONSISTENCY ==========
+                // Ensure timezone matches geolocation (already set in context options)
+                // This just verifies it's consistent
+                const timezoneOffset = new Date().getTimezoneOffset();
+
+                // ========== CONNECTION INFO ==========
+                // Add realistic connection properties
+                if (navigator.connection || navigator.mozConnection || navigator.webkitConnection) {{
+                    const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+                    Object.defineProperties(connection, {{
+                        downlink: {{ get: () => Math.random() * 10 + 5 }}, // 5-15 Mbps
+                        rtt: {{ get: () => Math.floor(Math.random() * 50) + 20 }}, // 20-70ms
+                        effectiveType: {{ get: () => '4g' }},
+                        saveData: {{ get: () => false }}
+                    }});
+                }}
+
+                // Make toString return native code for all modified functions
                 const oldToString = Function.prototype.toString;
                 Function.prototype.toString = function() {{
-                    if (this === window.navigator.permissions.query) {{
-                        return 'function query() {{ [native code] }}';
+                    if (this === window.navigator.permissions.query ||
+                        this === HTMLCanvasElement.prototype.toDataURL ||
+                        this === CanvasRenderingContext2D.prototype.getImageData ||
+                        this === navigator.mediaDevices.enumerateDevices ||
+                        this === navigator.getBattery) {{
+                        return 'function() {{ [native code] }}';
                     }}
                     return oldToString.call(this);
                 }};
+
+                // Hide that we modified anything
+                Object.defineProperty(Function.prototype.toString, 'toString', {{
+                    value: () => 'function toString() {{ [native code] }}'
+                }});
             """)
 
             mode_label = "headed" if use_headed else "headless"

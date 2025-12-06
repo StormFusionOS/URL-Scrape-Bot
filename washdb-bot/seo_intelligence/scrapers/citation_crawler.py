@@ -178,9 +178,7 @@ class CitationCrawler(BaseScraper):
 
         # Session break management (YP-style anti-detection)
         self.session_manager = SessionBreakManager(
-            requests_per_session=50,
-            short_break_range=(30, 60),
-            long_break_range=(120, 300),
+            requests_per_session=50
         )
         self.request_count = 0
 
@@ -836,11 +834,9 @@ class CitationCrawler(BaseScraper):
         try:
             # Check for session break (YP-style anti-detection)
             self.request_count += 1
-            break_duration = self.session_manager.should_break(self.request_count)
-            if break_duration:
-                logger.info(f"[SESSION BREAK] Taking {break_duration}s break after {self.request_count} requests")
-                time.sleep(break_duration)
-                self.request_count = 0
+            break_taken = self.session_manager.increment()
+            if break_taken:
+                logger.info(f"[SESSION BREAK] Break taken after {self.request_count} requests")
 
             with self.browser_session() as (browser, context, page):
                 # Human delay before navigation (YP-style timing)

@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 from nicegui import ui
 
 from niceui.widgets.live_log_viewer import LiveLogViewer
+from niceui.widgets.serp_monitor import get_serp_monitor
 
 # Database imports for SEO insights
 try:
@@ -444,6 +445,7 @@ class SEODashboard:
             self._render_header()
             self._render_module_status()
             self._render_seo_insights()
+            self._render_serp_monitor()
             self._render_tabbed_logs()
 
         # Start status update timer
@@ -560,6 +562,11 @@ class SEODashboard:
                 with ui.card().classes('flex-1'):
                     ui.label('Technical Health').classes('font-semibold text-purple-400')
                     self.technical_container = ui.column().classes('gap-1 mt-2')
+
+    def _render_serp_monitor(self):
+        """Render the SERP scraper monitor widget."""
+        monitor = get_serp_monitor()
+        monitor.render()
 
     def _update_insights(self):
         """Update the SEO insights display with fresh data."""
