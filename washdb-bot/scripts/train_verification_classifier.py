@@ -70,12 +70,13 @@ def binarize_labels(labels: list[str]) -> list[str]:
     """
     Convert multi-class labels to binary (provider vs other).
 
-    provider -> provider
-    non_provider, directory, agency, blog, franchise -> other
+    provider, pass -> provider  (legitimate service providers)
+    non_provider, fail, directory, agency, blog, franchise -> other
     """
     binary = []
     for label in labels:
-        if label == 'provider':
+        # Handle both old format (provider/non_provider) and new format (pass/fail)
+        if label in ('provider', 'pass'):
             binary.append('provider')
         else:
             binary.append('other')
@@ -91,6 +92,12 @@ def train_model(X: list[dict], y: list[str], model_type: str = 'logistic') -> tu
     # Vectorize features
     vec = DictVectorizer(sparse=False)
     X_vec = vec.fit_transform(X)
+
+    # Handle NaN values by replacing with 0 (missing features default to 0)
+    X_vec = np.nan_to_num(X_vec, nan=0.0, posinf=0.0, neginf=0.0)
+    nan_count = np.sum(np.isnan(X_vec))
+    if nan_count > 0:
+        print(f"Warning: Found {nan_count} NaN values, replaced with 0")
 
     print(f"\nFeature names ({len(vec.feature_names_)}):")
     for name in sorted(vec.feature_names_):
