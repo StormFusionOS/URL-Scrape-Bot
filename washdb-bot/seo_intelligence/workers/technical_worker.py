@@ -109,19 +109,22 @@ class TechnicalWorker(BaseModuleWorker):
         """
         Get companies that need technical audits.
 
-        Selects companies without recent page audits.
+        Selects verified companies without recent page audits.
         """
         session = self.Session()
         try:
-            # Get companies without recent audits
+            # Get verified companies without recent audits
+            # Only process verified companies (passed verification or human-labeled as provider)
             # page_audits uses url field, audited_at for timestamp
-            query = text("""
+            verification_clause = self.get_verification_where_clause()
+            query = text(f"""
                 SELECT c.id
                 FROM companies c
                 LEFT JOIN page_audits pa ON c.website = pa.url
                     AND pa.audited_at > NOW() - INTERVAL '7 days'
                 WHERE c.website IS NOT NULL
                   AND c.active = true
+                  AND {verification_clause}
                   AND pa.audit_id IS NULL
                   AND (:after_id IS NULL OR c.id > :after_id)
                 ORDER BY c.id ASC

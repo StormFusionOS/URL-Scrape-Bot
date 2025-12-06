@@ -118,11 +118,14 @@ class CompetitiveAnalysisWorker(BaseModuleWorker):
         """
         Get companies that need competitive analysis.
 
-        Selects companies without recent competitive analysis.
+        Selects verified companies without recent competitive analysis.
         """
         session = self.Session()
         try:
-            query = text("""
+            # Get verified companies without recent competitive analysis
+            # Only process verified companies (passed verification or human-labeled as provider)
+            verification_clause = self.get_verification_where_clause()
+            query = text(f"""
                 SELECT c.id
                 FROM companies c
                 LEFT JOIN competitive_analysis ca ON c.id = ca.company_id
@@ -130,6 +133,7 @@ class CompetitiveAnalysisWorker(BaseModuleWorker):
                 WHERE c.website IS NOT NULL
                   AND c.active = true
                   AND c.domain IS NOT NULL
+                  AND {verification_clause}
                   AND ca.id IS NULL
                   AND (:after_id IS NULL OR c.id > :after_id)
                 ORDER BY c.id ASC
@@ -145,14 +149,16 @@ class CompetitiveAnalysisWorker(BaseModuleWorker):
 
         except Exception as e:
             logger.error(f"Error getting companies: {e}")
-            # Fall back to simple query if competitive_analysis table doesn't exist
+            # Fall back to simple query with verification filter if competitive_analysis table doesn't exist
             try:
-                query = text("""
+                verification_clause = self.get_verification_where_clause()
+                query = text(f"""
                     SELECT c.id
                     FROM companies c
                     WHERE c.website IS NOT NULL
                       AND c.active = true
                       AND c.domain IS NOT NULL
+                      AND {verification_clause}
                       AND (:after_id IS NULL OR c.id > :after_id)
                     ORDER BY c.id ASC
                     LIMIT :limit

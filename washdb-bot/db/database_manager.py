@@ -217,3 +217,23 @@ def create_session() -> Session:
     db_manager = get_db_manager()
     # Return a raw session (not context managed)
     return db_manager.WashdbSessionLocal()
+
+    @contextmanager
+    def get_connection(self):
+        """
+        Get raw database connection (psycopg2).
+        For backwards compatibility with code expecting raw connections.
+        """
+        from sqlalchemy import text
+        session = self.WashdbSessionLocal()
+        try:
+            # Get raw connection from session
+            connection = session.connection().connection
+            yield connection
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Database connection error: {e}")
+            raise
+        finally:
+            session.close()

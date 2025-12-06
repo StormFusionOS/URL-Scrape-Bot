@@ -63,17 +63,20 @@ class BacklinkWorker(BaseModuleWorker):
         """
         Get companies that need backlink discovery.
 
-        Selects companies without recent backlink checks.
+        Selects verified companies without recent backlink checks.
         """
         session = self.Session()
         try:
-            # Get active companies with domains for backlink discovery
-            query = text("""
+            # Get active verified companies with domains for backlink discovery
+            # Only process verified companies (passed verification or human-labeled as provider)
+            verification_clause = self.get_verification_where_clause()
+            query = text(f"""
                 SELECT c.id
                 FROM companies c
                 WHERE c.website IS NOT NULL
                   AND c.active = true
                   AND c.domain IS NOT NULL
+                  AND {verification_clause}
                   AND (:after_id IS NULL OR c.id > :after_id)
                 ORDER BY c.id ASC
                 LIMIT :limit

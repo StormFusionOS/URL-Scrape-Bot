@@ -18,7 +18,7 @@ import os
 # ==============================================================================
 
 # Combined score thresholds for final triage decision
-COMBINED_HIGH_THRESHOLD = float(os.getenv('VERIFY_HIGH_THRESHOLD', '0.75'))  # Auto-accept
+COMBINED_HIGH_THRESHOLD = float(os.getenv('VERIFY_HIGH_THRESHOLD', '0.65'))  # Auto-accept
 COMBINED_LOW_THRESHOLD = float(os.getenv('VERIFY_LOW_THRESHOLD', '0.35'))    # Auto-reject
 
 # Heuristic-only thresholds (when LLM unavailable)
@@ -30,7 +30,7 @@ LLM_CONFIDENCE_HIGH = 0.75      # Trust LLM decision fully
 LLM_CONFIDENCE_LOW = 0.60       # Below this → needs_review
 
 # LLM weight in combined scoring (vs rule-based)
-LLM_WEIGHT = float(os.getenv('VERIFY_LLM_WEIGHT', '0.7'))  # 70% LLM, 30% rules
+LLM_WEIGHT = float(os.getenv('VERIFY_LLM_WEIGHT', '0.5'))  # 50% LLM, 50% rules
 
 # Red flag thresholds
 RED_FLAG_AUTO_REJECT_COUNT = 2  # Auto-reject if this many red flags + low score
@@ -114,6 +114,44 @@ LOGGING_SAMPLE_RATE = float(os.getenv('VERIFY_LOG_SAMPLE_RATE', '0.2'))
 # Alert thresholds
 ALERT_NEEDS_REVIEW_PERCENT = 50  # Alert if needs_review exceeds this %
 ALERT_PASS_RATE_MIN = 5          # Alert if pass rate drops below this %
+
+
+# ==============================================================================
+# CLAUDE AUTO-TUNING SYSTEM
+# ==============================================================================
+
+# Claude API Configuration
+CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', 'claude-3-5-sonnet-20241022')
+CLAUDE_MAX_TOKENS = int(os.getenv('CLAUDE_MAX_TOKENS', '500'))
+CLAUDE_TEMPERATURE = float(os.getenv('CLAUDE_TEMPERATURE', '0.0'))
+
+# Unix socket for Claude service
+CLAUDE_SOCKET_PATH = os.getenv('CLAUDE_SOCKET_PATH', '/tmp/claude_service.sock')
+
+# Queue Configuration
+CLAUDE_QUEUE_BATCH_SIZE = int(os.getenv('CLAUDE_QUEUE_BATCH_SIZE', '50'))
+CLAUDE_PROCESS_DELAY_SECONDS = float(os.getenv('CLAUDE_PROCESS_DELAY', '1.2'))  # 50 req/min = 1.2s
+CLAUDE_MAX_RETRIES = int(os.getenv('CLAUDE_MAX_RETRIES', '3'))
+
+# Score Range for Claude Review (borderline cases only)
+CLAUDE_REVIEW_SCORE_MIN = float(os.getenv('CLAUDE_REVIEW_SCORE_MIN', '0.45'))
+CLAUDE_REVIEW_SCORE_MAX = float(os.getenv('CLAUDE_REVIEW_SCORE_MAX', '0.55'))
+
+# Auto-Apply Threshold (only auto-apply if confidence >= this)
+CLAUDE_CONFIDENCE_THRESHOLD = float(os.getenv('CLAUDE_CONFIDENCE_THRESHOLD', '0.70'))
+
+# Cost Limits (safety thresholds)
+CLAUDE_MAX_COST_PER_DAY = float(os.getenv('CLAUDE_MAX_COST_DAY', '10.0'))
+CLAUDE_MAX_REVIEWS_PER_DAY = int(os.getenv('CLAUDE_MAX_REVIEWS_DAY', '5000'))
+
+# Rate Limiting
+CLAUDE_RATE_LIMIT_RPM = int(os.getenv('CLAUDE_RATE_LIMIT_RPM', '50'))  # Requests per minute
+
+# Few-Shot Example Configuration
+CLAUDE_NUM_FEW_SHOT_EXAMPLES = int(os.getenv('CLAUDE_NUM_EXAMPLES', '8'))
+CLAUDE_NUM_PROVIDER_EXAMPLES = int(os.getenv('CLAUDE_NUM_PROVIDER_EX', '3'))
+CLAUDE_NUM_NON_PROVIDER_EXAMPLES = int(os.getenv('CLAUDE_NUM_NON_PROVIDER_EX', '3'))
+CLAUDE_NUM_TRICKY_EXAMPLES = int(os.getenv('CLAUDE_NUM_TRICKY_EX', '2'))
 
 
 # ==============================================================================

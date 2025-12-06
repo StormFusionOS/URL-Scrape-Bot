@@ -228,7 +228,6 @@ class PrefetchBuffer:
                   AND (
                       parse_metadata->'verification' IS NULL
                       OR parse_metadata->'verification'->>'status' IS NULL
-                      OR parse_metadata->'verification'->>'status' = 'in_progress'
                   )
                 ORDER BY created_at DESC
                 FOR UPDATE SKIP LOCKED
@@ -326,7 +325,6 @@ def acquire_company_for_verification(session, worker_id: int, logger) -> Optiona
               AND (
                   parse_metadata->'verification' IS NULL
                   OR parse_metadata->'verification'->>'status' IS NULL
-                  OR parse_metadata->'verification'->>'status' = 'in_progress'
               )
             ORDER BY created_at DESC
             FOR UPDATE SKIP LOCKED

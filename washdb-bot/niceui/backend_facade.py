@@ -1313,22 +1313,22 @@ class BackendFacade:
             }
 
         try:
-            # Total companies
+            # Total companies (all companies, not just active)
             total = session.execute(
-                select(func.count(Company.id)).where(Company.active == True)
+                select(func.count(Company.id))
             ).scalar()
 
             # With email
             with_email = session.execute(
                 select(func.count(Company.id)).where(
-                    and_(Company.active == True, Company.email.isnot(None))
+                    Company.email.isnot(None)
                 )
             ).scalar()
 
             # With phone
             with_phone = session.execute(
                 select(func.count(Company.id)).where(
-                    and_(Company.active == True, Company.phone.isnot(None))
+                    Company.phone.isnot(None)
                 )
             ).scalar()
 
@@ -1336,10 +1336,7 @@ class BackendFacade:
             thirty_days_ago = datetime.utcnow() - timedelta(days=30)
             updated_30d = session.execute(
                 select(func.count(Company.id)).where(
-                    and_(
-                        Company.active == True,
-                        Company.last_updated >= thirty_days_ago
-                    )
+                    Company.last_updated >= thirty_days_ago
                 )
             ).scalar()
 
@@ -1347,10 +1344,7 @@ class BackendFacade:
             seven_days_ago = datetime.utcnow() - timedelta(days=7)
             new_7d = session.execute(
                 select(func.count(Company.id)).where(
-                    and_(
-                        Company.active == True,
-                        Company.created_at >= seven_days_ago
-                    )
+                    Company.created_at >= seven_days_ago
                 )
             ).scalar()
 
@@ -1505,26 +1499,25 @@ class BackendFacade:
         """Get database statistics."""
         session = create_session()
         try:
+            # Total companies (all, not just active)
             total = session.execute(
+                select(func.count(Company.id))
+            ).scalar() or 0
+
+            # Count verified (active) companies
+            verified = session.execute(
                 select(func.count(Company.id)).where(Company.active == True)
             ).scalar() or 0
 
-            with_details = session.execute(
-                select(func.count(Company.id)).where(
-                    and_(
-                        Company.active == True,
-                        Company.last_updated.isnot(None)
-                    )
-                )
-            ).scalar() or 0
+            # Count unverified companies
+            unverified = total - verified
 
-            pending = total - with_details
             failed = 0  # Would need to track failures separately
 
             return {
                 'total_urls': total,
-                'scraped': with_details,
-                'pending': pending,
+                'scraped': verified,
+                'pending': unverified,
                 'failed': failed
             }
         finally:

@@ -35,3 +35,7 @@ tiktoken>=0.5.0,<1.0.0
 # Optional: LangChain for advanced embedding workflows
 langchain>=0.1.0,<0.2.0
 langchain-community>=0.0.10
+
+# ===== LLM/AI SERVICES =====
+# Anthropic Claude API for auto-tuning system
+anthropic>=0.39.0

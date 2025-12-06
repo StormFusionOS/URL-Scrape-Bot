@@ -95,18 +95,20 @@ class SERPWorker(BaseModuleWorker):
         """
         Get companies that need SERP tracking.
 
-        Selects companies with websites that haven't had recent SERP checks.
+        Selects companies with websites that are verified and haven't had recent SERP checks.
         """
         session = self.Session()
         try:
             # Get active companies with websites for SERP tracking
-            # Simple query - just get companies that need processing
-            query = text("""
+            # Only process verified companies (passed verification or human-labeled as provider)
+            verification_clause = self.get_verification_where_clause()
+            query = text(f"""
                 SELECT c.id
                 FROM companies c
                 WHERE c.website IS NOT NULL
                   AND c.active = true
                   AND c.domain IS NOT NULL
+                  AND {verification_clause}
                   AND (:after_id IS NULL OR c.id > :after_id)
                 ORDER BY c.id ASC
                 LIMIT :limit

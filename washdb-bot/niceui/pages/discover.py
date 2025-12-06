@@ -12,7 +12,7 @@ import asyncio
 import sys
 import os
 from pathlib import Path
-from scrape_yp.state_assignments import get_states_for_worker, get_proxy_assignments
+from scrape_yp.state_assignments_5worker import get_states_for_worker, get_proxy_assignments
 from typing import Dict, Optional
 
 
@@ -152,7 +152,7 @@ class MultiWorkerState:
         self.running = False
 
 
-multi_worker_state = MultiWorkerState()
+multi_worker_state = MultiWorkerState(5)
 
 
 # Service categories

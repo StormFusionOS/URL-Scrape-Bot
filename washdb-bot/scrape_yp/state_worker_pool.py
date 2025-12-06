@@ -1,16 +1,16 @@
 """
 State-Partitioned Worker Pool for Yellow Pages Scraping.
 
-This module implements a 10-worker system where each worker:
-- Scrapes exactly 5 assigned US states
-- Uses 5 dedicated proxies with per-request rotation
+This module implements a 5-worker system where each worker:
+- Scrapes exactly 10 assigned US states
+- Uses 10 dedicated proxies with per-request rotation
 - Runs independently in its own process
 - Uses the same scraping logic as the single worker
 
 Architecture:
-- 10 worker processes
-- State assignments from state_assignments.py
-- Per-worker proxy pool (5 proxies each, 50 total)
+- 5 worker processes (10-worker system removed 2025-12-05)
+- State assignments from state_assignments_5worker.py
+- Per-worker proxy pool (10 proxies each, 50 total)
 - PostgreSQL row-level locking for target coordination
 - Individual worker logs for debugging
 """
@@ -27,7 +27,7 @@ from typing import List, Optional
 
 from runner.logging_setup import setup_logging
 from scrape_yp.proxy_pool import WorkerProxyPool
-from scrape_yp.state_assignments import get_states_for_worker, get_proxy_assignments
+from scrape_yp.state_assignments_5worker import get_states_for_worker, get_proxy_assignments
 from scrape_yp.yp_crawl_city_first import crawl_single_target
 from scrape_yp.yp_filter import YPFilter
 from scrape_yp.yp_monitor import ScraperMonitor
@@ -485,7 +485,7 @@ def main():
 
     config = {
         "proxy_file": os.getenv("PROXY_FILE", "data/webshare_proxies.txt"),
-        "num_workers": int(os.getenv("WORKER_COUNT", "10")),
+        "num_workers": int(os.getenv("WORKER_COUNT", "5")),  # 5-worker system only (10-worker removed 2025-12-05)
         "min_delay_seconds": float(os.getenv("MIN_DELAY_SECONDS", "10.0")),
         "max_delay_seconds": float(os.getenv("MAX_DELAY_SECONDS", "20.0")),
         "max_targets_per_browser": int(os.getenv("MAX_TARGETS_PER_BROWSER", "100")),

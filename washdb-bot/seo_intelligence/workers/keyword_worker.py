@@ -134,17 +134,21 @@ class KeywordIntelligenceWorker(BaseModuleWorker):
         """
         Get companies that need keyword analysis.
 
-        Selects companies without recent keyword research.
+        Selects verified companies without recent keyword research.
         """
         session = self.Session()
         try:
-            query = text("""
+            # Get verified companies without recent keyword research
+            # Only process verified companies (passed verification or human-labeled as provider)
+            verification_clause = self.get_verification_where_clause()
+            query = text(f"""
                 SELECT c.id
                 FROM companies c
                 LEFT JOIN keyword_research kr ON c.id = kr.company_id
                     AND kr.analyzed_at > NOW() - INTERVAL '7 days'
                 WHERE c.website IS NOT NULL
                   AND c.active = true
+                  AND {verification_clause}
                   AND kr.id IS NULL
                   AND (:after_id IS NULL OR c.id > :after_id)
                 ORDER BY c.id ASC
@@ -160,13 +164,15 @@ class KeywordIntelligenceWorker(BaseModuleWorker):
 
         except Exception as e:
             logger.error(f"Error getting companies: {e}")
-            # Fall back to simple query
+            # Fall back to simple query with verification filter
             try:
-                query = text("""
+                verification_clause = self.get_verification_where_clause()
+                query = text(f"""
                     SELECT c.id
                     FROM companies c
                     WHERE c.website IS NOT NULL
                       AND c.active = true
+                      AND {verification_clause}
                       AND (:after_id IS NULL OR c.id > :after_id)
                     ORDER BY c.id ASC
                     LIMIT :limit
