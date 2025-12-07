@@ -24,7 +24,7 @@ import random
 import signal
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Dict
 
@@ -234,7 +234,7 @@ def acquire_target_for_worker(state_ids: List[str], logger) -> Optional[int]:
         if target:
             # Mark as IN_PROGRESS (will be updated by crawl_single_target)
             target.status = "IN_PROGRESS"
-            target.claimed_at = datetime.utcnow()
+            target.claimed_at = datetime.now(timezone.utc)
             session.commit()
 
             logger.debug(f"Acquired target {target.id}: {target.city}, {target.state_id}")
@@ -267,7 +267,7 @@ def mark_target_failed(target_id: int, error_message: str, logger):
         if target:
             target.status = "FAILED"
             target.error_message = error_message[:500]  # Truncate if too long
-            target.completed_at = datetime.utcnow()
+            target.completed_at = datetime.now(timezone.utc)
             session.commit()
 
             logger.info(f"Marked target {target_id} as FAILED")

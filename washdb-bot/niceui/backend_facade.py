@@ -7,7 +7,7 @@ import os
 import csv
 import json
 from typing import Dict, List, Any, Optional, Callable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Import actual scraper modules
@@ -204,7 +204,7 @@ def cleanup_orphaned_targets(session, heartbeat_timeout_minutes: int = 30) -> di
     from sqlalchemy import func
 
     cleanup_counts = {'YP': 0, 'Google': 0, 'Yelp': 0}
-    cutoff_time = datetime.utcnow() - timedelta(minutes=heartbeat_timeout_minutes)
+    cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=heartbeat_timeout_minutes)
 
     # ===== Google Targets =====
     if not check_google_workers_running():
@@ -841,7 +841,7 @@ class BackendFacade:
         """
         from db.models import YPTarget, GoogleTarget, YelpTarget
         from sqlalchemy import func, desc
-        from datetime import datetime
+        from datetime import datetime, timezone
 
         session = create_session()
         statuses = {}
@@ -1333,7 +1333,7 @@ class BackendFacade:
             ).scalar()
 
             # Updated in last 30 days
-            thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+            thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
             updated_30d = session.execute(
                 select(func.count(Company.id)).where(
                     Company.last_updated >= thirty_days_ago
@@ -1341,7 +1341,7 @@ class BackendFacade:
             ).scalar()
 
             # New in last 7 days
-            seven_days_ago = datetime.utcnow() - timedelta(days=7)
+            seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
             new_7d = session.execute(
                 select(func.count(Company.id)).where(
                     Company.created_at >= seven_days_ago
@@ -1398,7 +1398,7 @@ class BackendFacade:
 
         try:
             # Calculate date threshold
-            cutoff_date = datetime.utcnow() - timedelta(days=days)
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
 
             # Query for new companies
             stmt = select(Company).where(

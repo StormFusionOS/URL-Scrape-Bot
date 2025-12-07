@@ -41,26 +41,58 @@ class ContinuousSerpScraper:
     """
     Continuous SERP scraper for verified company URLs.
 
-    Runs at ultra-slow rate (1-2 sites/hour) to minimize detection.
-    Implements CAPTCHA cooldown and cycle-based operation.
+    Uses time-window scheduling to maximize success rate:
+    - Scrape in 3-4 windows per day (e.g., 6AM, 12PM, 6PM, 12AM)
+    - 5-10 queries per window
+    - 4-5 hour gaps between windows
+    - Progressive CAPTCHA backoff via domain_quarantine
+
+    Implements detection evasion:
+    - Variable delays within windows
+    - Window-based scheduling matches human behavior patterns
+    - Integration with browser profile persistence
     """
 
-    # Rate limits: 30-60 minutes per site (1-2 sites/hour)
+    # Time windows for scraping (24-hour format)
+    # Structured to match typical human browsing patterns
+    SCRAPE_WINDOWS = [
+        {'hour': 6, 'name': 'early_morning'},   # 6 AM - people checking before work
+        {'hour': 12, 'name': 'lunch'},          # 12 PM - lunch break browsing
+        {'hour': 18, 'name': 'evening'},        # 6 PM - after work browsing
+        {'hour': 0, 'name': 'late_night'},      # 12 AM - late night browsing
+    ]
+
+    # Queries per window
+    MIN_QUERIES_PER_WINDOW = 5
+    MAX_QUERIES_PER_WINDOW = 10
+
+    # Delay between queries within a window (minutes)
+    MIN_DELAY_MINUTES = 3  # 3 minutes minimum
+    MAX_DELAY_MINUTES = 8  # 8 minutes maximum
+
+    # Legacy rate limits (for non-window mode)
     MIN_DELAY_SECONDS = 1800  # 30 minutes
     MAX_DELAY_SECONDS = 3600  # 60 minutes
 
     # Cycle rest period: 60 minutes after completing all sites
     CYCLE_REST_SECONDS = 3600  # 60 minutes
 
-    # CAPTCHA cooldown settings
+    # CAPTCHA cooldown settings - now integrated with progressive backoff
     DEFAULT_MAX_CONSECUTIVE_CAPTCHAS = 3  # Pause after 3 consecutive CAPTCHAs
-    CAPTCHA_COOLDOWN_SECONDS = 7200  # 2 hour cooldown
+    CAPTCHA_COOLDOWN_SECONDS = 7200  # 2 hour cooldown (base, progressive may be longer)
 
     # Progress tracking file
     PROGRESS_FILE = "/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/.serp_scraper_progress.json"
 
-    def __init__(self, max_consecutive_captchas: int = 3, dry_run: bool = False):
-        """Initialize continuous scraper."""
+    def __init__(self, max_consecutive_captchas: int = 3, dry_run: bool = False, use_windows: bool = True):
+        """
+        Initialize continuous scraper.
+
+        Args:
+            max_consecutive_captchas: Max CAPTCHAs before cooldown
+            dry_run: If True, don't actually scrape
+            use_windows: If True, use time-window scheduling (recommended)
+        """
         self.db = DatabaseManager()
         self.scraper = SerpScraper(
             headless=True,  # Hybrid mode
@@ -71,6 +103,11 @@ class ContinuousSerpScraper:
 
         self.max_consecutive_captchas = max_consecutive_captchas
         self.dry_run = dry_run
+        self.use_windows = use_windows
+
+        # Import domain quarantine for progressive backoff
+        from seo_intelligence.services import get_domain_quarantine
+        self.quarantine = get_domain_quarantine()
 
         # Stats tracking
         self.cycle_num = 0
@@ -78,14 +115,22 @@ class ContinuousSerpScraper:
         self.total_captchas = 0
         self.consecutive_captchas = 0
         self.captcha_cooldowns = 0
+        self.window_scrapes = 0  # Scrapes in current window
 
         # Load progress
         self.last_scraped_id = self._load_progress()
 
         logger.info(f"Continuous SERP Scraper Initialized")
-        logger.info(f"Rate limit: {self.MIN_DELAY_SECONDS//60}-{self.MAX_DELAY_SECONDS//60} minutes per site")
+        if self.use_windows:
+            logger.info(f"Mode: Time-window scheduling")
+            logger.info(f"Windows: {[w['name'] for w in self.SCRAPE_WINDOWS]}")
+            logger.info(f"Queries per window: {self.MIN_QUERIES_PER_WINDOW}-{self.MAX_QUERIES_PER_WINDOW}")
+            logger.info(f"Delay between queries: {self.MIN_DELAY_MINUTES}-{self.MAX_DELAY_MINUTES} minutes")
+        else:
+            logger.info(f"Mode: Legacy continuous")
+            logger.info(f"Rate limit: {self.MIN_DELAY_SECONDS//60}-{self.MAX_DELAY_SECONDS//60} minutes per site")
         logger.info(f"Cycle rest: {self.CYCLE_REST_SECONDS//60} minutes")
-        logger.info(f"CAPTCHA threshold: {self.max_consecutive_captchas} consecutive")
+        logger.info(f"CAPTCHA threshold: {self.max_consecutive_captchas} consecutive (with progressive backoff)")
         logger.info(f"Dry run: {self.dry_run}")
         if self.last_scraped_id:
             logger.info(f"Resuming from company ID: {self.last_scraped_id}")
@@ -135,7 +180,7 @@ class ContinuousSerpScraper:
         Returns companies in order, starting after last_scraped_id if resuming.
         """
         with self.db.get_session() as session:
-            # Build query
+            # Build query using standardized schema: verified=true for verified companies
             query = """
                 SELECT
                     c.id,
@@ -143,9 +188,8 @@ class ContinuousSerpScraper:
                     c.website,
                     c.address
                 FROM companies c
-                WHERE c.parse_metadata->'verification'->>'status' = 'passed'
+                WHERE c.verified = true
                 AND c.website IS NOT NULL
-                AND c.active = true
             """
 
             # Add resume clause if needed
@@ -290,6 +334,168 @@ class ContinuousSerpScraper:
         else:
             logger.info("[DRY RUN] Skipping delay")
 
+    def _window_delay(self):
+        """Wait random delay for window-based scheduling (shorter than legacy)."""
+        delay_minutes = random.uniform(self.MIN_DELAY_MINUTES, self.MAX_DELAY_MINUTES)
+        delay_seconds = delay_minutes * 60
+
+        resume_time = datetime.now() + timedelta(seconds=delay_seconds)
+
+        logger.info(f"⏳ Window delay: {delay_minutes:.1f} minutes")
+        logger.info(f"Next scrape at: {resume_time.strftime('%H:%M:%S')}")
+
+        if not self.dry_run:
+            time.sleep(delay_seconds)
+        else:
+            logger.info("[DRY RUN] Skipping delay")
+
+    def _get_current_window(self) -> Optional[Dict]:
+        """
+        Get the current scraping window if within one.
+
+        Returns:
+            Window dict if currently in a window, None otherwise
+        """
+        now = datetime.now()
+        current_hour = now.hour
+
+        for window in self.SCRAPE_WINDOWS:
+            window_hour = window['hour']
+            # Window is active for 1 hour
+            if current_hour == window_hour:
+                return window
+
+        return None
+
+    def _get_next_window(self) -> tuple:
+        """
+        Get the next scraping window.
+
+        Returns:
+            Tuple of (window_dict, seconds_until_window)
+        """
+        now = datetime.now()
+        current_hour = now.hour
+
+        # Sort windows by hour
+        sorted_windows = sorted(self.SCRAPE_WINDOWS, key=lambda w: w['hour'])
+
+        # Find next window
+        for window in sorted_windows:
+            if window['hour'] > current_hour:
+                # Next window is today
+                next_time = now.replace(hour=window['hour'], minute=0, second=0, microsecond=0)
+                seconds_until = (next_time - now).total_seconds()
+                return window, seconds_until
+
+        # Next window is tomorrow (first window)
+        first_window = sorted_windows[0]
+        tomorrow = now + timedelta(days=1)
+        next_time = tomorrow.replace(hour=first_window['hour'], minute=0, second=0, microsecond=0)
+        seconds_until = (next_time - now).total_seconds()
+        return first_window, seconds_until
+
+    def _wait_for_next_window(self):
+        """Wait until the next scraping window."""
+        window, seconds_until = self._get_next_window()
+        hours_until = seconds_until / 3600
+
+        resume_time = datetime.now() + timedelta(seconds=seconds_until)
+
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info(f"⏸️  WAITING FOR NEXT WINDOW: {window['name']}")
+        logger.info("=" * 80)
+        logger.info(f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Next window: {window['name']} at {window['hour']}:00")
+        logger.info(f"Wait time: {hours_until:.1f} hours")
+        logger.info(f"Resume at: {resume_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info("")
+
+        if not self.dry_run:
+            time.sleep(seconds_until)
+        else:
+            logger.info("[DRY RUN] Skipping window wait")
+
+    def run_window(self) -> int:
+        """
+        Run a single scraping window.
+
+        Scrapes MIN_QUERIES_PER_WINDOW to MAX_QUERIES_PER_WINDOW companies
+        with short delays between each.
+
+        Returns:
+            Number of companies successfully scraped
+        """
+        window = self._get_current_window()
+        if not window:
+            logger.warning("Not currently in a scraping window")
+            return 0
+
+        # Determine number of queries for this window
+        queries_this_window = random.randint(
+            self.MIN_QUERIES_PER_WINDOW,
+            self.MAX_QUERIES_PER_WINDOW
+        )
+
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info(f"🔍 WINDOW: {window['name'].upper()}")
+        logger.info("=" * 80)
+        logger.info(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Target queries: {queries_this_window}")
+        logger.info("")
+
+        # Get companies to scrape
+        companies = self._get_verified_companies()
+
+        if not companies:
+            logger.info("No companies to scrape (all caught up!)")
+            self._reset_progress()
+            return 0
+
+        # Scrape up to queries_this_window companies
+        scraped = 0
+        failed = 0
+
+        for i, company in enumerate(companies[:queries_this_window], 1):
+            # Check if Google is quarantined
+            if self.quarantine.is_quarantined('google.com'):
+                entry = self.quarantine.get_quarantine_entry('google.com')
+                logger.warning(f"Google quarantined until {entry.expires_at}. Skipping window.")
+                break
+
+            logger.info(f"\nQuery {i}/{queries_this_window} in {window['name']} window")
+
+            success = self._scrape_company(company)
+
+            if success:
+                scraped += 1
+                self.total_scraped += 1
+            else:
+                failed += 1
+                # Register CAPTCHA with quarantine service for progressive backoff
+                self.quarantine.quarantine_domain(
+                    domain='google.com',
+                    reason='CAPTCHA_DETECTED'
+                )
+
+            # Save progress
+            self._save_progress(company['id'])
+
+            # Delay before next query (unless last one)
+            if i < queries_this_window and i < len(companies):
+                self._window_delay()
+
+        logger.info("")
+        logger.info(f"Window {window['name']} complete:")
+        logger.info(f"  Scraped: {scraped}")
+        logger.info(f"  Failed: {failed}")
+        logger.info(f"  Total scraped (all time): {self.total_scraped}")
+
+        self.window_scrapes = scraped
+        return scraped
+
     def run_cycle(self):
         """Run a single scraping cycle (all verified companies)."""
         self.cycle_num += 1
@@ -359,12 +565,71 @@ class ContinuousSerpScraper:
         self._reset_progress()
 
     def run(self):
-        """Run continuous scraper forever."""
+        """Run continuous scraper forever using window or legacy mode."""
         logger.info("")
         logger.info("="*80)
         logger.info("CONTINUOUS SERP SCRAPER STARTING")
         logger.info("="*80)
         logger.info(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Mode: {'Time-window scheduling' if self.use_windows else 'Legacy continuous'}")
+        logger.info("")
+
+        if self.use_windows:
+            self._run_window_mode()
+        else:
+            self._run_legacy_mode()
+
+    def _run_window_mode(self):
+        """Run using time-window scheduling."""
+        logger.info("Running in TIME-WINDOW mode")
+        window_list = [f"{w['name']} ({w['hour']}:00)" for w in self.SCRAPE_WINDOWS]
+        logger.info(f"Windows: {window_list}")
+        logger.info("")
+
+        try:
+            windows_completed = 0
+
+            while True:
+                # Check if we're in a window
+                current_window = self._get_current_window()
+
+                if current_window:
+                    # We're in a window - scrape!
+                    logger.info(f"✓ Currently in window: {current_window['name']}")
+                    scraped = self.run_window()
+                    windows_completed += 1
+
+                    logger.info("")
+                    logger.info(f"Windows completed today: {windows_completed}")
+                    logger.info(f"Total scraped (all time): {self.total_scraped}")
+
+                    # Get quarantine stats
+                    stats = self.quarantine.get_captcha_stats('google.com')
+                    logger.info(f"Google CAPTCHA tier: {stats['current_tier']}")
+                    logger.info(f"Total CAPTCHAs: {stats['captcha_count']}")
+
+                # Wait for next window
+                self._wait_for_next_window()
+
+                if self.dry_run:
+                    logger.info("[DRY RUN] Exiting after one window cycle")
+                    break
+
+        except KeyboardInterrupt:
+            logger.info("")
+            logger.info("Interrupted by user. Shutting down gracefully...")
+            logger.info(f"Total scraped: {self.total_scraped}")
+            logger.info(f"Windows completed: {windows_completed if 'windows_completed' in dir() else 0}")
+            stats = self.quarantine.get_captcha_stats('google.com')
+            logger.info(f"Google CAPTCHA stats: tier {stats['current_tier']}, count {stats['captcha_count']}")
+            logger.info("Progress saved. Can resume later.")
+        except Exception as e:
+            logger.error(f"Fatal error: {e}", exc_info=True)
+            raise
+
+    def _run_legacy_mode(self):
+        """Run using legacy continuous mode (slower, for compatibility)."""
+        logger.info("Running in LEGACY mode (30-60 minute delays)")
         logger.info("")
 
         try:
@@ -400,11 +665,13 @@ def main():
     parser = argparse.ArgumentParser(description='Continuous SERP scraper for verified companies')
     parser.add_argument('--dry-run', action='store_true', help='Dry run mode (no actual scraping)')
     parser.add_argument('--max-consecutive-captchas', type=int, default=3, help='Max consecutive CAPTCHAs before cooldown')
+    parser.add_argument('--legacy', action='store_true', help='Use legacy mode (30-60 min delays) instead of window scheduling')
     args = parser.parse_args()
 
     scraper = ContinuousSerpScraper(
         max_consecutive_captchas=args.max_consecutive_captchas,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        use_windows=not args.legacy  # Default to window mode unless --legacy specified
     )
     scraper.run()
 

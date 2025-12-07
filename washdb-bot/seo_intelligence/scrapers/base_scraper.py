@@ -16,6 +16,7 @@ All scrapers (SERP, competitor, backlinks, citations) inherit from this class.
 import os
 import time
 import random
+import math
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, List, Tuple
 from contextlib import contextmanager
@@ -272,109 +273,466 @@ class BaseScraper(ABC):
             },
         }
 
+    def _bezier_curve_points(
+        self,
+        start: Tuple[float, float],
+        end: Tuple[float, float],
+        num_points: int = 20
+    ) -> List[Tuple[float, float]]:
+        """
+        Generate points along a cubic Bezier curve for natural mouse movement.
+
+        Uses randomized control points to create organic, human-like curves
+        rather than straight lines between positions.
+
+        Args:
+            start: Starting (x, y) position
+            end: Ending (x, y) position
+            num_points: Number of points to generate along the curve
+
+        Returns:
+            List of (x, y) tuples along the Bezier curve
+        """
+        # Calculate distance for control point offset
+        distance = math.sqrt((end[0] - start[0]) ** 2 + (end[1] - start[1]) ** 2)
+        offset = distance * random.uniform(0.2, 0.5)
+
+        # Generate two random control points for cubic Bezier
+        # Control points offset perpendicular to the line between start and end
+        angle = math.atan2(end[1] - start[1], end[0] - start[0])
+        perpendicular = angle + math.pi / 2
+
+        # First control point (biased toward start)
+        ctrl1_offset = random.uniform(-offset, offset)
+        ctrl1 = (
+            start[0] + (end[0] - start[0]) * 0.3 + ctrl1_offset * math.cos(perpendicular),
+            start[1] + (end[1] - start[1]) * 0.3 + ctrl1_offset * math.sin(perpendicular)
+        )
+
+        # Second control point (biased toward end)
+        ctrl2_offset = random.uniform(-offset, offset)
+        ctrl2 = (
+            start[0] + (end[0] - start[0]) * 0.7 + ctrl2_offset * math.cos(perpendicular),
+            start[1] + (end[1] - start[1]) * 0.7 + ctrl2_offset * math.sin(perpendicular)
+        )
+
+        # Generate points along the cubic Bezier curve
+        points = []
+        for i in range(num_points + 1):
+            t = i / num_points
+
+            # Cubic Bezier formula: B(t) = (1-t)³P0 + 3(1-t)²tP1 + 3(1-t)t²P2 + t³P3
+            x = (
+                (1 - t) ** 3 * start[0] +
+                3 * (1 - t) ** 2 * t * ctrl1[0] +
+                3 * (1 - t) * t ** 2 * ctrl2[0] +
+                t ** 3 * end[0]
+            )
+            y = (
+                (1 - t) ** 3 * start[1] +
+                3 * (1 - t) ** 2 * t * ctrl1[1] +
+                3 * (1 - t) * t ** 2 * ctrl2[1] +
+                t ** 3 * end[1]
+            )
+
+            # Add micro-jitter for even more natural movement
+            jitter = random.uniform(-1.5, 1.5)
+            points.append((x + jitter, y + jitter))
+
+        return points
+
+    def _human_mouse_move(
+        self,
+        page: Page,
+        target_x: float,
+        target_y: float,
+        speed: str = "normal"
+    ):
+        """
+        Move mouse to target position using natural Bezier curve movement.
+
+        Simulates human hand movement with variable speed and micro-pauses.
+
+        Args:
+            page: Playwright Page object
+            target_x: Target X coordinate
+            target_y: Target Y coordinate
+            speed: "slow", "normal", or "fast"
+        """
+        try:
+            # Get current mouse position (default to center if unknown)
+            viewport = page.viewport_size
+            current_x = random.randint(100, viewport['width'] - 100) if viewport else 500
+            current_y = random.randint(100, viewport['height'] - 100) if viewport else 400
+
+            # Determine number of points based on distance and speed
+            distance = math.sqrt((target_x - current_x) ** 2 + (target_y - current_y) ** 2)
+            speed_multiplier = {"slow": 1.5, "normal": 1.0, "fast": 0.6}.get(speed, 1.0)
+            num_points = max(10, min(40, int(distance / 15 * speed_multiplier)))
+
+            # Generate Bezier curve points
+            points = self._bezier_curve_points(
+                (current_x, current_y),
+                (target_x, target_y),
+                num_points
+            )
+
+            # Move through points with variable timing
+            for i, (x, y) in enumerate(points):
+                # Clamp coordinates to valid viewport range
+                if viewport:
+                    x = max(0, min(viewport['width'], x))
+                    y = max(0, min(viewport['height'], y))
+
+                page.mouse.move(x, y)
+
+                # Variable delay between movements (slower at start and end)
+                progress = i / len(points)
+                # Bell curve timing - slower at edges, faster in middle
+                base_delay = 0.008 / speed_multiplier
+                timing_factor = 1.0 + 0.5 * math.sin(progress * math.pi)
+                delay = base_delay * timing_factor * random.uniform(0.8, 1.2)
+                time.sleep(delay)
+
+                # Occasional micro-pause (like hand adjustment)
+                if random.random() < 0.05:
+                    time.sleep(random.uniform(0.02, 0.08))
+
+        except Exception as e:
+            # Fallback to simple move on error
+            self.logger.debug(f"Bezier move failed, using simple move: {e}")
+            page.mouse.move(target_x, target_y, steps=random.randint(5, 15))
+
+    def _human_scroll(self, page: Page, pattern: str = "random"):
+        """
+        Simulate human-like scrolling with various patterns.
+
+        Args:
+            page: Playwright Page object
+            pattern: "down", "up", "browse", "skim", "random"
+        """
+        if pattern == "random":
+            pattern = random.choice(["down", "browse", "skim"])
+
+        try:
+            viewport = page.viewport_size
+            viewport_height = viewport['height'] if viewport else 800
+
+            if pattern == "down":
+                # Scroll down in chunks (like reading)
+                total_scroll = random.randint(400, 1200)
+                scrolled = 0
+                while scrolled < total_scroll:
+                    chunk = random.randint(80, 200)
+                    page.mouse.wheel(0, chunk)
+                    scrolled += chunk
+                    # Variable reading pause
+                    time.sleep(random.uniform(0.3, 1.2))
+
+            elif pattern == "up":
+                # Scroll back up (re-reading or going back)
+                total_scroll = random.randint(200, 600)
+                scrolled = 0
+                while scrolled < total_scroll:
+                    chunk = random.randint(100, 250)
+                    page.mouse.wheel(0, -chunk)
+                    scrolled += chunk
+                    time.sleep(random.uniform(0.2, 0.8))
+
+            elif pattern == "browse":
+                # Browse pattern: scroll down, pause, sometimes scroll up
+                for _ in range(random.randint(2, 5)):
+                    # Scroll down
+                    page.mouse.wheel(0, random.randint(150, 350))
+                    time.sleep(random.uniform(0.8, 2.5))
+
+                    # Sometimes scroll up slightly (re-reading)
+                    if random.random() > 0.6:
+                        page.mouse.wheel(0, -random.randint(50, 150))
+                        time.sleep(random.uniform(0.3, 1.0))
+
+            elif pattern == "skim":
+                # Fast skim through content
+                for _ in range(random.randint(3, 6)):
+                    page.mouse.wheel(0, random.randint(200, 400))
+                    time.sleep(random.uniform(0.1, 0.4))
+
+        except Exception as e:
+            self.logger.debug(f"Human scroll failed: {e}")
+
+    def _human_click(self, page: Page, element_or_coords, click_type: str = "single"):
+        """
+        Perform human-like click with natural delay patterns.
+
+        Args:
+            page: Playwright Page object
+            element_or_coords: Element to click or (x, y) tuple
+            click_type: "single", "double", or "right"
+        """
+        try:
+            # Pre-click pause (decision time)
+            time.sleep(random.uniform(0.1, 0.4))
+
+            if isinstance(element_or_coords, tuple):
+                x, y = element_or_coords
+            else:
+                # Get element bounding box
+                box = element_or_coords.bounding_box()
+                if not box:
+                    return
+                # Click slightly off-center (humans don't click perfect center)
+                x = box['x'] + box['width'] * random.uniform(0.3, 0.7)
+                y = box['y'] + box['height'] * random.uniform(0.3, 0.7)
+
+            # Move to click position with natural movement
+            self._human_mouse_move(page, x, y, speed="normal")
+
+            # Brief pause before click (like aiming)
+            time.sleep(random.uniform(0.05, 0.15))
+
+            # Perform click with slight delay variations
+            if click_type == "single":
+                page.mouse.click(x, y, delay=random.uniform(50, 150))
+            elif click_type == "double":
+                page.mouse.dblclick(x, y, delay=random.uniform(50, 150))
+            elif click_type == "right":
+                page.mouse.click(x, y, button="right", delay=random.uniform(50, 150))
+
+            # Post-click pause (reaction time)
+            time.sleep(random.uniform(0.1, 0.3))
+
+        except Exception as e:
+            self.logger.debug(f"Human click failed: {e}")
+
     def _simulate_human_behavior(self, page: Page, intensity: str = "normal"):
         """
         Simulate human-like behavior on the page.
 
-        Includes random mouse movements, scrolling, reading pauses, and delays.
+        Enhanced version with Bezier curve mouse movements, natural scrolling patterns,
+        and realistic timing variations.
 
         Args:
             intensity: "light", "normal", or "thorough" - how much human simulation
         """
         try:
+            viewport = page.viewport_size
+            vw = viewport['width'] if viewport else 1200
+            vh = viewport['height'] if viewport else 800
+
             # Random initial delay (humans don't act instantly)
-            if intensity == "light":
-                time.sleep(random.uniform(0.5, 1.5))
-            elif intensity == "normal":
-                time.sleep(random.uniform(1.0, 3.0))
-            else:  # thorough
-                time.sleep(random.uniform(2.0, 5.0))
+            initial_delays = {"light": (0.3, 1.0), "normal": (0.8, 2.5), "thorough": (1.5, 4.0)}
+            delay_range = initial_delays.get(intensity, (0.8, 2.5))
+            time.sleep(random.uniform(*delay_range))
 
-            # Random mouse movement (like looking around the page)
-            move_count = {"light": 2, "normal": 4, "thorough": 8}.get(intensity, 4)
-            for _ in range(random.randint(2, move_count)):
-                x = random.randint(100, 1200)
-                y = random.randint(100, 800)
-                # Move in a more natural curve by using small steps
-                page.mouse.move(x, y, steps=random.randint(5, 15))
-                time.sleep(random.uniform(0.1, 0.4))
+            # Phase 1: Initial mouse movement (looking around the page)
+            move_counts = {"light": (1, 2), "normal": (2, 4), "thorough": (4, 7)}
+            move_range = move_counts.get(intensity, (2, 4))
 
-            # Simulate reading the page (longer pause)
+            for _ in range(random.randint(*move_range)):
+                # Natural target positions (avoid edges)
+                target_x = random.randint(int(vw * 0.1), int(vw * 0.9))
+                target_y = random.randint(int(vh * 0.1), int(vh * 0.85))
+
+                # Use Bezier curve movement
+                self._human_mouse_move(page, target_x, target_y, speed="normal")
+
+                # Brief pause at each position (like reading/scanning)
+                time.sleep(random.uniform(0.2, 0.8))
+
+            # Phase 2: Reading pause (simulates reading content)
             if intensity != "light":
-                reading_time = random.uniform(1.0, 4.0)
+                reading_times = {"normal": (1.5, 4.0), "thorough": (3.0, 8.0)}
+                read_range = reading_times.get(intensity, (1.5, 4.0))
+                reading_time = random.uniform(*read_range)
                 self.logger.debug(f"Simulating reading for {reading_time:.1f}s")
                 time.sleep(reading_time)
 
-            # Random scroll (humans often scroll to read content)
-            scroll_amount = random.randint(200, 600)
-            page.mouse.wheel(0, scroll_amount)
-            time.sleep(random.uniform(0.5, 1.5))
+            # Phase 3: Scrolling behavior (varies by intensity)
+            scroll_patterns = {
+                "light": ["down"],
+                "normal": ["down", "browse"],
+                "thorough": ["browse", "skim", "down"]
+            }
+            patterns = scroll_patterns.get(intensity, ["down"])
+            self._human_scroll(page, pattern=random.choice(patterns))
 
-            # Sometimes scroll more
-            if random.random() > 0.4:
-                page.mouse.wheel(0, random.randint(100, 300))
-                time.sleep(random.uniform(0.3, 0.8))
+            # Phase 4: Occasionally scroll back up (re-reading)
+            if random.random() > (0.7 if intensity == "light" else 0.5):
+                time.sleep(random.uniform(0.5, 1.5))
+                self._human_scroll(page, pattern="up")
 
-            # Sometimes scroll back up (like re-reading something)
-            if random.random() > 0.5:
-                page.mouse.wheel(0, -scroll_amount // 2)
-                time.sleep(random.uniform(0.3, 0.8))
-
-            # Occasionally hover over elements (like reading links)
-            if intensity == "thorough" and random.random() > 0.6:
+            # Phase 5: Hover over interactive elements (thorough mode)
+            if intensity == "thorough" and random.random() > 0.5:
                 try:
-                    links = page.query_selector_all("a")[:5]
-                    if links:
-                        link = random.choice(links)
-                        link.hover()
-                        time.sleep(random.uniform(0.2, 0.6))
+                    # Find visible links/buttons
+                    elements = page.query_selector_all("a, button, [role='button']")[:10]
+                    if elements:
+                        # Hover over 1-3 random elements
+                        for element in random.sample(elements, min(len(elements), random.randint(1, 3))):
+                            box = element.bounding_box()
+                            if box and box['width'] > 5 and box['height'] > 5:
+                                target_x = box['x'] + box['width'] / 2
+                                target_y = box['y'] + box['height'] / 2
+                                self._human_mouse_move(page, target_x, target_y, speed="slow")
+                                time.sleep(random.uniform(0.3, 1.0))
                 except Exception:
                     pass
 
-            # Final reading pause
+            # Phase 6: Final pause before action
             if intensity != "light":
-                time.sleep(random.uniform(0.5, 2.0))
+                time.sleep(random.uniform(0.3, 1.5))
 
         except Exception as e:
             # Don't fail if human simulation fails
             self.logger.debug(f"Human simulation skipped: {e}")
 
-    def _simulate_typing(self, page: Page, selector: str, text: str):
+    def _simulate_typing(
+        self,
+        page: Page,
+        selector: str,
+        text: str,
+        typo_rate: float = 0.02,
+        speed: str = "normal"
+    ):
         """
-        Simulate human-like typing with variable speed and occasional pauses.
+        Simulate human-like typing with variable speed, typos, and corrections.
+
+        Enhanced version with:
+        - Variable typing speed based on character patterns
+        - Occasional typos with corrections (makes it look very human)
+        - Natural pauses at word boundaries and punctuation
+        - Different speeds for different character types
 
         Args:
             page: Playwright Page object
             selector: CSS selector for the input field
             text: Text to type
+            typo_rate: Probability of making a typo (0.0-1.0)
+            speed: "slow", "normal", or "fast"
         """
+        # Speed profiles (base delay in seconds)
+        speed_profiles = {
+            "slow": {"base": 0.15, "variance": 0.08, "pause_mult": 1.5},
+            "normal": {"base": 0.08, "variance": 0.05, "pause_mult": 1.0},
+            "fast": {"base": 0.04, "variance": 0.02, "pause_mult": 0.7},
+        }
+        profile = speed_profiles.get(speed, speed_profiles["normal"])
+
+        # Common typos - adjacent keys on QWERTY keyboard
+        typo_map = {
+            'a': ['s', 'q', 'z'], 'b': ['v', 'n', 'g', 'h'],
+            'c': ['x', 'v', 'd', 'f'], 'd': ['s', 'f', 'e', 'r', 'c', 'x'],
+            'e': ['w', 'r', 'd', 's'], 'f': ['d', 'g', 'r', 't', 'v', 'c'],
+            'g': ['f', 'h', 't', 'y', 'b', 'v'], 'h': ['g', 'j', 'y', 'u', 'n', 'b'],
+            'i': ['u', 'o', 'k', 'j'], 'j': ['h', 'k', 'u', 'i', 'm', 'n'],
+            'k': ['j', 'l', 'i', 'o', 'm'], 'l': ['k', 'o', 'p'],
+            'm': ['n', 'j', 'k'], 'n': ['b', 'm', 'h', 'j'],
+            'o': ['i', 'p', 'k', 'l'], 'p': ['o', 'l'],
+            'q': ['w', 'a'], 'r': ['e', 't', 'd', 'f'],
+            's': ['a', 'd', 'w', 'e', 'x', 'z'], 't': ['r', 'y', 'f', 'g'],
+            'u': ['y', 'i', 'h', 'j'], 'v': ['c', 'b', 'f', 'g'],
+            'w': ['q', 'e', 'a', 's'], 'x': ['z', 'c', 's', 'd'],
+            'y': ['t', 'u', 'g', 'h'], 'z': ['a', 'x', 's'],
+        }
+
         try:
             element = page.query_selector(selector)
             if not element:
                 self.logger.warning(f"Element not found: {selector}")
                 return
 
+            # Click on the element with natural movement
+            box = element.bounding_box()
+            if box:
+                click_x = box['x'] + box['width'] * random.uniform(0.3, 0.7)
+                click_y = box['y'] + box['height'] * random.uniform(0.3, 0.7)
+                self._human_mouse_move(page, click_x, click_y, speed="normal")
+
             element.click()
-            time.sleep(random.uniform(0.2, 0.5))
+            time.sleep(random.uniform(0.2, 0.6))  # Pause before typing
 
-            # Type character by character with variable delays
+            # Track what we've typed for potential corrections
+            chars_typed = []
+
             for i, char in enumerate(text):
-                element.type(char)
+                # Simulate potential typo
+                should_typo = (
+                    random.random() < typo_rate and
+                    char.lower() in typo_map and
+                    i < len(text) - 1  # Don't typo on last character
+                )
 
-                # Variable delay between keystrokes (humans don't type uniformly)
-                if random.random() > 0.9:
-                    # Occasional longer pause (thinking)
-                    time.sleep(random.uniform(0.3, 0.8))
-                else:
-                    # Normal typing speed varies between 50-200ms per char
+                if should_typo:
+                    # Type wrong character
+                    wrong_char = random.choice(typo_map[char.lower()])
+                    if char.isupper():
+                        wrong_char = wrong_char.upper()
+
+                    element.type(wrong_char)
+                    chars_typed.append(wrong_char)
+                    time.sleep(random.uniform(0.05, 0.15))
+
+                    # Brief pause (realizing mistake)
+                    time.sleep(random.uniform(0.1, 0.4))
+
+                    # Backspace to fix
+                    page.keyboard.press("Backspace")
+                    chars_typed.pop()
+                    time.sleep(random.uniform(0.05, 0.15))
+
+                    # Slightly longer pause after correction
                     time.sleep(random.uniform(0.05, 0.2))
 
-                # Occasionally make a small pause after words
-                if char == ' ' and random.random() > 0.7:
-                    time.sleep(random.uniform(0.1, 0.3))
+                # Type the correct character
+                element.type(char)
+                chars_typed.append(char)
 
-            # Pause after finishing typing
-            time.sleep(random.uniform(0.3, 1.0))
+                # Calculate delay based on character type and context
+                base_delay = profile["base"]
+                variance = profile["variance"]
+
+                # Faster for repeated characters or common sequences
+                if i > 0 and text[i-1] == char:
+                    base_delay *= 0.6
+
+                # Slower for special characters and punctuation
+                if char in '!@#$%^&*()_+-=[]{}|;:\'",.<>?/\\':
+                    base_delay *= 1.5
+
+                # Slower for uppercase (need to hold shift)
+                if char.isupper():
+                    base_delay *= 1.2
+
+                # Slower for numbers (top row, less familiar)
+                if char.isdigit():
+                    base_delay *= 1.1
+
+                # Add variance
+                delay = base_delay + random.uniform(-variance, variance)
+                delay = max(0.02, delay)  # Minimum delay
+
+                time.sleep(delay)
+
+                # Natural pauses
+                pause_mult = profile["pause_mult"]
+
+                # Longer pause after spaces (between words)
+                if char == ' ':
+                    if random.random() > 0.5:
+                        time.sleep(random.uniform(0.1, 0.4) * pause_mult)
+
+                # Longer pause after punctuation
+                if char in '.!?':
+                    time.sleep(random.uniform(0.2, 0.6) * pause_mult)
+                elif char in ',:;':
+                    time.sleep(random.uniform(0.1, 0.3) * pause_mult)
+
+                # Occasional thinking pause (about 3% of keystrokes)
+                if random.random() < 0.03:
+                    time.sleep(random.uniform(0.3, 1.0) * pause_mult)
+
+            # Final pause after typing complete
+            time.sleep(random.uniform(0.3, 0.8))
 
         except Exception as e:
             self.logger.debug(f"Typing simulation failed: {e}")
@@ -675,6 +1033,11 @@ class BaseScraper(ABC):
             self._current_headed_mode = use_headed
 
         try:
+            # Set DISPLAY for headed mode on server
+            if use_headed and "DISPLAY" not in os.environ:
+                os.environ["DISPLAY"] = ":0"
+                self.logger.debug("Set DISPLAY=:0 for headed browser")
+
             # Start Playwright
             playwright = sync_playwright().start()
 
@@ -718,7 +1081,9 @@ class BaseScraper(ABC):
                 storage_file = os.path.join(profile_path, "storage_state.json")
                 if os.path.exists(storage_file):
                     context_options["storage_state"] = storage_file
-                    self.logger.debug(f"Loading saved browser state from {storage_file}")
+                    self.logger.info(f"Loading saved browser state from {storage_file}")
+                else:
+                    self.logger.warning(f"No saved browser state found at {storage_file}")
 
             context = browser.new_context(**context_options)
             context.set_default_timeout(self.page_timeout)

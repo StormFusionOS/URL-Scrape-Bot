@@ -30,7 +30,8 @@ from sqlalchemy import create_engine, text, select
 from sqlalchemy.orm import Session
 
 from seo_intelligence.scrapers.base_scraper import BaseScraper
-from seo_intelligence.services import get_task_logger, get_change_manager
+from seo_intelligence.services import get_task_logger, get_change_manager, get_domain_quarantine
+from seo_intelligence.services.browser_profile_manager import get_browser_profile_manager
 from runner.logging_setup import get_logger
 from db.models import Company, BusinessSource
 from scrape_yp.yp_stealth import (
@@ -84,57 +85,87 @@ class CitationResult:
         return asdict(self)
 
 
+# Directory priority tiers (easiest to hardest)
+# Updated based on manual testing - IP 140.177.183.86 is blocked by most directory sites
+PRIORITY_TIERS = {
+    "tier_1": ["bbb", "mapquest"],           # Less aggressive, may work
+    "tier_2": [],                            # Medium difficulty
+    "tier_3": ["yellowpages", "manta", "yelp"],  # IP blocked - need residential proxy
+    "tier_4": ["google_business", "facebook", "angies_list", "thumbtack", "homeadvisor"],  # Hardest/login required
+}
+
+# Directories to skip (require login or too aggressive)
+SKIP_DIRECTORIES = {"facebook"}  # Requires login for search
+
+# Directories with IP-level blocks (temporarily disabled until proxy available)
+# IP 140.177.183.86 flagged by these sites
+IP_BLOCKED_DIRECTORIES = {"manta", "yelp", "yellowpages"}  # Need residential proxy
+
 # Major citation directories to check
 CITATION_DIRECTORIES = {
     "google_business": {
         "name": "Google Business Profile",
-        "search_url": "https://www.google.com/search?q={business}+{location}",
+        "search_url": "https://www.google.com/search?q={business}+{location}&pws=0&gl=us",
         "tier": "A",  # Google requires Tier A
+        "requires_headed": True,
     },
     "yelp": {
         "name": "Yelp",
         "search_url": "https://www.yelp.com/search?find_desc={business}&find_loc={location}",
         "tier": "B",
+        "requires_headed": True,
     },
     "yellowpages": {
         "name": "Yellow Pages",
         "search_url": "https://www.yellowpages.com/search?search_terms={business}&geo_location_terms={location}",
         "tier": "B",
+        "requires_headed": False,
     },
     "bbb": {
         "name": "Better Business Bureau",
-        "search_url": "https://www.bbb.org/search?find_text={business}&find_loc={location}",
+        "search_url": "https://www.bbb.org/search?find_text={business}&find_loc={location}&page=1",
         "tier": "B",
+        "requires_headed": True,
     },
     "facebook": {
         "name": "Facebook",
-        "search_url": "https://www.facebook.com/search/pages?q={business}%20{location}",
+        "search_url": "https://www.facebook.com/public/{business}",
         "tier": "B",
+        "requires_headed": True,
+        "skip": True,  # Requires login for proper search
     },
     "angies_list": {
         "name": "Angi (Angie's List)",
-        "search_url": "https://www.angi.com/companylist/{location}/{business}.htm",
+        # Fixed: Use search endpoint instead of companylist
+        "search_url": "https://www.angi.com/search?search_terms={business}&postal_code={zip}",
         "tier": "B",
+        "requires_headed": True,
     },
     "thumbtack": {
         "name": "Thumbtack",
-        "search_url": "https://www.thumbtack.com/search/{business}/{location}",
+        # Fixed: Use proper search URL format
+        "search_url": "https://www.thumbtack.com/search/?search_term={business}&zip_code={zip}",
         "tier": "B",
+        "requires_headed": True,
     },
     "homeadvisor": {
         "name": "HomeAdvisor",
-        "search_url": "https://www.homeadvisor.com/rated.{business}.{location}.html",
+        # Fixed: Use search endpoint instead of rated URL
+        "search_url": "https://www.homeadvisor.com/s/{location}/?sp=1&q={business}",
         "tier": "B",
+        "requires_headed": True,
     },
     "mapquest": {
         "name": "MapQuest",
-        "search_url": "https://www.mapquest.com/search/{business}+{location}",
+        "search_url": "https://www.mapquest.com/search/results?query={business}&boundingBox=&page=0",
         "tier": "C",
+        "requires_headed": False,
     },
     "manta": {
         "name": "Manta",
         "search_url": "https://www.manta.com/search?search_source=nav&search={business}&search_location={location}",
         "tier": "C",
+        "requires_headed": False,
     },
 }
 
@@ -182,7 +213,22 @@ class CitationCrawler(BaseScraper):
         )
         self.request_count = 0
 
-        logger.info("CitationCrawler initialized (tier=B, YP-style stealth enabled)")
+        # Domain quarantine service for progressive backoff
+        self.domain_quarantine = get_domain_quarantine()
+
+        # Browser profile manager for headed mode detection
+        self.browser_profile_manager = get_browser_profile_manager()
+
+        # Per-directory CAPTCHA tracking for progressive backoff
+        self.directory_captcha_counts = {}
+
+        # Directory success/failure tracking
+        self.directory_stats = {
+            d: {"success": 0, "fail": 0, "skip": 0}
+            for d in CITATION_DIRECTORIES.keys()
+        }
+
+        logger.info("CitationCrawler initialized (tier=B, YP-style stealth, progressive backoff enabled)")
 
     def _get_stealth_context_options(self) -> dict:
         """
@@ -801,6 +847,47 @@ class CitationCrawler(BaseScraper):
 
         return citation_id
 
+    def _get_progressive_quarantine_minutes(self, directory: str) -> int:
+        """
+        Get progressive quarantine duration based on CAPTCHA count.
+
+        Progressive tiers:
+        - 1st CAPTCHA: 60 minutes
+        - 2nd CAPTCHA: 120 minutes (2 hours)
+        - 3rd CAPTCHA: 240 minutes (4 hours)
+        - 4th CAPTCHA: 480 minutes (8 hours)
+        - 5th+ CAPTCHA: 1440 minutes (24 hours)
+        """
+        count = self.directory_captcha_counts.get(directory, 0)
+        tiers = [60, 120, 240, 480, 1440]
+        tier_index = min(count, len(tiers) - 1)
+        return tiers[tier_index]
+
+    def _should_skip_directory(self, directory: str) -> Tuple[bool, str]:
+        """
+        Check if a directory should be skipped.
+
+        Returns:
+            Tuple of (should_skip, reason)
+        """
+        dir_info = CITATION_DIRECTORIES.get(directory, {})
+
+        # Check if directory is marked to skip
+        if dir_info.get("skip", False) or directory in SKIP_DIRECTORIES:
+            return True, "login_required"
+
+        # Check if directory has IP-level block
+        if directory in IP_BLOCKED_DIRECTORIES:
+            return True, "ip_blocked"
+
+        # Check domain quarantine
+        domain = urlparse(dir_info.get("search_url", "")).netloc
+        if domain and self.domain_quarantine.is_quarantined(domain):
+            quarantine_end = self.domain_quarantine.get_quarantine_end(domain)
+            return True, f"quarantined until {quarantine_end}"
+
+        return False, ""
+
     def check_directory(
         self,
         business: BusinessInfo,
@@ -820,16 +907,61 @@ class CitationCrawler(BaseScraper):
             logger.warning(f"Unknown directory: {directory}")
             return None
 
+        # Check if we should skip this directory
+        should_skip, skip_reason = self._should_skip_directory(directory)
+        if should_skip:
+            logger.info(f"Skipping {directory}: {skip_reason}")
+            self.directory_stats[directory]["skip"] += 1
+            return CitationResult(
+                directory=directory,
+                directory_url=CITATION_DIRECTORIES[directory]["name"],
+                is_listed=False,
+                metadata={"skipped": True, "skip_reason": skip_reason}
+            )
+
         dir_info = CITATION_DIRECTORIES[directory]
-        location = f"{business.city}, {business.state}" if business.city else business.state
-        location = location or business.zip_code or ""
 
-        search_url = dir_info["search_url"].format(
-            business=quote_plus(business.name),
-            location=quote_plus(location),
-        )
+        # Build location with fallbacks - never send empty location
+        location = ""
+        if business.city and business.state:
+            location = f"{business.city}, {business.state}"
+        elif business.city:
+            location = business.city
+        elif business.state:
+            location = business.state
+        elif business.zip_code:
+            location = business.zip_code
+        else:
+            location = "USA"  # Ultimate fallback
 
-        logger.info(f"Checking {dir_info['name']} for '{business.name}'")
+        # Get zip code for directories that need it
+        zip_code = business.zip_code or "10001"  # Default to NYC zip if none
+
+        # Format URL with appropriate parameters
+        try:
+            search_url = dir_info["search_url"].format(
+                business=quote_plus(business.name),
+                location=quote_plus(location),
+                zip=quote_plus(zip_code),
+            )
+        except KeyError as e:
+            # Some URLs may not use all placeholders
+            search_url = dir_info["search_url"].replace("{business}", quote_plus(business.name))
+            search_url = search_url.replace("{location}", quote_plus(location))
+            search_url = search_url.replace("{zip}", quote_plus(zip_code))
+
+        # Get domain from URL for headed mode check
+        domain = urlparse(dir_info["search_url"]).netloc
+
+        # Check if directory requires headed mode (either by config or from detection history)
+        dir_requires_headed = dir_info.get("requires_headed", False)
+        profile_requires_headed = self.browser_profile_manager.requires_headed(domain)
+        use_headed = dir_requires_headed or profile_requires_headed
+
+        if use_headed:
+            logger.info(f"Checking {dir_info['name']} for '{business.name}' [HEADED MODE]")
+        else:
+            logger.info(f"Checking {dir_info['name']} for '{business.name}'")
 
         try:
             # Check for session break (YP-style anti-detection)
@@ -838,7 +970,8 @@ class CitationCrawler(BaseScraper):
             if break_taken:
                 logger.info(f"[SESSION BREAK] Break taken after {self.request_count} requests")
 
-            with self.browser_session() as (browser, context, page):
+            # Pass domain to browser_session for hybrid headed/headless mode
+            with self.browser_session(domain=domain) as (browser, context, page):
                 # Human delay before navigation (YP-style timing)
                 human_delay(2.0, 5.0)
 
@@ -851,7 +984,47 @@ class CitationCrawler(BaseScraper):
 
                 if not html:
                     logger.warning(f"Failed to fetch {dir_info['name']}")
+                    self.directory_stats[directory]["fail"] += 1
                     return None
+
+                # Check for CAPTCHA in response
+                html_lower = html.lower()
+                captcha_indicators = [
+                    "captcha", "recaptcha", "hcaptcha", "challenge",
+                    "verify you are human", "are you a robot",
+                    "unusual traffic", "automated requests",
+                    "access denied", "blocked"
+                ]
+
+                if any(indicator in html_lower for indicator in captcha_indicators):
+                    # CAPTCHA detected - quarantine with progressive backoff
+                    self.directory_captcha_counts[directory] = self.directory_captcha_counts.get(directory, 0) + 1
+                    quarantine_minutes = self._get_progressive_quarantine_minutes(directory)
+
+                    captcha_domain = urlparse(search_url).netloc
+                    self.domain_quarantine.quarantine_domain(
+                        domain=captcha_domain,
+                        reason="CAPTCHA_DETECTED",
+                        duration_minutes=quarantine_minutes
+                    )
+
+                    # Record detection with browser_profile_manager to upgrade to headed mode
+                    upgraded = self.browser_profile_manager.record_detection(captcha_domain, "CAPTCHA_DETECTED")
+                    if upgraded:
+                        logger.warning(f"Domain {captcha_domain} upgraded to HEADED mode after repeated CAPTCHAs")
+
+                    logger.warning(
+                        f"CAPTCHA detected on {directory} (count: {self.directory_captcha_counts[directory]}) "
+                        f"- quarantining {captcha_domain} for {quarantine_minutes} minutes"
+                    )
+                    self.directory_stats[directory]["fail"] += 1
+
+                    return CitationResult(
+                        directory=directory,
+                        directory_url=dir_info["name"],
+                        is_listed=False,
+                        metadata={"error": "CAPTCHA_DETECTED", "quarantine_minutes": quarantine_minutes, "upgraded_to_headed": upgraded}
+                    )
 
                 # Simulate human reading and scrolling behavior
                 reading_time = get_human_reading_delay(len(html))
@@ -878,10 +1051,18 @@ class CitationCrawler(BaseScraper):
                     with Session(self.engine) as session:
                         self._save_citation(session, business, result)
 
+                # Track success
+                if result and result.is_listed:
+                    self.directory_stats[directory]["success"] += 1
+                    logger.info(f"SUCCESS: Found listing on {directory} for '{business.name}'")
+                else:
+                    self.directory_stats[directory]["fail"] += 1
+
                 return result
 
         except Exception as e:
             logger.error(f"Error checking {directory}: {e}")
+            self.directory_stats[directory]["fail"] += 1
             return None
 
     def check_all_directories(

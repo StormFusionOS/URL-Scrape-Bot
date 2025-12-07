@@ -52,9 +52,10 @@ class ClaudeReverifier:
         print(f"Available: ${budget - min_reserve:.2f}")
 
     def get_unknown_companies(self, limit: int = 100):
-        """Get companies with unknown status."""
+        """Get companies that haven't been verified yet (verified IS NULL)."""
 
         with self.db.get_session() as session:
+            # Use standardized schema: verified IS NULL means not yet verified
             result = session.execute(text("""
                 SELECT
                     id,
@@ -62,7 +63,7 @@ class ClaudeReverifier:
                     website,
                     parse_metadata
                 FROM companies
-                WHERE parse_metadata->'verification'->>'status' = 'unknown'
+                WHERE verified IS NULL
                 AND parse_metadata->'verification'->>'human_label' IS NULL
                 ORDER BY id
                 LIMIT :limit
@@ -156,7 +157,7 @@ class ClaudeReverifier:
             return 'failed'
 
     def _update_company(self, company_id: int, result: dict, new_status: str):
-        """Update company with Claude's assessment and save as training data."""
+        """Update company with Claude's assessment using standardized schema."""
 
         with self.db.get_session() as session:
             # Build Claude assessment details
@@ -179,7 +180,10 @@ class ClaudeReverifier:
             # Claude's high-quality classification becomes ground truth
             human_label = 'pass' if new_status == 'passed' else 'fail'
 
-            # Use raw SQL with f-string, escaping single quotes for PostgreSQL
+            # Determine verified boolean from status
+            verified_value = True if new_status == 'passed' else False
+
+            # Update using standardized schema: verified, verification_type
             query_sql = f"""
                 UPDATE companies
                 SET parse_metadata = jsonb_set(
@@ -194,7 +198,9 @@ class ClaudeReverifier:
                     ),
                     '{{verification,human_label}}',
                     '{json.dumps(human_label).replace("'", "''")}'::jsonb
-                )
+                ),
+                verified = {str(verified_value).lower()},
+                verification_type = 'claude'
                 WHERE id = {company_id}
             """
 
@@ -263,17 +269,17 @@ class ClaudeReverifier:
         print(f"Output tokens: {self.total_output_tokens:,}")
         print()
 
-        # Check remaining unknown
+        # Check remaining unknown (verified IS NULL)
         with self.db.get_session() as session:
             result = session.execute(text("""
                 SELECT COUNT(*)
                 FROM companies
-                WHERE parse_metadata->'verification'->>'status' = 'unknown'
+                WHERE verified IS NULL
                 AND parse_metadata->'verification'->>'human_label' IS NULL
             """))
             remaining_unknown = result.scalar()
 
-            print(f"Remaining unknown: {remaining_unknown}")
+            print(f"Remaining unverified: {remaining_unknown}")
 
         print("=" * 70)
 

@@ -62,7 +62,7 @@ def queue_borderline_companies(limit: int = 1000, dry_run: bool = False) -> dict
     """
     db_manager = DatabaseManager()
 
-    # Build query
+    # Build query using standardized schema: verified IS NULL means unverified
     query = """
         WITH candidates AS (
             SELECT
@@ -79,9 +79,7 @@ def queue_borderline_companies(limit: int = 1000, dry_run: bool = False) -> dict
                     ELSE 100     -- Further from boundary
                 END as priority
             FROM companies c
-            WHERE c.active = true
-              -- Status is 'unknown' (needs_review)
-              AND c.parse_metadata->'verification'->>'status' = 'unknown'
+            WHERE c.verified IS NULL
               -- Borderline score
               AND (c.parse_metadata->'verification'->>'final_score')::decimal
                   BETWEEN %(score_min)s AND %(score_max)s
@@ -162,16 +160,13 @@ def queue_borderline_companies(limit: int = 1000, dry_run: bool = False) -> dict
 
     inserted_count = 0
     with db_manager.get_session() as session:
-                for company_id, name, website, score, priority in candidates:
+        for company_id, name, website, score, priority in candidates:
             try:
-                result = session.execute(text(
-                    insert_query,
-                    {
-                        'company_id': company_id,
-                        'priority': priority,
-                        'score': float(score))
-                    }
-                )
+                session.execute(text(insert_query), {
+                    'company_id': company_id,
+                    'priority': priority,
+                    'score': float(score)
+                })
                 inserted_count += 1
             except Exception as e:
                 logger.error(f"Failed to queue company {company_id}: {e}")
@@ -203,7 +198,7 @@ def get_queue_stats() -> dict:
     """
 
     with db_manager.get_session() as session:
-                result = session.execute(text(query))
+        result = session.execute(text(query))
         rows = result.fetchall()
 
     stats = {}
@@ -232,7 +227,7 @@ def cleanup_old_completed() -> int:
     """
 
     with db_manager.get_session() as session:
-                result = session.execute(text(delete_query))
+        result = session.execute(text(delete_query))
         deleted_count = result.rowcount
         # commit handled by context manager
 

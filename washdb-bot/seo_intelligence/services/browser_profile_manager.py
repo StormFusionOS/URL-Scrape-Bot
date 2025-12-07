@@ -31,7 +31,7 @@ Usage:
 
 import os
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from pathlib import Path
 
@@ -214,7 +214,7 @@ class BrowserProfileManager:
                 settings = self._get_or_create_settings(session, domain)
 
                 settings.detection_count += 1
-                settings.last_detection = datetime.utcnow()
+                settings.last_detection = datetime.now(timezone.utc)
                 settings.detection_reason = reason
 
                 upgraded = False

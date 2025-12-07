@@ -140,17 +140,13 @@ class BaseModuleWorker(ABC):
         """
         Get SQL WHERE clause for filtering companies by verification status.
 
-        Returns companies that have either:
-        - Verification status = 'passed'
-        - Human label = 'provider'
+        Uses standardized schema:
+        - verified = true (boolean column on companies table)
 
         Returns:
             SQL WHERE clause string (can be used with AND in queries)
         """
-        return (
-            "(parse_metadata->'verification'->>'status' = 'passed' OR "
-            "parse_metadata->'verification'->>'human_label' = 'provider')"
-        )
+        return "verified = true"
 
     def run(self, resume_from: Optional[int] = None) -> WorkerStats:
         """

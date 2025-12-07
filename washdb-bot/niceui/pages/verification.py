@@ -224,6 +224,10 @@ def mark_company_label(company_id: int, label: str, notes: str = ""):
     """
     Mark a company with human verification label.
 
+    Uses standardized schema:
+    - verified: boolean (true if provider, false otherwise)
+    - verification_type: 'manual' for human-labeled companies
+
     Args:
         company_id: Company ID
         label: One of 'provider', 'non_provider', 'directory', 'agency', 'blog', 'franchise'
@@ -232,8 +236,10 @@ def mark_company_label(company_id: int, label: str, notes: str = ""):
     session = get_db_session()
 
     try:
-        # Update parse_metadata with label
-        # Note: Using string concatenation for jsonb to avoid ::text cast conflict with SQLAlchemy params
+        # Determine verified status from label
+        is_verified = label == 'provider'
+
+        # Update parse_metadata with label AND standardized verified/verification_type columns
         query = text("""
         UPDATE companies
         SET
@@ -254,10 +260,8 @@ def mark_company_label(company_id: int, label: str, notes: str = ""):
                 '{verification,needs_review}',
                 'false'::jsonb
             ),
-            active = CASE
-                WHEN :label = 'provider' THEN true
-                ELSE false
-            END,
+            verified = :is_verified,
+            verification_type = 'manual',
             last_updated = NOW()
         WHERE id = :company_id
         """)
@@ -266,7 +270,8 @@ def mark_company_label(company_id: int, label: str, notes: str = ""):
             'company_id': company_id,
             'label': label,
             'notes': notes,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'is_verified': is_verified
         })
         session.commit()
 

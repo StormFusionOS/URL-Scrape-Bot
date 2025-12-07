@@ -8,7 +8,7 @@ This module provides:
 - Enriching existing records with fresh data
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Callable
 
 from sqlalchemy import select, or_, and_
@@ -107,7 +107,7 @@ def update_company_details(website: str) -> dict:
 
         # Update timestamp if any fields were updated
         if updated_fields:
-            company.last_updated = datetime.utcnow()
+            company.last_updated = datetime.now(timezone.utc)
             session.commit()
 
             logger.info(f"Updated {company.name}: {', '.join(updated_fields)}")
@@ -178,7 +178,7 @@ def update_batch(
 
     try:
         # Build query
-        stale_date = datetime.utcnow() - timedelta(days=stale_days)
+        stale_date = datetime.now(timezone.utc) - timedelta(days=stale_days)
 
         # Base condition: has website
         conditions = [Company.website.isnot(None)]

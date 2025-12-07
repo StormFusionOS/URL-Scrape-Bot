@@ -158,7 +158,7 @@ def train_model(X: list[dict], y: list[str], model_type: str = 'logistic') -> tu
         'n_val': len(X_val),
         'classes': list(clf.classes_),
         'feature_names': vec.feature_names_,
-        'trained_at': datetime.utcnow().isoformat()
+        'trained_at': datetime.now(timezone.utc).isoformat()
     }
 
     if provider_idx is not None:

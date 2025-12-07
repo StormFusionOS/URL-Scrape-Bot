@@ -91,20 +91,42 @@ class QuarantineEntry:
 
 @dataclass
 class BackoffSchedule:
-    """Exponential backoff schedule configuration."""
+    """
+    Progressive exponential backoff schedule configuration.
 
-    # Exponential backoff delays (seconds)
+    Progressive CAPTCHA quarantine:
+    - First CAPTCHA: 1 hour quarantine
+    - Second CAPTCHA: 2 hours
+    - Third CAPTCHA: 4 hours
+    - Fourth CAPTCHA: 8 hours
+    - Fifth+ CAPTCHA: 24 hours
+
+    Backoff resets after 24 hours of no CAPTCHAs.
+    """
+
+    # Exponential backoff delays for individual requests (seconds)
     attempt_1: int = 5  # 5 seconds
     attempt_2: int = 30  # 30 seconds
     attempt_3: int = 300  # 5 minutes
     attempt_4_plus: int = 3600  # 60 minutes
 
-    # Quarantine durations (minutes)
+    # Progressive quarantine durations for CAPTCHAs (minutes)
+    # These progressively increase with each CAPTCHA encounter
+    captcha_tier_1: int = 60   # 1 hour (first CAPTCHA)
+    captcha_tier_2: int = 120  # 2 hours (second CAPTCHA)
+    captcha_tier_3: int = 240  # 4 hours (third CAPTCHA)
+    captcha_tier_4: int = 480  # 8 hours (fourth CAPTCHA)
+    captcha_tier_5: int = 1440 # 24 hours (fifth+ CAPTCHA)
+
+    # Standard quarantine durations (minutes)
     duration_403: int = 60  # 403 Forbidden: 60 minutes
     duration_429: int = 60  # Repeated 429: 60 minutes
-    duration_captcha: int = 60  # CAPTCHA: 60 minutes
+    duration_captcha: int = 60  # CAPTCHA base duration (overridden by progressive)
     duration_5xx: int = 30  # Server errors: 30 minutes
     duration_manual: int = 120  # Manual: 2 hours
+
+    # Backoff reset period (hours) - resets progressive tier after this many hours of no CAPTCHAs
+    captcha_reset_hours: int = 24
 
 
 class DomainQuarantine:
@@ -136,10 +158,13 @@ class DomainQuarantine:
         # Used to detect repeated 429s or 5xxs
         self._error_events: Dict[str, List[tuple[datetime, str]]] = {}
 
+        # CAPTCHA tracking for progressive backoff: domain -> {count, last_captcha}
+        self._captcha_history: Dict[str, Dict[str, Any]] = {}
+
         # Thread lock for concurrent access (reentrant to allow nested calls)
         self._lock = threading.RLock()
 
-        self.logger.info("DomainQuarantine initialized")
+        self.logger.info("DomainQuarantine initialized with progressive backoff")
 
     def _normalize_domain(self, domain: str) -> str:
         """Normalize domain (lowercase, strip www)."""
@@ -176,6 +201,109 @@ class DomainQuarantine:
         # Remove empty lists
         if not self._error_events[domain]:
             del self._error_events[domain]
+
+    def _get_captcha_tier(self, domain: str) -> int:
+        """
+        Get the current CAPTCHA tier for progressive backoff.
+
+        Tier increases with each CAPTCHA and resets after captcha_reset_hours of no CAPTCHAs.
+
+        Args:
+            domain: Domain to check
+
+        Returns:
+            Current tier (1-5)
+        """
+        if domain not in self._captcha_history:
+            return 1
+
+        history = self._captcha_history[domain]
+        last_captcha = history.get('last_captcha')
+        count = history.get('count', 0)
+
+        # Check if we should reset the tier (no CAPTCHAs for reset period)
+        if last_captcha:
+            hours_since_last = (datetime.now() - last_captcha).total_seconds() / 3600
+            if hours_since_last >= self.backoff_schedule.captcha_reset_hours:
+                # Reset - it's been long enough since last CAPTCHA
+                self.logger.info(
+                    f"CAPTCHA tier reset for {domain} (no CAPTCHAs for {hours_since_last:.1f}h)"
+                )
+                self._captcha_history[domain] = {'count': 0, 'last_captcha': None}
+                return 1
+
+        # Return tier based on count (capped at tier 5)
+        return min(count + 1, 5)
+
+    def _increment_captcha_count(self, domain: str):
+        """
+        Increment CAPTCHA count for progressive backoff tracking.
+
+        Args:
+            domain: Domain that encountered CAPTCHA
+        """
+        if domain not in self._captcha_history:
+            self._captcha_history[domain] = {'count': 0, 'last_captcha': None}
+
+        self._captcha_history[domain]['count'] += 1
+        self._captcha_history[domain]['last_captcha'] = datetime.now()
+
+    def get_progressive_captcha_duration(self, domain: str) -> int:
+        """
+        Get the progressive quarantine duration for CAPTCHA based on history.
+
+        Args:
+            domain: Domain to check
+
+        Returns:
+            Quarantine duration in minutes
+        """
+        tier = self._get_captcha_tier(domain)
+
+        # Map tier to duration
+        tier_durations = {
+            1: self.backoff_schedule.captcha_tier_1,   # 60 min (1 hr)
+            2: self.backoff_schedule.captcha_tier_2,   # 120 min (2 hrs)
+            3: self.backoff_schedule.captcha_tier_3,   # 240 min (4 hrs)
+            4: self.backoff_schedule.captcha_tier_4,   # 480 min (8 hrs)
+            5: self.backoff_schedule.captcha_tier_5,   # 1440 min (24 hrs)
+        }
+
+        return tier_durations.get(tier, self.backoff_schedule.captcha_tier_5)
+
+    def get_captcha_stats(self, domain: str) -> Dict[str, Any]:
+        """
+        Get CAPTCHA statistics for a domain.
+
+        Args:
+            domain: Domain to check
+
+        Returns:
+            Dictionary with CAPTCHA stats
+        """
+        domain = self._normalize_domain(domain)
+
+        with self._lock:
+            if domain not in self._captcha_history:
+                return {
+                    'domain': domain,
+                    'captcha_count': 0,
+                    'current_tier': 1,
+                    'next_quarantine_minutes': self.backoff_schedule.captcha_tier_1,
+                    'last_captcha': None,
+                }
+
+            history = self._captcha_history[domain]
+            tier = self._get_captcha_tier(domain)
+            duration = self.get_progressive_captcha_duration(domain)
+
+            return {
+                'domain': domain,
+                'captcha_count': history.get('count', 0),
+                'current_tier': tier,
+                'next_quarantine_minutes': duration,
+                'last_captcha': history.get('last_captcha'),
+            }
 
     def is_quarantined(self, domain: str) -> bool:
         """
@@ -267,12 +395,12 @@ class DomainQuarantine:
         metadata: Optional[Dict[str, Any]] = None
     ):
         """
-        Quarantine a domain.
+        Quarantine a domain with progressive backoff for CAPTCHAs.
 
         Args:
             domain: Domain to quarantine
             reason: Reason code (QuarantineReason enum value or string)
-            duration_minutes: Quarantine duration in minutes (uses default if None)
+            duration_minutes: Quarantine duration in minutes (uses default/progressive if None)
             retry_after_seconds: Retry-After header value (overrides duration if larger)
             metadata: Additional context
         """
@@ -286,15 +414,19 @@ class DomainQuarantine:
             reason_enum = QuarantineReason.MANUAL
             self.logger.warning(f"Unknown quarantine reason: {reason}, using MANUAL")
 
-        # Determine duration
+        # Determine duration - CAPTCHA uses progressive backoff
         if duration_minutes is None:
-            # Use default duration based on reason
-            if reason_enum == QuarantineReason.FORBIDDEN_403:
+            if reason_enum == QuarantineReason.CAPTCHA_DETECTED:
+                # Use progressive backoff for CAPTCHA
+                duration_minutes = self.get_progressive_captcha_duration(domain)
+                tier = self._get_captcha_tier(domain)
+                self.logger.info(
+                    f"Progressive CAPTCHA backoff: tier {tier}, duration {duration_minutes}m"
+                )
+            elif reason_enum == QuarantineReason.FORBIDDEN_403:
                 duration_minutes = self.backoff_schedule.duration_403
             elif reason_enum == QuarantineReason.TOO_MANY_REQUESTS_429:
                 duration_minutes = self.backoff_schedule.duration_429
-            elif reason_enum == QuarantineReason.CAPTCHA_DETECTED:
-                duration_minutes = self.backoff_schedule.duration_captcha
             elif reason_enum == QuarantineReason.SERVER_ERROR_5XX:
                 duration_minutes = self.backoff_schedule.duration_5xx
             else:
@@ -309,12 +441,27 @@ class DomainQuarantine:
             )
 
         with self._lock:
+            # Increment CAPTCHA count if this is a CAPTCHA quarantine
+            if reason_enum == QuarantineReason.CAPTCHA_DETECTED:
+                self._increment_captcha_count(domain)
+                captcha_count = self._captcha_history[domain]['count']
+                tier = self._get_captcha_tier(domain)
+            else:
+                captcha_count = 0
+                tier = 0
+
             # Get current retry attempt
             attempt = self._retry_attempts.get(domain, 0)
 
             # Create quarantine entry
             now = datetime.now()
             expires_at = now + timedelta(minutes=duration_minutes)
+
+            # Add CAPTCHA tier info to metadata
+            entry_metadata = metadata or {}
+            if reason_enum == QuarantineReason.CAPTCHA_DETECTED:
+                entry_metadata['captcha_count'] = captcha_count
+                entry_metadata['captcha_tier'] = tier
 
             entry = QuarantineEntry(
                 domain=domain,
@@ -323,7 +470,7 @@ class DomainQuarantine:
                 expires_at=expires_at,
                 retry_attempt=attempt,
                 retry_after_seconds=retry_after_seconds,
-                metadata=metadata or {}
+                metadata=entry_metadata
             )
 
             self._quarantined[domain] = entry
@@ -331,10 +478,22 @@ class DomainQuarantine:
             # Increment retry attempt
             self._retry_attempts[domain] = attempt + 1
 
-            self.logger.warning(
-                f"Quarantined {domain} for {duration_minutes}m "
-                f"(reason: {reason_enum.value}, attempt: {attempt})"
-            )
+            # Build log message
+            duration_str = f"{duration_minutes}m"
+            if duration_minutes >= 60:
+                hours = duration_minutes / 60
+                duration_str = f"{hours:.1f}h ({duration_minutes}m)"
+
+            if reason_enum == QuarantineReason.CAPTCHA_DETECTED:
+                self.logger.warning(
+                    f"⏸️ CAPTCHA quarantine for {domain}: {duration_str} "
+                    f"(tier {tier}, count {captcha_count})"
+                )
+            else:
+                self.logger.warning(
+                    f"Quarantined {domain} for {duration_str} "
+                    f"(reason: {reason_enum.value}, attempt: {attempt})"
+                )
 
     def record_error_event(self, domain: str, reason: str):
         """
@@ -442,7 +601,7 @@ class DomainQuarantine:
 
     def get_stats(self) -> Dict[str, Any]:
         """
-        Get quarantine statistics.
+        Get quarantine statistics including progressive CAPTCHA data.
 
         Returns:
             Dictionary with statistics
@@ -456,11 +615,25 @@ class DomainQuarantine:
                 reason = entry.reason.value
                 reason_counts[reason] = reason_counts.get(reason, 0) + 1
 
+            # CAPTCHA tier distribution
+            tier_counts = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+            total_captcha_count = 0
+            for domain, history in self._captcha_history.items():
+                count = history.get('count', 0)
+                total_captcha_count += count
+                tier = self._get_captcha_tier(domain)
+                tier_counts[tier] = tier_counts.get(tier, 0) + 1
+
             return {
                 "total_quarantined": len(self._quarantined),
                 "by_reason": reason_counts,
                 "domains_with_retries": len(self._retry_attempts),
                 "domains_with_errors": len(self._error_events),
+                "captcha_stats": {
+                    "domains_with_captcha_history": len(self._captcha_history),
+                    "total_captchas_recorded": total_captcha_count,
+                    "tier_distribution": tier_counts,
+                }
             }
 
     def clear_all(self):
@@ -469,7 +642,25 @@ class DomainQuarantine:
             self._quarantined.clear()
             self._retry_attempts.clear()
             self._error_events.clear()
+            self._captcha_history.clear()
             self.logger.info("Cleared all quarantine data")
+
+    def reset_captcha_history(self, domain: Optional[str] = None):
+        """
+        Reset CAPTCHA history for a domain or all domains.
+
+        Args:
+            domain: Specific domain to reset, or None to reset all
+        """
+        with self._lock:
+            if domain:
+                domain = self._normalize_domain(domain)
+                if domain in self._captcha_history:
+                    del self._captcha_history[domain]
+                    self.logger.info(f"Reset CAPTCHA history for {domain}")
+            else:
+                self._captcha_history.clear()
+                self.logger.info("Reset CAPTCHA history for all domains")
 
 
 def get_domain_quarantine() -> DomainQuarantine:

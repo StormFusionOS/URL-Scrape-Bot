@@ -18,32 +18,52 @@ from db.database_manager import DatabaseManager
 
 
 def export_for_review(output_file: str = None, limit: int = None, status: str = 'unknown'):
-    """Export companies needing review to CSV."""
+    """Export companies needing review to CSV.
+
+    Uses standardized schema:
+    - 'unknown' status = verified IS NULL
+    - 'passed' status = verified = true
+    - 'failed' status = verified = false
+    """
 
     if output_file is None:
         output_file = f'data/companies_for_review_{status}.csv'
 
     db = DatabaseManager()
 
-    # Build query
+    # Map status to standardized schema condition
+    if status == 'unknown':
+        verified_condition = "verified IS NULL"
+    elif status == 'passed':
+        verified_condition = "verified = true"
+    elif status == 'failed':
+        verified_condition = "verified = false"
+    else:
+        verified_condition = "verified IS NULL"
+
+    # Build query using standardized schema
     query = text(f"""
         SELECT
             id,
             name,
             website,
             source,
-            parse_metadata->'verification'->>'status' as current_status,
-            parse_metadata->'verification'->>'ml_prediction' as ml_prediction,
+            CASE
+                WHEN verified IS NULL THEN 'unknown'
+                WHEN verified = true THEN 'passed'
+                ELSE 'failed'
+            END as current_status,
+            verification_type,
             parse_metadata->'verification'->>'ml_confidence' as ml_confidence
         FROM companies
-        WHERE parse_metadata->'verification'->>'status' = :status
+        WHERE {verified_condition}
         AND parse_metadata->'verification'->>'human_label' IS NULL
         ORDER BY id
         {f'LIMIT {limit}' if limit else ''}
     """)
 
     with db.get_session() as session:
-        result = session.execute(query, {'status': status})
+        result = session.execute(query)
         companies = result.fetchall()
 
     if not companies:
@@ -61,8 +81,8 @@ def export_for_review(output_file: str = None, limit: int = None, status: str = 
             'Company Name',
             'Website',
             'Source',
-            'Current Status',
-            'ML Prediction',
+            'Verified Status',
+            'Verification Type',
             'ML Confidence',
             'Label (provider/non_provider)'
         ])
@@ -73,8 +93,8 @@ def export_for_review(output_file: str = None, limit: int = None, status: str = 
                 company[1],  # company_name
                 company[2],  # website
                 company[3],  # source
-                company[4],  # current_status
-                company[5],  # ml_prediction
+                company[4],  # verified status (passed/failed/unknown)
+                company[5],  # verification_type (llm/claude/manual)
                 company[6],  # ml_confidence
                 ''          # empty label column for manual entry
             ])

@@ -140,6 +140,12 @@ from .ranking_trends import (
     DomainTrendSummary,
     get_ranking_trends
 )
+from .serp_priority_queue import (
+    SerpPriorityQueue,
+    QueuedCompany,
+    Priority,
+    get_serp_priority_queue
+)
 
 __all__ = [
     "TaskLogger",
@@ -246,4 +252,9 @@ __all__ = [
     "AlertType",
     "DomainTrendSummary",
     "get_ranking_trends",
+    # Phase 5: SERP Priority Queue
+    "SerpPriorityQueue",
+    "QueuedCompany",
+    "Priority",
+    "get_serp_priority_queue",
 ]

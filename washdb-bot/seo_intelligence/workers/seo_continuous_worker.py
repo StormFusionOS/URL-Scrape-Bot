@@ -67,23 +67,19 @@ class SEOContinuousWorker(BaseModuleWorker):
         """
         Get companies for comprehensive SEO processing.
 
-        Selects verified companies that haven't been fully processed recently.
+        Selects all verified companies with websites for continuous scraping.
         """
         session = self.Session()
         try:
-            # Get verified companies without recent comprehensive SEO processing
-            # Only process verified companies (passed verification or human-labeled as provider)
-            # Uses the page_audits table as a proxy for "processed"
+            # Get all verified companies with websites - no time restriction
+            # This allows continuous re-scraping of verified URLs
             verification_clause = self.get_verification_where_clause()
             query = text(f"""
                 SELECT c.id
                 FROM companies c
-                LEFT JOIN page_audits pa ON c.website = pa.url
-                    AND pa.audited_at > NOW() - INTERVAL '7 days'
                 WHERE c.website IS NOT NULL
                   AND c.active = true
                   AND {verification_clause}
-                  AND pa.audit_id IS NULL
                   AND (:after_id IS NULL OR c.id > :after_id)
                 ORDER BY c.id ASC
                 LIMIT :limit

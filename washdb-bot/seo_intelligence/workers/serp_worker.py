@@ -55,12 +55,13 @@ class SERPWorker(BaseModuleWorker):
         self._traffic_estimator = None
 
     def _get_scraper(self):
-        """Get or create SERP scraper."""
+        """Get or create SERP scraper (SeleniumBase UC version)."""
         if self._scraper is None:
             try:
-                from seo_intelligence.scrapers.serp_scraper import SerpScraper
-                self._scraper = SerpScraper(headless=True)
-                logger.info("SERP scraper initialized")
+                # Use SeleniumBase version for better anti-detection
+                from seo_intelligence.scrapers.serp_scraper_selenium import SerpScraperSelenium
+                self._scraper = SerpScraperSelenium(headless=True)
+                logger.info("SERP scraper initialized (SeleniumBase UC)")
             except Exception as e:
                 logger.error(f"Failed to initialize SERP scraper: {e}")
         return self._scraper

@@ -58,7 +58,7 @@ def get_run_history(limit=100):
 
         # Date range filter
         if run_history_state.date_range > 0:
-            cutoff_date = datetime.utcnow() - timedelta(days=run_history_state.date_range)
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=run_history_state.date_range)
             query = query.filter(JobExecutionLog.start_time >= cutoff_date)
 
         # Search filter (in job_name or notes)
@@ -142,7 +142,7 @@ def get_summary_stats():
         total_errors = session.query(func.sum(JobExecutionLog.errors_count)).scalar() or 0
 
         # Runs in last 24 hours
-        yesterday = datetime.utcnow() - timedelta(days=1)
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
         recent_runs = session.query(func.count(JobExecutionLog.id)).filter(
             JobExecutionLog.start_time >= yesterday
         ).scalar()

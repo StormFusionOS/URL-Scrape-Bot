@@ -64,7 +64,7 @@ def recover_orphaned_targets(
     logger.info(f"Searching for orphaned targets (heartbeat timeout={timeout_minutes} minutes)...")
 
     # Calculate threshold timestamp
-    threshold = datetime.utcnow() - timedelta(minutes=timeout_minutes)
+    threshold = datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)
 
     # Build query - use heartbeat_at for orphan detection
     query = session.query(YPTarget).filter(
@@ -193,7 +193,7 @@ def save_progress_checkpoint(checkpoint_file: str, stats: dict, state_ids: Optio
 
     # Prepare checkpoint data
     checkpoint_data = {
-        'timestamp': datetime.utcnow().isoformat(),
+        'timestamp': datetime.now(timezone.utc).isoformat(),
         'state_ids': state_ids or [],
         'stats': stats,
     }

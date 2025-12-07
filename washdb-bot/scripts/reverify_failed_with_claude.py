@@ -59,12 +59,11 @@ class FailedCompanyReverifier:
         print(f"Include inactive: {include_inactive}")
 
     def get_failed_companies(self, limit: int = 100):
-        """Get companies marked as failed but not verified by Claude."""
+        """Get companies marked as failed (verified=false) but not yet verified by Claude."""
 
         with self.db.get_session() as session:
-            # Build query based on include_inactive flag
-            active_clause = "" if self.include_inactive else "AND c.active = true"
-
+            # Use standardized schema: verified=false means failed
+            # Only get LLM-verified companies that need Claude re-verification
             query = text(f"""
                 SELECT
                     c.id,
@@ -72,9 +71,9 @@ class FailedCompanyReverifier:
                     c.website,
                     c.parse_metadata
                 FROM companies c
-                WHERE c.parse_metadata->'verification'->>'status' = 'failed'
+                WHERE c.verified = false
+                AND c.verification_type = 'llm'
                 AND c.claude_verified = FALSE
-                {active_clause}
                 ORDER BY c.id
                 LIMIT :limit
             """)
@@ -171,7 +170,7 @@ class FailedCompanyReverifier:
             return 'failed'
 
     def _update_company(self, company_id: int, result: dict, new_status: str):
-        """Update company with Claude's assessment."""
+        """Update company with Claude's assessment using standardized schema."""
 
         with self.db.get_session() as session:
             # Build Claude assessment details
@@ -193,7 +192,10 @@ class FailedCompanyReverifier:
             # Save Claude's assessment as human_label for ML training
             human_label = 'pass' if new_status == 'passed' else 'fail'
 
-            # Update both parse_metadata AND claude_verified field
+            # Determine verified boolean from status
+            verified_value = True if new_status == 'passed' else False
+
+            # Update using standardized schema: verified, verification_type
             query_sql = f"""
                 UPDATE companies
                 SET
@@ -211,7 +213,9 @@ class FailedCompanyReverifier:
                         '{json.dumps(human_label).replace("'", "''")}'::jsonb
                     ),
                     claude_verified = TRUE,
-                    claude_verified_at = NOW()
+                    claude_verified_at = NOW(),
+                    verified = {str(verified_value).lower()},
+                    verification_type = 'claude'
                 WHERE id = {company_id}
             """
 

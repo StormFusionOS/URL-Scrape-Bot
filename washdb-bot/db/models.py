@@ -109,12 +109,25 @@ class Company(Base):
     )
 
     # Status and Timestamps
-    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    active: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False,
+        comment="Website is online/reachable (true=online, false=offline/unreachable)"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
     )
     last_updated: Mapped[Optional[datetime]] = mapped_column(
         DateTime, onupdate=func.now(), nullable=True
+    )
+
+    # Verification Status (standardized across LLM, Claude, Manual)
+    verified: Mapped[Optional[bool]] = mapped_column(
+        Boolean, nullable=True, index=True,
+        comment="Company is a verified target service provider (true/false/null=unverified)"
+    )
+    verification_type: Mapped[Optional[str]] = mapped_column(
+        String(20), nullable=True,
+        comment="How company was verified: 'llm', 'claude', 'manual'"
     )
 
     def __repr__(self) -> str:

@@ -1,33 +1,41 @@
 """
-SERP Scraper Module
+SERP Scraper Module (SeleniumBase Version)
 
 Scrapes Google Search Engine Results Pages (SERPs) for position tracking.
+Uses SeleniumBase with Undetected Chrome for better anti-detection than Playwright.
+
+This is a drop-in replacement for serp_scraper.py using SeleniumBase instead of Playwright.
 
 Features:
-- Playwright-based Google search crawling
+- SeleniumBase UC-based Google search crawling (better anti-detection)
 - Respects rate limits (Tier A - high-value target)
-- Robots.txt compliance
 - Integration with SERP parser
 - Database storage of results
 - Position tracking over time
 
 Per SCRAPING_NOTES.md:
 - Use Tier A rate limits (15-30s delay, 2-4 req/min)
-- Robots.txt must be checked before crawling
 - Store raw HTML + parsed data for audit trail
 """
 
 import os
 import json
+import time
+import random
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from urllib.parse import quote_plus
+
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.wait import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.keys import Keys
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
-from seo_intelligence.scrapers.base_scraper import BaseScraper
+from seo_intelligence.scrapers.base_selenium_scraper import BaseSeleniumScraper
 from seo_intelligence.scrapers.serp_parser import get_serp_parser, SerpSnapshot
 from seo_intelligence.services import (
     get_task_logger,
@@ -40,21 +48,23 @@ from runner.logging_setup import get_logger
 # Load environment
 load_dotenv()
 
-logger = get_logger("serp_scraper")
+logger = get_logger("serp_scraper_selenium")
 
 
-class SerpScraper(BaseScraper):
+class SerpScraperSelenium(BaseSeleniumScraper):
     """
-    Google SERP Scraper for position tracking.
+    Google SERP Scraper using SeleniumBase (Undetected Chrome).
 
-    Searches Google for specified queries and tracks ranking positions.
+    This is the SeleniumBase equivalent of SerpScraper, providing better
+    anti-detection than the Playwright version.
+
     Uses Tier A rate limits due to Google's anti-bot measures.
     """
 
     def __init__(
         self,
-        headless: bool = True,  # Hybrid mode: starts headless, upgrades to headed on detection
-        use_proxy: bool = False,  # Disabled: datacenter proxies get detected
+        headless: bool = True,
+        use_proxy: bool = True,  # Enabled by default with UC mode
         store_raw_html: bool = True,
         enable_embeddings: bool = True,
     ):
@@ -63,25 +73,25 @@ class SerpScraper(BaseScraper):
 
         Args:
             headless: Run browser in headless mode
-            use_proxy: Use proxy pool
+            use_proxy: Use proxy pool (recommended with UC mode)
             store_raw_html: Store raw HTML in database
             enable_embeddings: Generate embeddings for SERP snippets
         """
         super().__init__(
-            name="serp_scraper",
+            name="serp_scraper_selenium",
             tier="A",  # High-value target (Google)
             headless=headless,
-            respect_robots=False,  # Disabled: need to scrape search results
+            respect_robots=False,  # Need to scrape search results
             use_proxy=use_proxy,
             max_retries=3,
-            page_timeout=45000,  # Longer timeout for Google
+            page_timeout=45,  # Seconds for Selenium
         )
 
         self.store_raw_html = store_raw_html
         self.parser = get_serp_parser()
         self.hasher = get_content_hasher()
 
-        # Initialize embedding services (per SCRAPER BOT.pdf)
+        # Initialize embedding services
         self.enable_embeddings = enable_embeddings
         self.embedder = None
         self.qdrant = None
@@ -90,18 +100,16 @@ class SerpScraper(BaseScraper):
             try:
                 self.embedder = get_content_embedder()
 
-                # Check if embedder actually initialized properly
                 if not self.embedder.is_available():
                     logger.warning("Embedding model failed to initialize. Continuing without embeddings.")
                     self.enable_embeddings = False
                 else:
                     self.qdrant = get_qdrant_manager()
-                    logger.info("✓ Embedding services initialized")
+                    logger.info("Embedding services initialized")
             except Exception as e:
                 error_msg = str(e)
-                # Check for specific PyTorch errors
                 if "meta tensor" in error_msg.lower() or "cannot copy" in error_msg.lower():
-                    logger.warning(f"PyTorch meta tensor error - embeddings disabled. This is a known issue with some CUDA configurations.")
+                    logger.warning("PyTorch meta tensor error - embeddings disabled.")
                 else:
                     logger.warning(f"Embedding services unavailable: {error_msg[:100]}. Continuing without embeddings.")
                 self.enable_embeddings = False
@@ -114,7 +122,7 @@ class SerpScraper(BaseScraper):
             self.engine = None
             logger.warning("DATABASE_URL not set - database storage disabled")
 
-        logger.info("SerpScraper initialized (tier=A, store_html={})".format(store_raw_html))
+        logger.info(f"SerpScraperSelenium initialized (tier=A, store_html={store_raw_html})")
 
     def _build_search_url(
         self,
@@ -122,27 +130,80 @@ class SerpScraper(BaseScraper):
         location: Optional[str] = None,
         num_results: int = 100,
     ) -> str:
-        """
-        Build Google search URL.
-
-        Args:
-            query: Search query
-            location: Location context (appended to query)
-            num_results: Number of results to request
-
-        Returns:
-            str: Google search URL
-        """
-        # Combine query with location
+        """Build Google search URL."""
         full_query = query
         if location:
             full_query = f"{query} {location}"
 
-        # Build URL with parameters
         encoded_query = quote_plus(full_query)
         url = f"https://www.google.com/search?q={encoded_query}&num={num_results}"
 
         return url
+
+    def _perform_search_via_input(
+        self,
+        driver,
+        query: str,
+        location: Optional[str] = None
+    ) -> bool:
+        """
+        Perform search by typing into Google's search box (more human-like).
+
+        Args:
+            driver: SeleniumBase driver
+            query: Search query
+            location: Location context
+
+        Returns:
+            True if search performed, False on error
+        """
+        try:
+            full_query = query
+            if location:
+                full_query = f"{query} {location}"
+
+            # Find search input
+            search_input = None
+            input_selectors = [
+                'input[name="q"]',
+                'textarea[name="q"]',
+                'input[aria-label="Search"]',
+            ]
+
+            for selector in input_selectors:
+                try:
+                    search_input = self.wait_for_element(
+                        driver, selector, timeout=10, condition="clickable"
+                    )
+                    if search_input:
+                        break
+                except Exception:
+                    continue
+
+            if not search_input:
+                logger.warning("Could not find search input, using URL navigation")
+                return False
+
+            # Click on search box
+            self._human_click(driver, search_input)
+            time.sleep(random.uniform(0.3, 0.7))
+
+            # Clear and type query with human-like delays
+            search_input.clear()
+            self._human_type(driver, search_input, full_query, clear_first=False)
+
+            # Submit search
+            time.sleep(random.uniform(0.2, 0.5))
+            search_input.send_keys(Keys.RETURN)
+
+            # Wait for results
+            time.sleep(random.uniform(2, 4))
+
+            return True
+
+        except Exception as e:
+            logger.warning(f"Search via input failed: {e}")
+            return False
 
     def _get_or_create_query(
         self,
@@ -150,18 +211,7 @@ class SerpScraper(BaseScraper):
         query_text: str,
         location: Optional[str] = None,
     ) -> int:
-        """
-        Get existing query ID or create new query record.
-
-        Args:
-            session: Database session
-            query_text: Search query text
-            location: Location context
-
-        Returns:
-            int: Query ID
-        """
-        # Check if query exists
+        """Get existing query ID or create new query record."""
         result = session.execute(
             text("""
                 SELECT query_id FROM search_queries
@@ -176,7 +226,6 @@ class SerpScraper(BaseScraper):
         if row:
             return row[0]
 
-        # Create new query
         result = session.execute(
             text("""
                 INSERT INTO search_queries (query_text, location, search_engine, is_active)
@@ -196,30 +245,17 @@ class SerpScraper(BaseScraper):
         snapshot: SerpSnapshot,
         raw_html: Optional[str] = None,
     ) -> int:
-        """
-        Save SERP snapshot to database.
-
-        Args:
-            session: Database session
-            query_id: Query ID
-            snapshot: Parsed SERP snapshot
-            raw_html: Raw HTML (if store_raw_html enabled)
-
-        Returns:
-            int: Snapshot ID
-        """
-        # Calculate snapshot hash
+        """Save SERP snapshot to database."""
         snapshot_hash = self.hasher.hash_dict(snapshot.to_dict())
 
-        # Build metadata
         metadata = {
             "total_results": snapshot.total_results,
             "local_pack_count": len(snapshot.local_pack),
             "paa_count": len(snapshot.people_also_ask),
             "related_count": len(snapshot.related_searches),
+            "scraper": "selenium",  # Mark this was scraped with Selenium
         }
 
-        # Insert snapshot
         result = session.execute(
             text("""
                 INSERT INTO serp_snapshots (
@@ -249,20 +285,11 @@ class SerpScraper(BaseScraper):
         query_id: int,
         snapshot: SerpSnapshot,
     ):
-        """
-        Save People Also Ask questions to serp_paa table.
-
-        Args:
-            session: Database session
-            snapshot_id: Snapshot ID
-            query_id: Query ID
-            snapshot: Parsed SERP snapshot with PAA data
-        """
+        """Save People Also Ask questions to serp_paa table."""
         if not snapshot.people_also_ask:
             return
 
         for paa in snapshot.people_also_ask:
-            # Use the upsert function created in migration 022
             session.execute(
                 text("""
                     SELECT upsert_paa_question(
@@ -280,7 +307,7 @@ class SerpScraper(BaseScraper):
                     "snapshot_id": snapshot_id,
                     "query_id": query_id,
                     "question": paa.question,
-                    "answer_snippet": paa.answer[:500] if paa.answer else None,  # Limit to 500 chars
+                    "answer_snippet": paa.answer[:500] if paa.answer else None,
                     "source_url": paa.source_url or None,
                     "source_domain": paa.source_domain or None,
                     "position": paa.position if paa.position > 0 else None,
@@ -299,32 +326,20 @@ class SerpScraper(BaseScraper):
         our_domains: Optional[List[str]] = None,
         competitor_domains: Optional[Dict[str, int]] = None,
     ):
-        """
-        Save individual SERP results to database.
-
-        Args:
-            session: Database session
-            snapshot_id: Snapshot ID
-            snapshot: Parsed SERP snapshot
-            our_domains: List of our company's domains (for tracking)
-            competitor_domains: Dict of competitor domain -> competitor_id
-        """
+        """Save individual SERP results to database."""
         our_domains = our_domains or []
         competitor_domains = competitor_domains or {}
 
         for result in snapshot.results:
-            # Check if this is our company or a competitor
             is_our_company = result.domain in our_domains
             is_competitor = result.domain in competitor_domains
             competitor_id = competitor_domains.get(result.domain)
 
-            # Build metadata
             metadata = result.metadata.copy()
             metadata["is_featured"] = result.is_featured
             metadata["is_local"] = result.is_local
             metadata["is_ad"] = result.is_ad
 
-            # Insert result and get ID back
             db_result = session.execute(
                 text("""
                     INSERT INTO serp_results (
@@ -351,14 +366,12 @@ class SerpScraper(BaseScraper):
             )
             result_id = db_result.fetchone()[0]
 
-            # Generate and store embeddings for snippet (per SCRAPER BOT.pdf)
+            # Generate and store embeddings
             if self.enable_embeddings and result.description:
                 try:
-                    # Embed the snippet text
                     snippet_embedding = self.embedder.embed_single(result.description)
 
                     if snippet_embedding:
-                        # Store in Qdrant
                         self.qdrant.upsert_serp_snippet(
                             result_id=result_id,
                             query=snapshot.query,
@@ -369,7 +382,6 @@ class SerpScraper(BaseScraper):
                             vector=snippet_embedding
                         )
 
-                        # Update database with embedding metadata
                         session.execute(
                             text("""
                                 UPDATE serp_results
@@ -382,10 +394,9 @@ class SerpScraper(BaseScraper):
                                 "result_id": result_id
                             }
                         )
-                        logger.debug(f"✓ Embedded SERP snippet for result {result_id}")
+                        logger.debug(f"Embedded SERP snippet for result {result_id}")
                 except Exception as e:
                     logger.error(f"Failed to embed snippet for result {result_id}: {e}")
-                    # Continue without embeddings
 
         session.commit()
 
@@ -398,7 +409,7 @@ class SerpScraper(BaseScraper):
         num_results: int = 100,
     ) -> Optional[SerpSnapshot]:
         """
-        Scrape SERP for a single query.
+        Scrape SERP for a single query using SeleniumBase UC.
 
         Args:
             query: Search query
@@ -414,17 +425,50 @@ class SerpScraper(BaseScraper):
         logger.info(f"Scraping SERP for: '{query}' ({location or 'no location'})")
 
         try:
-            with self.browser_session() as (browser, context, page):
-                # Fetch the SERP page
-                html = self.fetch_page(
-                    url=url,
-                    page=page,
-                    wait_for="domcontentloaded",
-                    extra_wait=2.0,  # Wait for JS rendering
-                )
+            with self.browser_session("google") as driver:
+                # Navigate to Google first (to warm up cookies/session)
+                driver.get("https://www.google.com/")
+                time.sleep(random.uniform(1, 2))
 
-                if not html:
+                # Simulate human behavior
+                self._simulate_human_behavior(driver, intensity="light")
+
+                # Try to search via input (more human-like)
+                search_success = self._perform_search_via_input(driver, query, location)
+
+                if not search_success:
+                    # Fallback to direct URL navigation
+                    driver.get(url)
+                    time.sleep(random.uniform(2, 4))
+
+                # Wait for search results
+                wait = WebDriverWait(driver, self.page_timeout)
+
+                try:
+                    # Wait for results container
+                    wait.until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, '#search, #rso'))
+                    )
+                except Exception:
+                    logger.warning("Timeout waiting for search results")
+
+                # Extra wait for JS rendering
+                time.sleep(random.uniform(1, 2))
+
+                # Simulate reading behavior
+                self._simulate_human_behavior(driver, intensity="normal")
+
+                # Get page source
+                html = driver.page_source
+
+                if not html or len(html) < 1000:
                     logger.error(f"Failed to fetch SERP for query: {query}")
+                    return None
+
+                # Validate response
+                is_valid, reason = self._validate_page_response(driver, url)
+                if not is_valid:
+                    logger.error(f"SERP validation failed: {reason}")
                     return None
 
                 # Parse the SERP
@@ -436,21 +480,14 @@ class SerpScraper(BaseScraper):
                 # Save to database if enabled
                 if self.engine:
                     with Session(self.engine) as session:
-                        # Get or create query record
                         query_id = self._get_or_create_query(session, query, location)
-
-                        # Save snapshot
                         snapshot_id = self._save_snapshot(
                             session, query_id, snapshot, html
                         )
-
-                        # Save individual results
                         self._save_results(
                             session, snapshot_id, snapshot,
                             our_domains, competitor_domains
                         )
-
-                        # Save People Also Ask questions
                         self._save_paa_questions(
                             session, snapshot_id, query_id, snapshot
                         )
@@ -492,9 +529,10 @@ class SerpScraper(BaseScraper):
             "total_results": 0,
             "our_rankings": [],
             "competitor_rankings": [],
+            "scraper": "selenium",
         }
 
-        with task_logger.log_task("serp_scraper", "scraper", {"query_count": len(queries)}) as task:
+        with task_logger.log_task("serp_scraper_selenium", "scraper", {"query_count": len(queries)}) as task:
             for query_dict in queries:
                 query = query_dict.get("query", "")
                 location = query_dict.get("location")
@@ -515,7 +553,6 @@ class SerpScraper(BaseScraper):
                     results["successful"] += 1
                     results["total_results"] += len(snapshot.results)
 
-                    # Track our rankings
                     for result in snapshot.results:
                         if our_domains and result.domain in our_domains:
                             results["our_rankings"].append({
@@ -547,24 +584,24 @@ class SerpScraper(BaseScraper):
 
 
 # Module-level singleton
-_serp_scraper_instance = None
+_serp_scraper_selenium_instance = None
 
 
-def get_serp_scraper(**kwargs) -> SerpScraper:
-    """Get or create the singleton SerpScraper instance."""
-    global _serp_scraper_instance
+def get_serp_scraper_selenium(**kwargs) -> SerpScraperSelenium:
+    """Get or create the singleton SerpScraperSelenium instance."""
+    global _serp_scraper_selenium_instance
 
-    if _serp_scraper_instance is None:
-        _serp_scraper_instance = SerpScraper(**kwargs)
+    if _serp_scraper_selenium_instance is None:
+        _serp_scraper_selenium_instance = SerpScraperSelenium(**kwargs)
 
-    return _serp_scraper_instance
+    return _serp_scraper_selenium_instance
 
 
 def main():
     """Demo/CLI interface for SERP scraper."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="SERP Scraper")
+    parser = argparse.ArgumentParser(description="SERP Scraper (SeleniumBase)")
     parser.add_argument("query", nargs="?", help="Search query")
     parser.add_argument("--location", "-l", help="Location context")
     parser.add_argument("--headless", action="store_true", default=True)
@@ -575,15 +612,15 @@ def main():
 
     if args.demo:
         logger.info("=" * 60)
-        logger.info("SERP Scraper Demo Mode")
+        logger.info("SERP Scraper Demo Mode (SeleniumBase)")
         logger.info("=" * 60)
         logger.info("")
-        logger.info("This would scrape Google for the specified query.")
-        logger.info("Note: Actual scraping requires Playwright and proper setup.")
+        logger.info("This scraper uses SeleniumBase Undetected Chrome for better")
+        logger.info("anti-detection than the Playwright version.")
         logger.info("")
         logger.info("Example usage:")
-        logger.info("  python serp_scraper.py 'pressure washing austin'")
-        logger.info("  python serp_scraper.py 'power washing' --location 'Austin, TX'")
+        logger.info("  python serp_scraper_selenium.py 'pressure washing austin'")
+        logger.info("  python serp_scraper_selenium.py 'power washing' --location 'Austin, TX'")
         logger.info("")
         logger.info("=" * 60)
         return
@@ -592,13 +629,11 @@ def main():
         parser.print_help()
         return
 
-    # Create scraper
-    scraper = SerpScraper(
+    scraper = SerpScraperSelenium(
         headless=args.headless,
         use_proxy=not args.no_proxy,
     )
 
-    # Scrape single query
     snapshot = scraper.scrape_query(
         query=args.query,
         location=args.location,
@@ -617,7 +652,6 @@ def main():
         if len(snapshot.results) > 10:
             logger.info(f"... and {len(snapshot.results) - 10} more results")
 
-        # Print stats
         logger.info("")
         logger.info("Statistics:")
         stats = scraper.get_stats()

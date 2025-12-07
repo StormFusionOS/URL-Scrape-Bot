@@ -55,17 +55,13 @@ def get_verification_where_clause() -> str:
     """
     Get SQL WHERE clause for filtering companies by verification status.
 
-    Returns companies that have either:
-    - Verification status = 'passed'
-    - Human label = 'provider'
+    Returns companies that have been verified as legitimate service providers.
+    Uses the standardized 'verified' column (true/false/null).
 
     Returns:
         SQL WHERE clause string (can be used with AND in queries)
     """
-    return (
-        "(parse_metadata->'verification'->>'status' = 'passed' OR "
-        "parse_metadata->'verification'->>'human_label' = 'provider')"
-    )
+    return "verified = true"
 
 # Global state
 shutdown_requested = False
@@ -144,13 +140,14 @@ class SEOWorkerService:
         self.auditor = None
 
     def _init_auditor(self):
-        """Initialize the technical auditor."""
+        """Initialize the technical auditor (SeleniumBase UC version)."""
         try:
-            from seo_intelligence.scrapers.technical_auditor import TechnicalAuditor
-            self.auditor = TechnicalAuditor()
-            logger.info("Technical auditor initialized")
+            # Use SeleniumBase version for better anti-detection
+            from seo_intelligence.scrapers.technical_auditor_selenium import TechnicalAuditorSelenium
+            self.auditor = TechnicalAuditorSelenium()
+            logger.info("Technical auditor initialized (SeleniumBase UC)")
         except ImportError as e:
-            logger.warning(f"Could not import TechnicalAuditor: {e}")
+            logger.warning(f"Could not import TechnicalAuditorSelenium: {e}")
             self.auditor = None
 
     def start(self):

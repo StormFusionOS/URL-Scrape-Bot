@@ -45,12 +45,13 @@ class BacklinkWorker(BaseModuleWorker):
         self._crawler = None
 
     def _get_crawler(self):
-        """Get or create backlink crawler."""
+        """Get or create backlink crawler (SeleniumBase UC version)."""
         if self._crawler is None:
             try:
-                from seo_intelligence.scrapers.backlink_crawler import BacklinkCrawler
-                self._crawler = BacklinkCrawler(headless=True)
-                logger.info("Backlink crawler initialized")
+                # Use SeleniumBase version for better anti-detection
+                from seo_intelligence.scrapers.backlink_crawler_selenium import BacklinkCrawlerSelenium
+                self._crawler = BacklinkCrawlerSelenium(headless=True)
+                logger.info("Backlink crawler initialized (SeleniumBase UC)")
             except Exception as e:
                 logger.error(f"Failed to initialize backlink crawler: {e}")
         return self._crawler

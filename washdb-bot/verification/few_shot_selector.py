@@ -125,6 +125,7 @@ class FewShotSelector:
         - No major red flags
         - Contact info present
         """
+        # Use standardized schema: verified=true means passed verification
         query = """
             SELECT
                 c.id,
@@ -132,13 +133,10 @@ class FewShotSelector:
                 c.website,
                 c.parse_metadata
             FROM companies c
-            WHERE c.active = true
+            WHERE c.verified = true
               AND (
                   c.parse_metadata->'verification'->'labels'->>'human' = 'provider'
-                  OR (
-                      c.parse_metadata->'verification'->>'status' = 'passed'
-                      AND (c.parse_metadata->'verification'->>'final_score')::float >= %(min_conf)s
-                  )
+                  OR (c.parse_metadata->'verification'->>'final_score')::float >= %(min_conf)s
               )
               AND c.parse_metadata->'verification'->'llm_classification'->>'type' = 'provider'
               AND (c.parse_metadata ? 'services_text' OR c.parse_metadata ? 'about_text')
@@ -148,7 +146,7 @@ class FewShotSelector:
 
         with self.db_manager.get_connection() as conn:
             result = conn.execute(text(query), {'min_conf': min_confidence, 'limit': n * 2})
-            rows = cursor.fetchall()
+            rows = result.fetchall()
 
         examples = []
         for row in rows:
@@ -172,6 +170,7 @@ class FewShotSelector:
         - Has red flags (directory, agency, blog, franchise)
         - Clearly not a service provider
         """
+        # Use standardized schema: verified=false means failed verification
         query = """
             SELECT
                 c.id,
@@ -179,13 +178,10 @@ class FewShotSelector:
                 c.website,
                 c.parse_metadata
             FROM companies c
-            WHERE c.active = true
+            WHERE c.verified = false
               AND (
                   c.parse_metadata->'verification'->'labels'->>'human' IN ('non_provider', 'directory', 'agency', 'blog')
-                  OR (
-                      c.parse_metadata->'verification'->>'status' = 'failed'
-                      AND (c.parse_metadata->'verification'->>'final_score')::float <= (1.0 - %(min_conf)s)
-                  )
+                  OR (c.parse_metadata->'verification'->>'final_score')::float <= (1.0 - %(min_conf)s)
               )
               AND c.parse_metadata->'verification'->'red_flags' IS NOT NULL
               AND jsonb_array_length(c.parse_metadata->'verification'->'red_flags') > 0
@@ -195,7 +191,7 @@ class FewShotSelector:
 
         with self.db_manager.get_connection() as conn:
             result = conn.execute(text(query), {'min_conf': min_confidence, 'limit': n * 2})
-            rows = cursor.fetchall()
+            rows = result.fetchall()
 
         examples = []
         for row in rows:
@@ -215,6 +211,7 @@ class FewShotSelector:
         - Human reviewed and corrected
         - Borderline scores (0.4-0.6)
         """
+        # Tricky cases: human-reviewed and corrected, regardless of current verified status
         query = """
             SELECT
                 c.id,
@@ -223,8 +220,7 @@ class FewShotSelector:
                 c.parse_metadata
             FROM companies c
             INNER JOIN claude_review_audit cra ON cra.company_id = c.id
-            WHERE c.active = true
-              AND cra.human_reviewed = true
+            WHERE cra.human_reviewed = true
               AND cra.decision != cra.human_decision  -- Claude was wrong
               AND (c.parse_metadata->'verification'->>'final_score')::float BETWEEN 0.4 AND 0.6
             ORDER BY cra.reviewed_at DESC
@@ -232,8 +228,8 @@ class FewShotSelector:
         """
 
         with self.db_manager.get_connection() as conn:
-                        result = conn.execute(text(query), {'limit': n * 2})
-            rows = cursor.fetchall()
+            result = conn.execute(text(query), {'limit': n * 2})
+            rows = result.fetchall()
 
         examples = []
         for row in rows:
@@ -252,6 +248,7 @@ class FewShotSelector:
 
     def _get_borderline_cases(self, n: int) -> List[FewShotExample]:
         """Get borderline cases (scores 0.45-0.55) as fallback tricky examples."""
+        # Borderline cases: verified IS NOT NULL and have human label or claude review
         query = """
             SELECT
                 c.id,
@@ -259,7 +256,7 @@ class FewShotSelector:
                 c.website,
                 c.parse_metadata
             FROM companies c
-            WHERE c.active = true
+            WHERE c.verified IS NOT NULL
               AND (c.parse_metadata->'verification'->>'final_score')::float BETWEEN 0.45 AND 0.55
               AND (
                   c.parse_metadata->'verification'->'labels'->>'human' IS NOT NULL
@@ -270,8 +267,8 @@ class FewShotSelector:
         """
 
         with self.db_manager.get_connection() as conn:
-                        result = conn.execute(text(query), {'limit': n})
-            rows = cursor.fetchall()
+            result = conn.execute(text(query), {'limit': n})
+            rows = result.fetchall()
 
         examples = []
         for row in rows:

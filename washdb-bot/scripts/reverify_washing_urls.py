@@ -55,9 +55,10 @@ class WashingURLReverifier:
         print(f"Available: ${budget - min_reserve:.2f}")
 
     def get_washing_url_companies(self, limit: int = 50):
-        """Get rejected companies with 'washing' in URL."""
+        """Get rejected companies with 'washing' in URL using standardized schema."""
 
         with self.db.get_session() as session:
+            # Use standardized schema: verified=false means failed
             result = session.execute(text("""
                 SELECT
                     id,
@@ -65,7 +66,7 @@ class WashingURLReverifier:
                     website,
                     parse_metadata
                 FROM companies
-                WHERE parse_metadata->'verification'->>'status' = 'failed'
+                WHERE verified = false
                 AND (
                     website ILIKE '%washing%'
                     OR website ILIKE '%wash%'
@@ -196,7 +197,10 @@ class WashingURLReverifier:
             # IMPORTANT: Save Claude's assessment as human_label for ML training
             human_label = 'pass' if new_status == 'passed' else 'fail'
 
-            # Use raw SQL with f-string, escaping single quotes for PostgreSQL
+            # Determine verified boolean from status
+            verified_value = True if new_status == 'passed' else False
+
+            # Update using standardized schema: verified, verification_type
             query_sql = f"""
                 UPDATE companies
                 SET parse_metadata = jsonb_set(
@@ -211,7 +215,9 @@ class WashingURLReverifier:
                     ),
                     '{{verification,human_label}}',
                     '{json.dumps(human_label).replace("'", "''")}'::jsonb
-                )
+                ),
+                verified = {str(verified_value).lower()},
+                verification_type = 'claude'
                 WHERE id = {company_id}
             """
 
@@ -227,12 +233,12 @@ class WashingURLReverifier:
         print("Re-verifying rejected companies with 'washing' in URL/name")
         print()
 
-        # Get total count first
+        # Get total count first using standardized schema
         with self.db.get_session() as session:
             result = session.execute(text("""
                 SELECT COUNT(*)
                 FROM companies
-                WHERE parse_metadata->'verification'->>'status' = 'failed'
+                WHERE verified = false
                 AND (
                     website ILIKE '%washing%'
                     OR website ILIKE '%wash%'

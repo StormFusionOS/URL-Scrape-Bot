@@ -23,7 +23,7 @@ Usage:
 import asyncio
 import random
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Generator, Optional, Dict, List
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -410,8 +410,8 @@ async def crawl_single_target(
 
     # Update target status
     target.status = "IN_PROGRESS"
-    target.claimed_at = datetime.utcnow()
-    target.heartbeat_at = datetime.utcnow()
+    target.claimed_at = datetime.now(timezone.utc)
+    target.heartbeat_at = datetime.now(timezone.utc)
     session.commit()
 
     all_results = []
@@ -446,7 +446,7 @@ async def crawl_single_target(
             target.status = "DONE"
             target.note = "completed_no_results"
             target.results_found = 0
-            target.finished_at = datetime.utcnow()
+            target.finished_at = datetime.now(timezone.utc)
             session.commit()
 
             return [], {
@@ -535,7 +535,7 @@ async def crawl_single_target(
         target.results_found = total_found
         target.results_saved = total_saved
         target.duplicates_skipped = duplicates_skipped
-        target.finished_at = datetime.utcnow()
+        target.finished_at = datetime.now(timezone.utc)
         session.commit()
 
         stats = {
@@ -603,7 +603,7 @@ async def crawl_city_targets(
         logger.info("ORPHAN RECOVERY")
         logger.info(f"{'='*80}")
 
-        orphan_cutoff = datetime.utcnow() - timedelta(minutes=orphan_timeout_minutes)
+        orphan_cutoff = datetime.now(timezone.utc) - timedelta(minutes=orphan_timeout_minutes)
         orphaned = session.query(YelpTarget).filter(
             YelpTarget.state_id.in_(state_ids),
             YelpTarget.status == "IN_PROGRESS",
