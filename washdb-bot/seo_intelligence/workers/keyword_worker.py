@@ -61,12 +61,13 @@ class KeywordIntelligenceWorker(BaseModuleWorker):
         self._traffic_estimator = None
 
     def _get_keyword_intelligence(self):
-        """Get or create keyword intelligence orchestrator."""
+        """Get or create keyword intelligence orchestrator (SeleniumBase UC version)."""
         if self._keyword_intelligence is None:
             try:
-                from seo_intelligence.scrapers.keyword_intelligence import get_keyword_intelligence
-                self._keyword_intelligence = get_keyword_intelligence()
-                logger.info("Keyword intelligence initialized")
+                # Use SeleniumBase version for better anti-detection
+                from seo_intelligence.scrapers.keyword_intelligence_selenium import get_keyword_intelligence_selenium
+                self._keyword_intelligence = get_keyword_intelligence_selenium()
+                logger.info("Keyword intelligence initialized (SeleniumBase UC)")
             except Exception as e:
                 logger.error(f"Failed to initialize keyword intelligence: {e}")
         return self._keyword_intelligence
@@ -134,18 +135,19 @@ class KeywordIntelligenceWorker(BaseModuleWorker):
         """
         Get companies that need keyword analysis.
 
-        Selects companies without recent keyword research.
+        Selects all verified companies with websites for continuous scraping.
         """
         session = self.Session()
         try:
-            query = text("""
+            # Get all verified companies with websites - no time restriction
+            # This allows continuous re-scraping of verified URLs
+            verification_clause = self.get_verification_where_clause()
+            query = text(f"""
                 SELECT c.id
                 FROM companies c
-                LEFT JOIN keyword_research kr ON c.id = kr.company_id
-                    AND kr.analyzed_at > NOW() - INTERVAL '7 days'
                 WHERE c.website IS NOT NULL
                   AND c.active = true
-                  AND kr.id IS NULL
+                  AND {verification_clause}
                   AND (:after_id IS NULL OR c.id > :after_id)
                 ORDER BY c.id ASC
                 LIMIT :limit
@@ -160,13 +162,15 @@ class KeywordIntelligenceWorker(BaseModuleWorker):
 
         except Exception as e:
             logger.error(f"Error getting companies: {e}")
-            # Fall back to simple query
+            # Fall back to simple query with verification filter
             try:
-                query = text("""
+                verification_clause = self.get_verification_where_clause()
+                query = text(f"""
                     SELECT c.id
                     FROM companies c
                     WHERE c.website IS NOT NULL
                       AND c.active = true
+                      AND {verification_clause}
                       AND (:after_id IS NULL OR c.id > :after_id)
                     ORDER BY c.id ASC
                     LIMIT :limit

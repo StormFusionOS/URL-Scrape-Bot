@@ -50,6 +50,19 @@ PREFETCH_SIZE = 5  # Companies to prefetch
 
 logger = get_logger("seo_worker_service")
 
+
+def get_verification_where_clause() -> str:
+    """
+    Get SQL WHERE clause for filtering companies by verification status.
+
+    Returns companies that have been verified as legitimate service providers.
+    Uses the standardized 'verified' column (true/false/null).
+
+    Returns:
+        SQL WHERE clause string (can be used with AND in queries)
+    """
+    return "verified = true"
+
 # Global state
 shutdown_requested = False
 service_stats = {
@@ -127,13 +140,14 @@ class SEOWorkerService:
         self.auditor = None
 
     def _init_auditor(self):
-        """Initialize the technical auditor."""
+        """Initialize the technical auditor (SeleniumBase UC version)."""
         try:
-            from seo_intelligence.scrapers.technical_auditor import TechnicalAuditor
-            self.auditor = TechnicalAuditor()
-            logger.info("Technical auditor initialized")
+            # Use SeleniumBase version for better anti-detection
+            from seo_intelligence.scrapers.technical_auditor_selenium import TechnicalAuditorSelenium
+            self.auditor = TechnicalAuditorSelenium()
+            logger.info("Technical auditor initialized (SeleniumBase UC)")
         except ImportError as e:
-            logger.warning(f"Could not import TechnicalAuditor: {e}")
+            logger.warning(f"Could not import TechnicalAuditorSelenium: {e}")
             self.auditor = None
 
     def start(self):
@@ -303,16 +317,19 @@ class SEOWorkerService:
                 time.sleep(5.0)
 
     def _get_companies_to_audit(self, limit: int) -> List[CompanyToAudit]:
-        """Get companies that haven't been audited recently."""
+        """Get verified companies that haven't been audited recently."""
         session = self.Session()
         try:
-            # Get companies without recent page audits
-            query = text("""
+            # Get verified companies without recent page audits
+            # Only process verified companies (passed verification or human-labeled as provider)
+            verification_clause = get_verification_where_clause()
+            query = text(f"""
                 SELECT c.id, c.name, c.website, c.domain
                 FROM companies c
                 LEFT JOIN page_audits pa ON c.website = pa.url
                 WHERE c.website IS NOT NULL
                   AND c.active = true
+                  AND {verification_clause}
                   AND (pa.id IS NULL OR pa.audit_date < NOW() - INTERVAL '7 days')
                 ORDER BY pa.audit_date ASC NULLS FIRST, c.last_updated DESC
                 LIMIT :limit

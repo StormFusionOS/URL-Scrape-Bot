@@ -126,14 +126,55 @@ class EmbeddingGenerator:
         """
         self.model_name = model_name or os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
         self.embedding_version = os.getenv("EMBEDDING_VERSION", "v1.0")
+        self.model = None
+        self.dimension = 384  # Default dimension for MiniLM
+        self._initialized = False
+        self._init_error = None
 
-        # Load model
-        print(f"Loading embedding model: {self.model_name}")
-        self.model = SentenceTransformer(self.model_name)
+        # Try to load model with robust error handling
+        self._initialize_model()
 
-        # Get embedding dimension
-        self.dimension = self.model.get_sentence_embedding_dimension()
-        print(f"✓ Model loaded. Embedding dimension: {self.dimension}")
+    def _initialize_model(self):
+        """
+        Initialize the model with robust error handling.
+
+        Handles common issues like:
+        - PyTorch meta tensor errors (CUDA initialization)
+        - Memory constraints
+        - Model download failures
+        """
+        try:
+            print(f"Loading embedding model: {self.model_name}")
+
+            # Try CPU-only first to avoid CUDA/meta tensor issues
+            import torch
+            device = 'cpu'  # Force CPU to avoid meta tensor errors
+
+            self.model = SentenceTransformer(self.model_name, device=device)
+
+            # Get embedding dimension
+            self.dimension = self.model.get_sentence_embedding_dimension()
+            self._initialized = True
+            print(f"✓ Model loaded on {device}. Embedding dimension: {self.dimension}")
+
+        except Exception as e:
+            error_msg = str(e)
+            self._init_error = error_msg
+
+            # Check for specific PyTorch errors
+            if "meta tensor" in error_msg.lower() or "cannot copy" in error_msg.lower():
+                print(f"⚠ PyTorch meta tensor error - embeddings disabled: {error_msg[:100]}")
+            elif "cuda" in error_msg.lower():
+                print(f"⚠ CUDA error - embeddings disabled: {error_msg[:100]}")
+            else:
+                print(f"⚠ Failed to load embedding model: {error_msg[:100]}")
+
+            # Model will be None, embed methods will return empty/None
+            self._initialized = False
+
+    def is_available(self) -> bool:
+        """Check if the embedding model is available and working."""
+        return self._initialized and self.model is not None
 
     def embed_text(self, text: str) -> List[float]:
         """
@@ -143,10 +184,17 @@ class EmbeddingGenerator:
             text: Input text
 
         Returns:
-            Embedding vector as list of floats
+            Embedding vector as list of floats, or None if model unavailable
         """
-        embedding = self.model.encode(text, convert_to_numpy=True)
-        return embedding.tolist()
+        if not self.is_available():
+            return None
+
+        try:
+            embedding = self.model.encode(text, convert_to_numpy=True)
+            return embedding.tolist()
+        except Exception as e:
+            print(f"⚠ Embedding failed: {str(e)[:100]}")
+            return None
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
         """
@@ -156,19 +204,36 @@ class EmbeddingGenerator:
             texts: List of input texts
 
         Returns:
-            List of embedding vectors
+            List of embedding vectors, or empty list if model unavailable
         """
-        embeddings = self.model.encode(texts, convert_to_numpy=True, show_progress_bar=True)
-        return embeddings.tolist()
+        if not self.is_available():
+            return []
+
+        if not texts:
+            return []
+
+        try:
+            embeddings = self.model.encode(texts, convert_to_numpy=True, show_progress_bar=True)
+            return embeddings.tolist()
+        except Exception as e:
+            print(f"⚠ Batch embedding failed: {str(e)[:100]}")
+            return []
 
     def get_model_info(self) -> Dict[str, Any]:
         """Get information about the current model"""
-        return {
+        info = {
             "model_name": self.model_name,
             "embedding_version": self.embedding_version,
             "dimension": self.dimension,
-            "max_seq_length": self.model.max_seq_length
+            "available": self.is_available(),
         }
+
+        if self.is_available():
+            info["max_seq_length"] = self.model.max_seq_length
+        else:
+            info["error"] = self._init_error[:200] if self._init_error else "Unknown error"
+
+        return info
 
 
 class ContentEmbedder:
@@ -185,6 +250,10 @@ class ContentEmbedder:
 
         self.chunker = TextChunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         self.embedder = EmbeddingGenerator()
+
+    def is_available(self) -> bool:
+        """Check if the embedding service is available and working."""
+        return self.embedder.is_available()
 
     def embed_content(self, content: str) -> Tuple[List[str], List[List[float]]]:
         """

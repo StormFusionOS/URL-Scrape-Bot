@@ -136,6 +136,18 @@ class BaseModuleWorker(ABC):
         """
         pass
 
+    def get_verification_where_clause(self) -> str:
+        """
+        Get SQL WHERE clause for filtering companies by verification status.
+
+        Uses standardized schema:
+        - verified = true (boolean column on companies table)
+
+        Returns:
+            SQL WHERE clause string (can be used with AND in queries)
+        """
+        return "verified = true"
+
     def run(self, resume_from: Optional[int] = None) -> WorkerStats:
         """
         Run the worker, processing all companies.

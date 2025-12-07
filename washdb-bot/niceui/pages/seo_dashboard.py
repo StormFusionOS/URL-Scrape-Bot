@@ -1,7 +1,7 @@
 """
 Unified SEO Dashboard Page
 
-Single dashboard with Start/Stop button controlling all 7 SEO modules:
+Single dashboard with individual Start/Stop controls for each SEO module:
 - SERP (with ranking trends and traffic estimation)
 - Citations
 - Backlinks
@@ -10,7 +10,7 @@ Single dashboard with Start/Stop button controlling all 7 SEO modules:
 - Keyword Intelligence (Phase 2: autocomplete, volume, difficulty, opportunities)
 - Competitive Analysis (Phase 3: keyword gaps, content gaps, backlink gaps)
 
-All modules run in continuous loop mode with tabbed per-module live logs.
+Each module can be started/stopped independently with forceful termination.
 
 Includes SEO Insights section showing:
 - Content metrics (word count, content depth, header structure)
@@ -20,14 +20,20 @@ Includes SEO Insights section showing:
 """
 
 import os
+import signal
+import subprocess
+import threading
+import time
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Dict, Any, List
 
 from dotenv import load_dotenv
 from nicegui import ui
 
 from niceui.widgets.live_log_viewer import LiveLogViewer
+from niceui.widgets.serp_monitor import get_serp_monitor
+from niceui.widgets.citation_monitor import citation_monitor_widget
 
 # Database imports for SEO insights
 try:
@@ -45,24 +51,22 @@ LOG_DIR = PROJECT_ROOT / "logs" / "seo_modules"
 # Ensure environment is loaded
 load_dotenv(PROJECT_ROOT / '.env')
 
-# Module configuration
+# Module configuration with worker scripts
 MODULES = [
-    {"name": "serp", "label": "SERP", "icon": "search"},
-    {"name": "citations", "label": "Citations", "icon": "business"},
-    {"name": "backlinks", "label": "Backlinks", "icon": "link"},
-    {"name": "technical", "label": "Technical", "icon": "build"},
-    {"name": "seo_worker", "label": "SEO Worker", "icon": "analytics"},
-    # Phase 2 & 3 modules
-    {"name": "keyword_intel", "label": "Keywords", "icon": "key"},
-    {"name": "competitive", "label": "Competitive", "icon": "trending_up"},
+    {"name": "serp", "label": "SERP", "icon": "search", "worker_class": "SERPWorker"},
+    {"name": "citations", "label": "Citations", "icon": "business", "worker_class": "CitationWorker"},
+    {"name": "backlinks", "label": "Backlinks", "icon": "link", "worker_class": "BacklinkWorker"},
+    {"name": "technical", "label": "Technical", "icon": "build", "worker_class": "TechnicalWorker"},
+    {"name": "seo_worker", "label": "SEO Worker", "icon": "analytics", "worker_class": "SEOContinuousWorker"},
+    {"name": "keyword_intel", "label": "Keywords", "icon": "key", "worker_class": "KeywordIntelligenceWorker"},
+    {"name": "competitive", "label": "Competitive", "icon": "trending_up", "worker_class": "CompetitiveAnalysisWorker"},
 ]
-
-# Global orchestrator instance (lazy loaded)
-_orchestrator = None
-_workers_registered = False
 
 # Database engine for SEO insights
 _db_engine = None
+
+# Global module runners - tracks running processes/threads per module
+_module_runners: Dict[str, Dict[str, Any]] = {}
 
 
 def get_db_engine():
@@ -359,91 +363,219 @@ def query_content_stats() -> Dict[str, Any]:
         return {"error": str(e)}
 
 
-def get_orchestrator(force_new: bool = False):
-    """Get or create the SEO orchestrator instance."""
-    global _orchestrator, _workers_registered
+class ModuleRunner:
+    """Manages running a single SEO module worker."""
 
-    if force_new and _orchestrator is not None:
-        # Stop existing orchestrator if running
-        if _orchestrator.is_running():
-            _orchestrator.stop()
-        _orchestrator = None
-        _workers_registered = False
+    def __init__(self, module_name: str, worker_class: str, log_dir: Path):
+        self.module_name = module_name
+        self.worker_class = worker_class
+        self.log_dir = log_dir
+        self.log_file = log_dir / f"{module_name}.log"
 
-    if _orchestrator is None:
-        from seo_intelligence.orchestrator import SEOCycleOrchestrator
-        _orchestrator = SEOCycleOrchestrator(
-            log_dir=str(LOG_DIR),
-            heartbeat_timeout=300,
-            delay_between_modules=5.0,
-            delay_between_cycles=60.0
+        self._process: Optional[subprocess.Popen] = None
+        self._thread: Optional[threading.Thread] = None
+        self._worker = None
+        self._running = False
+        self._stop_requested = False
+        self._started_at: Optional[datetime] = None
+        self._stats = {
+            'companies_processed': 0,
+            'companies_succeeded': 0,
+            'companies_failed': 0,
+        }
+
+    def start(self):
+        """Start the module worker in a background thread."""
+        if self._running:
+            return
+
+        self._running = True
+        self._stop_requested = False
+        self._started_at = datetime.now()
+        self._stats = {'companies_processed': 0, 'companies_succeeded': 0, 'companies_failed': 0}
+
+        # Run in a separate thread
+        self._thread = threading.Thread(
+            target=self._run_worker,
+            daemon=True,
+            name=f"SEO-{self.module_name}"
         )
-        _workers_registered = False
+        self._thread.start()
 
-    # Register workers if not already done
-    if not _workers_registered:
-        _register_workers(_orchestrator)
-        _workers_registered = True
+        self._log(f"=== Started {self.module_name} worker ===")
 
-    return _orchestrator
+    def _run_worker(self):
+        """Run the worker (called in thread)."""
+        try:
+            # Import and instantiate the worker
+            from seo_intelligence.workers import (
+                SERPWorker,
+                CitationWorker,
+                BacklinkWorker,
+                TechnicalWorker,
+                SEOContinuousWorker,
+                KeywordIntelligenceWorker,
+                CompetitiveAnalysisWorker
+            )
+
+            worker_classes = {
+                "SERPWorker": SERPWorker,
+                "CitationWorker": CitationWorker,
+                "BacklinkWorker": BacklinkWorker,
+                "TechnicalWorker": TechnicalWorker,
+                "SEOContinuousWorker": SEOContinuousWorker,
+                "KeywordIntelligenceWorker": KeywordIntelligenceWorker,
+                "CompetitiveAnalysisWorker": CompetitiveAnalysisWorker,
+            }
+
+            worker_cls = worker_classes.get(self.worker_class)
+            if not worker_cls:
+                self._log(f"[ERROR] Unknown worker class: {self.worker_class}")
+                return
+
+            self._worker = worker_cls(log_dir=str(self.log_dir))
+
+            # Set up progress callback
+            def progress_callback(last_id, processed, errors):
+                self._stats['companies_processed'] = processed
+                self._stats['companies_failed'] = errors
+                self._stats['companies_succeeded'] = processed - errors
+
+            self._worker.set_progress_callback(progress_callback)
+
+            # Run the worker
+            stats = self._worker.run()
+
+            self._stats['companies_processed'] = stats.companies_processed
+            self._stats['companies_succeeded'] = stats.companies_succeeded
+            self._stats['companies_failed'] = stats.companies_failed
+
+            self._log(f"=== Completed: {stats.companies_succeeded}/{stats.companies_processed} succeeded ===")
+
+        except Exception as e:
+            self._log(f"[ERROR] Worker crashed: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self._running = False
+            self._worker = None
+
+    def stop(self, force: bool = True):
+        """Stop the module worker.
+
+        Args:
+            force: If True, forcefully terminate the worker thread
+        """
+        self._stop_requested = True
+        self._log("Stop requested...")
+
+        # Request graceful stop from worker
+        if self._worker:
+            self._worker.stop()
+
+        # Wait briefly for graceful shutdown
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5.0)
+
+        # If force and still running, we need to kill any spawned processes
+        if force and self._thread and self._thread.is_alive():
+            self._log("[FORCE] Forcefully terminating...")
+            # Find and kill any child processes (Chrome, etc)
+            self._kill_child_processes()
+
+        self._running = False
+        self._log("=== Stopped ===")
+
+    def _kill_child_processes(self):
+        """Kill any child processes spawned by the worker (Chrome, etc)."""
+        try:
+            import psutil
+            current_pid = os.getpid()
+
+            # Find all chrome/chromium processes that might be ours
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    pinfo = proc.info
+                    name = pinfo['name'].lower() if pinfo['name'] else ''
+
+                    # Kill chromium/chrome processes
+                    if 'chrom' in name:
+                        proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except ImportError:
+            # psutil not available, try pkill
+            try:
+                subprocess.run(['pkill', '-f', 'chromium'], timeout=5)
+                subprocess.run(['pkill', '-f', 'chrome'], timeout=5)
+            except Exception:
+                pass
+        except Exception as e:
+            self._log(f"[WARN] Error killing child processes: {e}")
+
+    def is_running(self) -> bool:
+        """Check if the worker is running."""
+        return self._running
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get current status."""
+        uptime = 0
+        if self._started_at and self._running:
+            uptime = (datetime.now() - self._started_at).total_seconds()
+
+        return {
+            'running': self._running,
+            'started_at': self._started_at.isoformat() if self._started_at else None,
+            'uptime_seconds': uptime,
+            'companies_processed': self._stats.get('companies_processed', 0),
+            'companies_succeeded': self._stats.get('companies_succeeded', 0),
+            'companies_failed': self._stats.get('companies_failed', 0),
+        }
+
+    def _log(self, message: str):
+        """Log message to module log file."""
+        try:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(self.log_file, 'a') as f:
+                f.write(f"[{timestamp}] {message}\n")
+        except Exception:
+            pass
 
 
-def _register_workers(orchestrator):
-    """Register all module workers with the orchestrator."""
-    try:
-        from seo_intelligence.workers import (
-            SERPWorker,
-            CitationWorker,
-            BacklinkWorker,
-            TechnicalWorker,
-            SEOContinuousWorker,
-            KeywordIntelligenceWorker,
-            CompetitiveAnalysisWorker
+def get_module_runner(module_name: str, worker_class: str) -> ModuleRunner:
+    """Get or create a module runner."""
+    global _module_runners
+
+    if module_name not in _module_runners:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _module_runners[module_name] = ModuleRunner(
+            module_name=module_name,
+            worker_class=worker_class,
+            log_dir=LOG_DIR
         )
 
-        workers = [
-            ("serp", SERPWorker(log_dir=str(LOG_DIR))),
-            ("citations", CitationWorker(log_dir=str(LOG_DIR))),
-            ("backlinks", BacklinkWorker(log_dir=str(LOG_DIR))),
-            ("technical", TechnicalWorker(log_dir=str(LOG_DIR))),
-            ("seo_worker", SEOContinuousWorker(log_dir=str(LOG_DIR))),
-            # Phase 2 & 3 workers
-            ("keyword_intel", KeywordIntelligenceWorker(log_dir=str(LOG_DIR))),
-            ("competitive", CompetitiveAnalysisWorker(log_dir=str(LOG_DIR))),
-        ]
-
-        for name, worker in workers:
-            orchestrator.register_worker(name, worker)
-
-    except Exception as e:
-        print(f"Error registering workers: {e}")
-        import traceback
-        traceback.print_exc()
+    return _module_runners[module_name]
 
 
 class SEODashboard:
-    """Unified SEO Dashboard component."""
+    """Unified SEO Dashboard component with individual module controls."""
 
     def __init__(self):
-        self.orchestrator = get_orchestrator()
         self.log_viewers: Dict[str, LiveLogViewer] = {}
         self.status_timer = None
         self.active_tab = "orchestrator"
 
-        # UI elements
-        self.status_badge = None
-        self.start_btn = None
-        self.stop_btn = None
-        self.cycle_label = None
-        self.uptime_label = None
-        self.module_cards = {}
+        # UI elements per module
+        self.module_cards: Dict[str, Dict[str, Any]] = {}
 
     def render(self):
         """Render the dashboard."""
         with ui.column().classes('w-full max-w-7xl mx-auto p-4 gap-4'):
             self._render_header()
-            self._render_module_status()
+            self._render_module_controls()
             self._render_seo_insights()
+            self._render_serp_monitor()
+            self._render_citation_monitor()
             self._render_tabbed_logs()
 
         # Start status update timer
@@ -457,75 +589,82 @@ class SEODashboard:
         self._update_insights()
 
     def _render_header(self):
-        """Render header with controls."""
+        """Render header with global controls."""
         with ui.card().classes('w-full'):
             with ui.row().classes('w-full items-center'):
                 # Title
                 ui.icon('dashboard', size='lg').classes('text-blue-400')
-                ui.label('SEO Unified Dashboard').classes('text-2xl font-bold ml-2')
+                ui.label('SEO Dashboard').classes('text-2xl font-bold ml-2')
+                ui.label('(Individual Job Control)').classes('text-sm text-gray-400 ml-2')
 
                 ui.space()
 
-                # Status badge
-                self.status_badge = ui.badge('STOPPED', color='negative').classes('text-lg px-4 py-1')
-
-                # Cycle count
-                self.cycle_label = ui.label('Cycle: 0').classes('text-lg ml-4')
-
-                # Uptime
-                self.uptime_label = ui.label('Uptime: 0m').classes('text-gray-400 ml-4')
-
-            ui.separator().classes('my-3')
-
-            # Control buttons
-            with ui.row().classes('w-full gap-4'):
-                self.start_btn = ui.button(
+                # Global controls
+                ui.button(
                     'Start All',
                     icon='play_arrow',
                     color='positive',
-                    on_click=self._on_start
-                ).classes('flex-1')
+                    on_click=self._on_start_all
+                ).props('dense')
 
-                self.stop_btn = ui.button(
+                ui.button(
                     'Stop All',
                     icon='stop',
                     color='negative',
-                    on_click=self._on_stop
-                ).classes('flex-1')
+                    on_click=self._on_stop_all
+                ).props('dense')
 
                 ui.button(
-                    'Reset State',
-                    icon='restart_alt',
-                    color='warning',
-                    on_click=self._on_reset
-                ).props('outline').classes('flex-1')
-
-                ui.button(
-                    'Clear Logs',
+                    'Clear All Logs',
                     icon='delete_sweep',
                     on_click=self._on_clear_logs
-                ).props('outline').classes('flex-1')
+                ).props('outline dense')
 
-    def _render_module_status(self):
-        """Render module status cards."""
-        with ui.row().classes('w-full gap-2'):
+    def _render_module_controls(self):
+        """Render individual module control cards."""
+        ui.label('Module Controls').classes('text-lg font-semibold mt-4')
+
+        with ui.row().classes('w-full gap-3 flex-wrap'):
             for module in MODULES:
-                with ui.card().classes('flex-1 min-w-32'):
-                    with ui.column().classes('items-center p-2'):
-                        # Module icon and name
-                        ui.icon(module['icon'], size='md').classes('text-gray-400')
-                        ui.label(module['label']).classes('font-semibold')
+                with ui.card().classes('min-w-64 flex-1'):
+                    with ui.column().classes('gap-2 p-2'):
+                        # Header row with icon and name
+                        with ui.row().classes('items-center gap-2'):
+                            ui.icon(module['icon'], size='md').classes('text-blue-400')
+                            ui.label(module['label']).classes('font-semibold text-lg')
+                            ui.space()
+                            # Status badge
+                            status_badge = ui.badge('stopped', color='grey').classes('text-xs')
 
-                        # Status indicator
-                        status_badge = ui.badge('pending', color='grey').classes('text-xs')
+                        # Stats row
+                        stats_label = ui.label('0/0 processed').classes('text-sm text-gray-400')
+                        uptime_label = ui.label('').classes('text-xs text-gray-500')
+
+                        # Control buttons
+                        with ui.row().classes('gap-2 mt-2'):
+                            start_btn = ui.button(
+                                'Start',
+                                icon='play_arrow',
+                                color='positive',
+                                on_click=lambda m=module['name'], w=module['worker_class']: self._on_start_module(m, w)
+                            ).props('dense size=sm')
+
+                            stop_btn = ui.button(
+                                'Stop',
+                                icon='stop',
+                                color='negative',
+                                on_click=lambda m=module['name']: self._on_stop_module(m)
+                            ).props('dense size=sm')
+
+                        # Store references
                         self.module_cards[module['name']] = {
                             'badge': status_badge,
-                            'icon': None
+                            'stats': stats_label,
+                            'uptime': uptime_label,
+                            'start_btn': start_btn,
+                            'stop_btn': stop_btn,
+                            'worker_class': module['worker_class'],
                         }
-
-                        # Stats
-                        stats_label = ui.label('0 processed').classes('text-xs text-gray-500')
-                        self.module_cards[module['name']]['stats'] = stats_label
 
     def _render_seo_insights(self):
         """Render SEO Insights section with data from new scrapers."""
@@ -560,6 +699,15 @@ class SEODashboard:
                 with ui.card().classes('flex-1'):
                     ui.label('Technical Health').classes('font-semibold text-purple-400')
                     self.technical_container = ui.column().classes('gap-1 mt-2')
+
+    def _render_serp_monitor(self):
+        """Render the SERP scraper monitor widget."""
+        monitor = get_serp_monitor()
+        monitor.render()
+
+    def _render_citation_monitor(self):
+        """Render the Citation crawler monitor widget."""
+        citation_monitor_widget()
 
     def _update_insights(self):
         """Update the SEO insights display with fresh data."""
@@ -736,15 +884,14 @@ class SEODashboard:
             ui.label('Live Logs').classes('text-xl font-bold mb-2')
 
             # Create tabs
-            tabs = [{"name": "orchestrator", "label": "Orchestrator", "icon": "hub"}] + \
-                   [{"name": m['name'], "label": m['label'], "icon": m['icon']} for m in MODULES]
+            tabs = [{"name": m['name'], "label": m['label'], "icon": m['icon']} for m in MODULES]
 
             with ui.tabs().classes('w-full').props('dense') as tab_container:
                 tab_refs = {}
                 for tab in tabs:
                     tab_refs[tab['name']] = ui.tab(tab['name'], label=tab['label'], icon=tab['icon'])
 
-            with ui.tab_panels(tab_container, value='orchestrator').classes('w-full'):
+            with ui.tab_panels(tab_container, value=MODULES[0]['name']).classes('w-full'):
                 for tab in tabs:
                     with ui.tab_panel(tab['name']):
                         log_file = self._get_log_file(tab['name'])
@@ -759,63 +906,82 @@ class SEODashboard:
     def _get_log_file(self, module: str) -> str:
         """Get log file path for a module."""
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        if module == "orchestrator":
-            return str(LOG_DIR / "orchestrator.log")
         return str(LOG_DIR / f"{module}.log")
 
-    async def _on_start(self):
-        """Handle start button click."""
-        self.start_btn.disable()
-        ui.notify('Starting all SEO modules...', type='info')
+    async def _on_start_module(self, module_name: str, worker_class: str):
+        """Start a single module."""
+        runner = get_module_runner(module_name, worker_class)
 
-        try:
-            # Force create new orchestrator to ensure fresh workers
-            self.orchestrator = get_orchestrator(force_new=True)
-            self.orchestrator.start()
-            ui.notify('SEO orchestrator started!', type='positive')
-        except Exception as e:
-            ui.notify(f'Error starting: {e}', type='negative')
-            import traceback
-            traceback.print_exc()
-
-        self._update_status()
-
-    async def _on_stop(self):
-        """Handle stop button click."""
-        self.stop_btn.disable()
-        ui.notify('Stopping all SEO modules...', type='info')
-
-        try:
-            self.orchestrator.stop(timeout=30.0)
-            ui.notify('SEO orchestrator stopped', type='info')
-        except Exception as e:
-            ui.notify(f'Error stopping: {e}', type='negative')
-
-        self._update_status()
-
-    async def _on_reset(self):
-        """Handle reset button click."""
-        if self.orchestrator.is_running():
-            ui.notify('Stop the orchestrator first', type='warning')
+        if runner.is_running():
+            ui.notify(f'{module_name} is already running', type='warning')
             return
 
+        runner.start()
+        ui.notify(f'Started {module_name}', type='positive')
+        self._update_status()
+
+    async def _on_stop_module(self, module_name: str):
+        """Stop a single module (forcefully)."""
+        global _module_runners
+
+        if module_name not in _module_runners:
+            ui.notify(f'{module_name} is not running', type='info')
+            return
+
+        runner = _module_runners[module_name]
+
+        if not runner.is_running():
+            ui.notify(f'{module_name} is not running', type='info')
+            return
+
+        ui.notify(f'Stopping {module_name}...', type='info')
+
+        # Force stop
+        runner.stop(force=True)
+
+        ui.notify(f'Stopped {module_name}', type='positive')
+        self._update_status()
+
+    async def _on_start_all(self):
+        """Start all modules."""
+        for module in MODULES:
+            runner = get_module_runner(module['name'], module['worker_class'])
+            if not runner.is_running():
+                runner.start()
+                await asyncio.sleep(0.5)  # Stagger starts slightly
+
+        ui.notify('Started all modules', type='positive')
+        self._update_status()
+
+    async def _on_stop_all(self):
+        """Stop all modules."""
+        global _module_runners
+
+        for module_name, runner in _module_runners.items():
+            if runner.is_running():
+                runner.stop(force=True)
+
+        # Also kill any stray Chrome processes
         try:
-            self.orchestrator.reset_state()
-            ui.notify('State reset complete', type='positive')
+            subprocess.run(['pkill', '-f', 'chromium'], timeout=5, capture_output=True)
+            subprocess.run(['pkill', '-f', 'chrome'], timeout=5, capture_output=True)
+        except Exception:
+            pass
 
-            # Reload log viewers
-            for viewer in self.log_viewers.values():
-                viewer.load_last_n_lines(100)
-
-        except Exception as e:
-            ui.notify(f'Error resetting: {e}', type='negative')
-
+        ui.notify('Stopped all modules', type='positive')
         self._update_status()
 
     async def _on_clear_logs(self):
         """Handle clear logs button click."""
         try:
-            self.orchestrator.clear_logs()
+            # Clear all module log files
+            for module in MODULES:
+                log_file = LOG_DIR / f"{module['name']}.log"
+                try:
+                    with open(log_file, 'w') as f:
+                        f.write("")
+                except Exception:
+                    pass
 
             # Clear viewer displays
             for viewer in self.log_viewers.values():
@@ -826,68 +992,64 @@ class SEODashboard:
             ui.notify(f'Error clearing logs: {e}', type='negative')
 
     def _update_status(self):
-        """Update status display."""
+        """Update status display for all modules."""
+        global _module_runners
+
         try:
-            status = self.orchestrator.get_status()
-            running = status.get('running', False)
+            for module in MODULES:
+                name = module['name']
+                card = self.module_cards.get(name)
+                if not card:
+                    continue
 
-            # Update main status badge
-            if running:
-                self.status_badge.set_text('RUNNING')
-                self.status_badge.props('color=positive')
-                self.start_btn.disable()
-                self.stop_btn.enable()
-            else:
-                self.status_badge.set_text('STOPPED')
-                self.status_badge.props('color=negative')
-                self.start_btn.enable()
-                self.stop_btn.disable()
-
-            # Update cycle count
-            cycles = status.get('cycles_completed', 0)
-            self.cycle_label.set_text(f'Cycle: {cycles}')
-
-            # Update uptime
-            uptime_sec = status.get('uptime_seconds', 0)
-            if uptime_sec > 3600:
-                uptime_str = f'{uptime_sec // 3600}h {(uptime_sec % 3600) // 60}m'
-            else:
-                uptime_str = f'{uptime_sec // 60}m'
-            self.uptime_label.set_text(f'Uptime: {uptime_str}')
-
-            # Update module cards
-            modules = status.get('modules', {})
-            current_module = status.get('current_module')
-
-            for name, card in self.module_cards.items():
-                mod_status = modules.get(name, {})
-                mod_state = mod_status.get('status', 'pending')
+                # Get runner status
+                runner = _module_runners.get(name)
+                if runner:
+                    status = runner.get_status()
+                    is_running = status['running']
+                    processed = status['companies_processed']
+                    succeeded = status['companies_succeeded']
+                    failed = status['companies_failed']
+                    uptime = status['uptime_seconds']
+                else:
+                    is_running = False
+                    processed = 0
+                    succeeded = 0
+                    failed = 0
+                    uptime = 0
 
                 # Update badge
                 badge = card['badge']
-                if name == current_module:
+                if is_running:
                     badge.set_text('running')
-                    badge.props('color=primary')
-                elif mod_state == 'completed':
-                    badge.set_text('completed')
                     badge.props('color=positive')
-                elif mod_state == 'failed':
-                    badge.set_text('failed')
-                    badge.props('color=negative')
-                elif mod_state == 'running':
-                    badge.set_text('running')
-                    badge.props('color=primary')
                 else:
-                    badge.set_text('pending')
+                    badge.set_text('stopped')
                     badge.props('color=grey')
 
                 # Update stats
-                processed = mod_status.get('companies_processed', 0)
-                errors = mod_status.get('errors', 0)
-                card['stats'].set_text(f'{processed} processed, {errors} errors')
+                card['stats'].set_text(f'{succeeded}/{processed} processed, {failed} errors')
+
+                # Update uptime
+                if uptime > 0:
+                    if uptime > 3600:
+                        uptime_str = f'{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m'
+                    else:
+                        uptime_str = f'{int(uptime // 60)}m {int(uptime % 60)}s'
+                    card['uptime'].set_text(f'Uptime: {uptime_str}')
+                else:
+                    card['uptime'].set_text('')
+
+                # Update button states
+                card['start_btn'].set_enabled(not is_running)
+                card['stop_btn'].set_enabled(is_running)
 
         except Exception as e:
             print(f"Error updating status: {e}")
+
+
+# Need asyncio for async methods
+import asyncio
 
 
 def seo_dashboard_page():

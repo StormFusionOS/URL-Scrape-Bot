@@ -15,7 +15,7 @@ Usage:
 
 import time
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Generator, Optional
 from urllib.parse import urlparse
 
@@ -217,7 +217,7 @@ def crawl_single_target(
 
     # Update target status to in_progress
     target.status = "in_progress"
-    target.last_attempt_ts = datetime.utcnow()
+    target.last_attempt_ts = datetime.now(timezone.utc)
     target.attempts += 1
     session.commit()
 

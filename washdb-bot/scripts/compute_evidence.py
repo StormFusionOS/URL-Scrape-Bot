@@ -364,7 +364,7 @@ class EvidenceComputer:
 
             company.field_evidence = evidence
             company.nap_conflict = nap_conflict
-            company.last_validated_at = datetime.utcnow()
+            company.last_validated_at = datetime.now(timezone.utc)
 
             # Update canonical fields if we have high-confidence values
             if evidence.get('phone', {}).get('agreement_ratio', 0) >= 0.7:

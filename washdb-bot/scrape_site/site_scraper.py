@@ -233,6 +233,11 @@ def merge_results(base_result: dict, additional_results: list[dict], base_url: s
 
     merged["reviews"] = best_reviews
 
+    # Preserve content_metrics from homepage (primary source for SEO analysis)
+    # This includes word_count, content_depth, header_structure
+    if not merged.get("content_metrics") and base_result.get("content_metrics"):
+        merged["content_metrics"] = base_result["content_metrics"]
+
     return merged
 
 
@@ -265,6 +270,7 @@ def scrape_website(url: str) -> dict:
         "service_area": None,
         "address": None,
         "reviews": None,
+        "content_metrics": None,
     }
 
     try:

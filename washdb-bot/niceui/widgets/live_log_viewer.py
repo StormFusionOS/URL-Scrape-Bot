@@ -1,11 +1,16 @@
 """
 Live log viewer widget - tails log files in real-time and displays with color coding.
+
+Uses NiceGUI's built-in WebSocket for real-time updates via ui.timer and proper binding.
 """
 
-from nicegui import ui
+from nicegui import ui, app
 from pathlib import Path
 from datetime import datetime
 import asyncio
+import time
+from typing import Optional, List
+from collections import deque
 
 
 class LiveLogViewer:
@@ -86,7 +91,7 @@ class LiveLogViewer:
         return self
 
     def start_tailing(self):
-        """Start tailing the log file."""
+        """Start tailing the log file with proper async WebSocket updates."""
         if self.is_tailing:
             return
 
@@ -101,29 +106,34 @@ class LiveLogViewer:
                     f.seek(0, 2)  # Seek to end
                     self.file_position = f.tell()
 
-        # Create timer to poll for new lines (faster polling for real-time responsiveness)
+        # Create timer to poll for new lines - use async callback for proper WebSocket updates
         if not self.timer:
-            self.timer = ui.timer(0.1, self._tail_file)  # Poll every 100ms for real-time feel
+            # Use a slightly slower interval but with proper async handling
+            self.timer = ui.timer(0.5, self._async_tail_file)
         else:
             self.timer.active = True
 
-    def stop_tailing(self):
-        """Stop tailing the log file."""
-        self.is_tailing = False
-        if self.timer:
-            self.timer.active = False
-
-    def _tail_file(self):
-        """Read new lines from log file."""
+    async def _async_tail_file(self):
+        """Async wrapper for tail file that ensures proper UI updates."""
         if not self.is_tailing:
             return
 
+        # Run the file read in background to not block the event loop
+        await asyncio.get_event_loop().run_in_executor(None, self._tail_file_sync)
+
+        # Force UI update after adding lines
+        if hasattr(self, '_needs_scroll') and self._needs_scroll:
+            if self.auto_scroll and self.scroll_area:
+                self.scroll_area.scroll_to(percent=1.0)
+            self._needs_scroll = False
+
+    def _tail_file_sync(self):
+        """Synchronous file reading part of tailing."""
         log_path = Path(self.log_file)
 
         # Update file status indicator
         if hasattr(self, 'file_status_label'):
             if log_path.exists():
-                # Check if file has grown
                 current_size = log_path.stat().st_size
                 if current_size != self.file_position:
                     self.file_status_label.set_text(f'📄 {log_path.name} (active)')
@@ -138,27 +148,24 @@ class LiveLogViewer:
 
         try:
             with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                # Seek to last position
                 f.seek(self.file_position)
-
-                # Read new lines
                 new_lines = f.readlines()
-
-                # Update position
                 self.file_position = f.tell()
 
-                # Add new lines to display
-                for line in new_lines:
-                    line = line.rstrip()
-                    if line:
-                        self._add_line(line)
-
+                if new_lines:
+                    self._needs_scroll = True
+                    for line in new_lines:
+                        line = line.rstrip()
+                        if line:
+                            self._add_line(line)
         except Exception as e:
-            error_msg = f"Error tailing log {log_path.name}: {e}"
-            print(error_msg)
-            if hasattr(self, 'file_status_label'):
-                self.file_status_label.set_text(f'❌ {log_path.name} (error)')
-                self.file_status_label.classes(remove='text-green-400 text-yellow-400', add='text-red-400')
+            print(f"Error tailing log {log_path.name}: {e}")
+
+    def stop_tailing(self):
+        """Stop tailing the log file."""
+        self.is_tailing = False
+        if self.timer:
+            self.timer.active = False
 
     def _add_line(self, line: str):
         """Add a line to the log display with color coding."""
@@ -176,9 +183,7 @@ class LiveLogViewer:
         with self.log_element:
             ui.label(line).classes(f'{color_class} leading-tight text-xs whitespace-pre-wrap')
 
-        # Auto-scroll to bottom if enabled
-        if self.auto_scroll and self.scroll_area:
-            self.scroll_area.scroll_to(percent=1.0)
+        # Note: Auto-scroll is handled in _async_tail_file after all lines are added
 
     def _get_line_color(self, line: str) -> str:
         """Determine color class based on line content."""
@@ -267,6 +272,10 @@ class LiveLogViewer:
                 # Update file position
                 f.seek(0, 2)
                 self.file_position = f.tell()
+
+                # Scroll to bottom after loading
+                if self.auto_scroll and self.scroll_area:
+                    self.scroll_area.scroll_to(percent=1.0)
 
         except Exception as e:
             error_msg = f"Error loading log {log_path.name}: {e}"

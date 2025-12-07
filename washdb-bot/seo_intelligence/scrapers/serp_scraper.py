@@ -83,13 +83,27 @@ class SerpScraper(BaseScraper):
 
         # Initialize embedding services (per SCRAPER BOT.pdf)
         self.enable_embeddings = enable_embeddings
+        self.embedder = None
+        self.qdrant = None
+
         if self.enable_embeddings:
             try:
                 self.embedder = get_content_embedder()
-                self.qdrant = get_qdrant_manager()
-                logger.info("✓ Embedding services initialized")
+
+                # Check if embedder actually initialized properly
+                if not self.embedder.is_available():
+                    logger.warning("Embedding model failed to initialize. Continuing without embeddings.")
+                    self.enable_embeddings = False
+                else:
+                    self.qdrant = get_qdrant_manager()
+                    logger.info("✓ Embedding services initialized")
             except Exception as e:
-                logger.warning(f"Embedding services unavailable: {e}. Continuing without embeddings.")
+                error_msg = str(e)
+                # Check for specific PyTorch errors
+                if "meta tensor" in error_msg.lower() or "cannot copy" in error_msg.lower():
+                    logger.warning(f"PyTorch meta tensor error - embeddings disabled. This is a known issue with some CUDA configurations.")
+                else:
+                    logger.warning(f"Embedding services unavailable: {error_msg[:100]}. Continuing without embeddings.")
                 self.enable_embeddings = False
 
         # Database connection

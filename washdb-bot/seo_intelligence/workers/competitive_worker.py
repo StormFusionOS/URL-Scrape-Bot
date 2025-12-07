@@ -100,12 +100,13 @@ class CompetitiveAnalysisWorker(BaseModuleWorker):
         return self._topic_clusterer
 
     def _get_competitive_analysis(self):
-        """Get or create competitive analysis orchestrator."""
+        """Get or create competitive analysis orchestrator (SeleniumBase UC version)."""
         if self._competitive_analysis is None:
             try:
-                from seo_intelligence.scrapers.competitive_analysis import get_competitive_analysis
-                self._competitive_analysis = get_competitive_analysis()
-                logger.info("Competitive analysis orchestrator initialized")
+                # Use SeleniumBase version for better anti-detection
+                from seo_intelligence.scrapers.competitive_analysis_selenium import get_competitive_analysis_selenium
+                self._competitive_analysis = get_competitive_analysis_selenium()
+                logger.info("Competitive analysis orchestrator initialized (SeleniumBase UC)")
             except Exception as e:
                 logger.error(f"Failed to initialize competitive analysis: {e}")
         return self._competitive_analysis
@@ -118,19 +119,20 @@ class CompetitiveAnalysisWorker(BaseModuleWorker):
         """
         Get companies that need competitive analysis.
 
-        Selects companies without recent competitive analysis.
+        Selects all verified companies with domains for continuous scraping.
         """
         session = self.Session()
         try:
-            query = text("""
+            # Get all verified companies with domains - no time restriction
+            # This allows continuous re-scraping of verified URLs
+            verification_clause = self.get_verification_where_clause()
+            query = text(f"""
                 SELECT c.id
                 FROM companies c
-                LEFT JOIN competitive_analysis ca ON c.id = ca.company_id
-                    AND ca.analyzed_at > NOW() - INTERVAL '14 days'
                 WHERE c.website IS NOT NULL
                   AND c.active = true
                   AND c.domain IS NOT NULL
-                  AND ca.id IS NULL
+                  AND {verification_clause}
                   AND (:after_id IS NULL OR c.id > :after_id)
                 ORDER BY c.id ASC
                 LIMIT :limit
@@ -145,14 +147,16 @@ class CompetitiveAnalysisWorker(BaseModuleWorker):
 
         except Exception as e:
             logger.error(f"Error getting companies: {e}")
-            # Fall back to simple query if competitive_analysis table doesn't exist
+            # Fall back to simple query with verification filter if competitive_analysis table doesn't exist
             try:
-                query = text("""
+                verification_clause = self.get_verification_where_clause()
+                query = text(f"""
                     SELECT c.id
                     FROM companies c
                     WHERE c.website IS NOT NULL
                       AND c.active = true
                       AND c.domain IS NOT NULL
+                      AND {verification_clause}
                       AND (:after_id IS NULL OR c.id > :after_id)
                     ORDER BY c.id ASC
                     LIMIT :limit

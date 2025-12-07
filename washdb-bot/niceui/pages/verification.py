@@ -224,6 +224,10 @@ def mark_company_label(company_id: int, label: str, notes: str = ""):
     """
     Mark a company with human verification label.
 
+    Uses standardized schema:
+    - verified: boolean (true if provider, false otherwise)
+    - verification_type: 'manual' for human-labeled companies
+
     Args:
         company_id: Company ID
         label: One of 'provider', 'non_provider', 'directory', 'agency', 'blog', 'franchise'
@@ -232,8 +236,10 @@ def mark_company_label(company_id: int, label: str, notes: str = ""):
     session = get_db_session()
 
     try:
-        # Update parse_metadata with label
-        # Note: Using string concatenation for jsonb to avoid ::text cast conflict with SQLAlchemy params
+        # Determine verified status from label
+        is_verified = label == 'provider'
+
+        # Update parse_metadata with label AND standardized verified/verification_type columns
         query = text("""
         UPDATE companies
         SET
@@ -254,10 +260,8 @@ def mark_company_label(company_id: int, label: str, notes: str = ""):
                 '{verification,needs_review}',
                 'false'::jsonb
             ),
-            active = CASE
-                WHEN :label = 'provider' THEN true
-                ELSE false
-            END,
+            verified = :is_verified,
+            verification_type = 'manual',
             last_updated = NOW()
         WHERE id = :company_id
         """)
@@ -266,7 +270,8 @@ def mark_company_label(company_id: int, label: str, notes: str = ""):
             'company_id': company_id,
             'label': label,
             'notes': notes,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
+            'is_verified': is_verified
         })
         session.commit()
 
@@ -993,11 +998,117 @@ def verification_page():
                     ui.notify('Need at least 10 labeled examples to train', type='warning')
                     return
 
-                ui.notify('Training classifier (this may take a moment)...', type='info')
+                ui.notify('Exporting training data...', type='info')
                 try:
                     import subprocess
+
+                    # Step 1: Export training data (using ALL verification results)
+                    export_script = '''
+from db.database_manager import DatabaseManager
+from sqlalchemy import text
+import json
+
+db = DatabaseManager()
+output_file = "data/verification_training.jsonl"
+count = 0
+
+with db.get_session() as session:
+    result = session.execute(text("""
+        SELECT
+            id, name, website, domain, phone, email,
+            services, service_area, address, source,
+            rating_yp, rating_google, reviews_yp, reviews_google,
+            parse_metadata, active
+        FROM companies
+        WHERE parse_metadata->'verification'->>'status' IN ('passed', 'failed')
+        ORDER BY id
+    """))
+
+    records = []
+    for row in result:
+        company_id, name, website, domain, phone, email, services, service_area, address, source, rating_yp, rating_google, reviews_yp, reviews_google, parse_metadata, active = row
+
+        verification = parse_metadata.get('verification', {})
+        status = verification.get('status')
+
+        if status == 'passed':
+            label = 'provider'
+        elif status == 'failed':
+            label = 'non_provider'
+        else:
+            continue
+
+        yp_filter = parse_metadata.get('yp_filter', {})
+        google_filter = parse_metadata.get('google_filter', {})
+        red_flags = verification.get('red_flags', [])
+        tier_map = {'A': 3, 'B': 2, 'C': 1, 'D': 0}
+        tier_value = tier_map.get(verification.get('tier'), 0)
+        llm_class = verification.get('llm_classification', {})
+        services_list = llm_class.get('services', [])
+
+        features = {
+            'combined_score': verification.get('combined_score', 0.0) or 0.0,
+            'rule_score': verification.get('scores', {}).get('heuristic', 0.0) or 0.0,
+            'llm_score': verification.get('scores', {}).get('llm', 0.0) or 0.0,
+            'web_score': verification.get('scores', {}).get('website', 0.0) or 0.0,
+            'review_score': verification.get('scores', {}).get('reviews', 0.0) or 0.0,
+            'is_legitimate': verification.get('is_legitimate', False),
+            'llm_confidence': verification.get('llm_confidence', 0.0) or 0.0,
+            'red_flags_count': len(red_flags),
+            'quality_signals_count': len(verification.get('quality_signals', [])),
+            'tier': tier_value,
+            'has_phone': bool(phone),
+            'has_email': bool(email),
+            'has_address': bool(address),
+            'rating_yp': float(rating_yp or 0),
+            'rating_google': float(rating_google or 0),
+            'reviews_yp': int(reviews_yp or 0),
+            'reviews_google': int(reviews_google or 0),
+            'yp_confidence': yp_filter.get('confidence', 0.0) or 0.0,
+            'google_confidence': google_filter.get('confidence', 0.0) or 0.0,
+            'pressure_washing': 'pressure washing' in services_list,
+            'window_cleaning': 'window cleaning' in services_list,
+            'wood_restoration': 'wood restoration' in services_list,
+            'has_service_nav': parse_metadata.get('has_service_nav', False),
+            'has_local_business_schema': parse_metadata.get('has_local_business_schema', False),
+            'provider_phrase_count': parse_metadata.get('provider_phrase_count', 0) or 0,
+            'informational_phrase_count': parse_metadata.get('informational_phrase_count', 0) or 0,
+            'cta_phrase_count': parse_metadata.get('cta_phrase_count', 0) or 0,
+            'deep_scraped': parse_metadata.get('deep_scraped', False),
+            'llm_type': llm_class.get('type', 'unknown'),
+            'scope': llm_class.get('scope', 'unknown'),
+            f'source={source}': True,
+            f'tier={verification.get("tier")}': True
+        }
+
+        record = {'company_id': company_id, 'label': label, 'features': features}
+        records.append(record)
+        count += 1
+
+with open(output_file, 'w') as f:
+    for record in records:
+        f.write(json.dumps(record) + '\\n')
+
+print(f"Exported {count} samples")
+'''
+                    result = subprocess.run(
+                        [sys.executable, '-c', export_script],
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        cwd=os.getcwd()
+                    )
+
+                    if result.returncode != 0:
+                        ui.notify(f'Export failed: {result.stderr}', type='negative')
+                        return
+
+                    ui.notify('Training classifier (this may take a moment)...', type='info')
+
+                    # Step 2: Train the model with 'y' piped to stdin for confirmation
                     result = subprocess.run(
                         [sys.executable, 'scripts/train_verification_classifier.py', '--binary'],
+                        input='y\n',
                         capture_output=True,
                         text=True,
                         timeout=120,
@@ -1048,26 +1159,27 @@ def verification_page():
         # Worker status cards container
         worker_status_container = ui.column().classes('w-full')
 
-        # Initial render - always show 5 worker cards
+        # Initial render - dynamically show all worker cards
         def render_worker_statuses():
             worker_status_container.clear()
 
             state = get_worker_pool_state()
+            num_workers = state.get('num_workers', 0)
 
             with worker_status_container:
-                # Show pool started time if running
+                # Show pool started time and worker count
                 if state.get('pool_started_at'):
-                    ui.label(f'Pool started: {state["pool_started_at"]}').classes('text-sm text-gray-400 mb-2')
+                    ui.label(f'Pool started: {state["pool_started_at"]} | Workers: {num_workers}').classes('text-sm text-gray-400 mb-2')
                 else:
                     ui.label('Worker pool stopped').classes('text-sm text-gray-400 mb-2')
 
-                # Always show 5 worker status cards
+                # Dynamically show all worker status cards
                 with ui.grid(columns=5).classes('w-full gap-4'):
                     # Create status dict for quick lookup
                     worker_status_dict = {w['worker_id']: w for w in state.get('workers', [])}
 
-                    # Always show exactly 5 workers (0-4)
-                    for worker_id in range(5):
+                    # Show all workers dynamically based on num_workers
+                    for worker_id in range(num_workers):
                         worker_data = worker_status_dict.get(worker_id, {})
                         status = worker_data.get('status', 'stopped')
                         pid = worker_data.get('pid')
@@ -1166,6 +1278,151 @@ def verification_page():
         start_pool_button.on('click', on_start_pool)
         stop_pool_button.on('click', on_stop_pool)
 
+    # Claude API Reverification Status Block
+    with ui.card().classes('w-full mb-4'):
+        ui.label('Claude API Reverification & Training').classes('text-xl font-bold mb-4')
+        ui.label('Monitor Claude API processes for training data collection and reverification').classes('text-sm text-gray-400 mb-4')
+
+        # Container for status cards
+        claude_status_container = ui.column().classes('w-full')
+
+        def render_claude_api_status():
+            """Check for running Claude API processes and show status."""
+            import subprocess
+            import os
+
+            claude_status_container.clear()
+
+            with claude_status_container:
+                # Check for running processes
+                running_processes = []
+
+                # Check validation process
+                try:
+                    result = subprocess.run(
+                        ['pgrep', '-f', 'validate_with_claude.py'],
+                        capture_output=True, text=True, timeout=2
+                    )
+                    if result.returncode == 0:
+                        running_processes.append({
+                            'name': 'Validation',
+                            'log': 'logs/validation_final.log',
+                            'pid': result.stdout.strip().split('\n')[0]
+                        })
+                except Exception:
+                    pass
+
+                # Check reverification process
+                try:
+                    result = subprocess.run(
+                        ['pgrep', '-f', 'reverify_unknown_with_claude.py'],
+                        capture_output=True, text=True, timeout=2
+                    )
+                    if result.returncode == 0:
+                        running_processes.append({
+                            'name': 'Reverification',
+                            'log': 'logs/reverification_final.log',
+                            'pid': result.stdout.strip().split('\n')[0]
+                        })
+                except Exception:
+                    pass
+
+                # Check failed sample validation process
+                try:
+                    result = subprocess.run(
+                        ['pgrep', '-f', 'validate_with_claude.py.*failed-sample'],
+                        capture_output=True, text=True, timeout=2
+                    )
+                    if result.returncode == 0:
+                        pids = result.stdout.strip().split('\n')
+                        if pids and pids[0]:
+                            running_processes.append({
+                                'name': 'Failed Sample Validation',
+                                'log': 'logs/failed_sample_validation.log',
+                                'pid': pids[0]
+                            })
+                except Exception:
+                    pass
+
+                # Display running processes status
+                if running_processes:
+                    with ui.row().classes('w-full gap-4 mb-4'):
+                        for proc in running_processes:
+                            with ui.card().classes('flex-1 bg-green-900 p-4'):
+                                ui.label(proc['name']).classes('text-md font-bold text-green-200')
+                                ui.label('RUNNING').classes('text-xs text-green-300 font-bold')
+                                ui.label(f'PID: {proc["pid"]}').classes('text-xs text-gray-400')
+
+                                # Try to extract stats from log file
+                                if os.path.exists(proc['log']):
+                                    try:
+                                        with open(proc['log'], 'r') as f:
+                                            lines = f.readlines()
+                                            # Look for budget or progress info
+                                            for line in reversed(lines[-20:]):
+                                                if 'Budget:' in line or 'Processed:' in line or 'Sampling:' in line:
+                                                    ui.label(line.strip()).classes('text-xs text-gray-300 mt-1')
+                                                    break
+                                    except Exception:
+                                        pass
+                else:
+                    with ui.card().classes('w-full bg-gray-800 p-4'):
+                        ui.label('No Claude API processes running').classes('text-sm text-gray-400 italic')
+                        ui.label('Start training/validation scripts manually or via command line').classes('text-xs text-gray-500')
+
+                # Show available log files
+                ui.separator().classes('my-4')
+                ui.label('Recent Claude API Logs').classes('text-md font-bold mb-2')
+
+                log_files = [
+                    'logs/validation_final.log',
+                    'logs/reverification_final.log',
+                    'logs/failed_sample_validation.log',
+                    'logs/claude_validation.log',
+                    'logs/claude_reverification.log'
+                ]
+
+                available_logs = []
+                for log_file in log_files:
+                    if os.path.exists(log_file):
+                        stat = os.stat(log_file)
+                        available_logs.append({
+                            'path': log_file,
+                            'name': os.path.basename(log_file),
+                            'size': stat.st_size,
+                            'modified': datetime.fromtimestamp(stat.st_mtime)
+                        })
+
+                if available_logs:
+                    # Sort by modified time, newest first
+                    available_logs.sort(key=lambda x: x['modified'], reverse=True)
+
+                    with ui.grid(columns=3).classes('w-full gap-2'):
+                        for log in available_logs[:6]:  # Show up to 6 most recent
+                            with ui.card().classes('p-3 bg-gray-800'):
+                                ui.label(log['name']).classes('text-xs font-bold')
+                                ui.label(f"{log['size'] / 1024:.1f} KB").classes('text-xs text-gray-400')
+                                ui.label(log['modified'].strftime('%m/%d %H:%M')).classes('text-xs text-gray-500')
+
+                                # Add button to view log
+                                def make_view_handler(log_path):
+                                    def handler():
+                                        if verification_state.log_viewer:
+                                            verification_state.log_viewer.set_log_file(log_path)
+                                            verification_state.log_viewer.load_last_n_lines(100)
+                                            ui.notify(f'Viewing {os.path.basename(log_path)}', type='info')
+                                    return handler
+
+                                ui.button('View', on_click=make_view_handler(log['path'])).props('size=xs flat')
+                else:
+                    ui.label('No log files found').classes('text-sm text-gray-400 italic')
+
+        # Initial render
+        render_claude_api_status()
+
+        # Auto-refresh every 10 seconds
+        ui.timer(10.0, render_claude_api_status)
+
     # Live log viewer
     with ui.card().classes('w-full mb-4'):
         ui.label('═' * 60).classes('text-gray-600 mb-2')
@@ -1225,15 +1482,17 @@ def verification_page():
         refresh_button.on('click', on_filter_change)
 
         # Run button handler
-        async def start_batch_verification():
-            await run_batch_verification(
-                int(max_companies_input.value) if max_companies_input.value else None,
-                stats_card,
-                progress_bar,
-                run_button,
-                stop_button,
-                companies_table_container
-            )
-
-        run_button.on('click', start_batch_verification)
-        stop_button.on('click', stop_verification)
+        # Note: run_button and stop_button need to be defined above this section
+        # Commented out to prevent NameError until buttons are properly created
+        # async def start_batch_verification():
+        #     await run_batch_verification(
+        #         int(max_companies_input.value) if max_companies_input.value else None,
+        #         stats_card,
+        #         progress_bar,
+        #         run_button,
+        #         stop_button,
+        #         companies_table_container
+        #     )
+        #
+        # run_button.on('click', start_batch_verification)
+        # stop_button.on('click', stop_verification)

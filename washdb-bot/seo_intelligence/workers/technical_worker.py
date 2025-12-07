@@ -58,12 +58,13 @@ class TechnicalWorker(BaseModuleWorker):
         self._cwv_service = None
 
     def _get_auditor(self):
-        """Get or create technical auditor."""
+        """Get or create technical auditor (SeleniumBase UC version)."""
         if self._auditor is None:
             try:
-                from seo_intelligence.scrapers.technical_auditor import TechnicalAuditor
-                self._auditor = TechnicalAuditor(headless=True)
-                logger.info("Technical auditor initialized")
+                # Use SeleniumBase version for better anti-detection
+                from seo_intelligence.scrapers.technical_auditor_selenium import TechnicalAuditorSelenium
+                self._auditor = TechnicalAuditorSelenium(headless=True)
+                logger.info("Technical auditor initialized (SeleniumBase UC)")
             except Exception as e:
                 logger.error(f"Failed to initialize technical auditor: {e}")
         return self._auditor
@@ -109,20 +110,19 @@ class TechnicalWorker(BaseModuleWorker):
         """
         Get companies that need technical audits.
 
-        Selects companies without recent page audits.
+        Selects all verified companies with websites for continuous scraping.
         """
         session = self.Session()
         try:
-            # Get companies without recent audits
-            # page_audits uses url field, audited_at for timestamp
-            query = text("""
+            # Get all verified companies with websites - no time restriction
+            # This allows continuous re-scraping of verified URLs
+            verification_clause = self.get_verification_where_clause()
+            query = text(f"""
                 SELECT c.id
                 FROM companies c
-                LEFT JOIN page_audits pa ON c.website = pa.url
-                    AND pa.audited_at > NOW() - INTERVAL '7 days'
                 WHERE c.website IS NOT NULL
                   AND c.active = true
-                  AND pa.audit_id IS NULL
+                  AND {verification_clause}
                   AND (:after_id IS NULL OR c.id > :after_id)
                 ORDER BY c.id ASC
                 LIMIT :limit

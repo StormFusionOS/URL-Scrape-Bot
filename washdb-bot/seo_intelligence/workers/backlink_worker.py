@@ -45,12 +45,13 @@ class BacklinkWorker(BaseModuleWorker):
         self._crawler = None
 
     def _get_crawler(self):
-        """Get or create backlink crawler."""
+        """Get or create backlink crawler (SeleniumBase UC version)."""
         if self._crawler is None:
             try:
-                from seo_intelligence.scrapers.backlink_crawler import BacklinkCrawler
-                self._crawler = BacklinkCrawler(headless=True)
-                logger.info("Backlink crawler initialized")
+                # Use SeleniumBase version for better anti-detection
+                from seo_intelligence.scrapers.backlink_crawler_selenium import BacklinkCrawlerSelenium
+                self._crawler = BacklinkCrawlerSelenium(headless=True)
+                logger.info("Backlink crawler initialized (SeleniumBase UC)")
             except Exception as e:
                 logger.error(f"Failed to initialize backlink crawler: {e}")
         return self._crawler
@@ -63,17 +64,20 @@ class BacklinkWorker(BaseModuleWorker):
         """
         Get companies that need backlink discovery.
 
-        Selects companies without recent backlink checks.
+        Selects verified companies without recent backlink checks.
         """
         session = self.Session()
         try:
-            # Get active companies with domains for backlink discovery
-            query = text("""
+            # Get active verified companies with domains for backlink discovery
+            # Only process verified companies (passed verification or human-labeled as provider)
+            verification_clause = self.get_verification_where_clause()
+            query = text(f"""
                 SELECT c.id
                 FROM companies c
                 WHERE c.website IS NOT NULL
                   AND c.active = true
                   AND c.domain IS NOT NULL
+                  AND {verification_clause}
                   AND (:after_id IS NULL OR c.id > :after_id)
                 ORDER BY c.id ASC
                 LIMIT :limit

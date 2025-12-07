@@ -228,7 +228,6 @@ class PrefetchBuffer:
                   AND (
                       parse_metadata->'verification' IS NULL
                       OR parse_metadata->'verification'->>'status' IS NULL
-                      OR parse_metadata->'verification'->>'status' = 'in_progress'
                   )
                 ORDER BY created_at DESC
                 FOR UPDATE SKIP LOCKED
@@ -326,7 +325,6 @@ def acquire_company_for_verification(session, worker_id: int, logger) -> Optiona
               AND (
                   parse_metadata->'verification' IS NULL
                   OR parse_metadata->'verification'->>'status' IS NULL
-                  OR parse_metadata->'verification'->>'status' = 'in_progress'
               )
             ORDER BY created_at DESC
             FOR UPDATE SKIP LOCKED
@@ -435,6 +433,10 @@ def verify_company(company: Dict, verifier, logger) -> Optional[Dict]:
             website_metadata=metadata
         )
 
+        # Include content_metrics from metadata for SEO analysis storage
+        if metadata and metadata.get('content_metrics'):
+            verification_result['content_metrics'] = metadata['content_metrics']
+
         logger.info(
             f"Verified {company['name']}: "
             f"Status={verification_result['status']}, "
@@ -496,6 +498,10 @@ def verify_prefetched_company(prefetched: PrefetchedCompany, verifier, logger) -
             website_html=prefetched.html,
             website_metadata=prefetched.metadata
         )
+
+        # Include content_metrics from metadata for SEO analysis storage
+        if prefetched.metadata and prefetched.metadata.get('content_metrics'):
+            verification_result['content_metrics'] = prefetched.metadata['content_metrics']
 
         logger.info(
             f"Verified {company['name']}: "
@@ -632,6 +638,15 @@ def update_company_verification(
         # Serialize to JSON
         verification_json = json.dumps(verification_result)
 
+        # Determine verified status for standardized column
+        # verified = true if passed, false if failed, null if unknown/needs_review
+        verified_value = None
+        if final_status == 'passed':
+            verified_value = True
+        elif final_status == 'failed':
+            verified_value = False
+        # Leave as None for 'unknown' status
+
         if active is not None:
             query = text("""
                 UPDATE companies
@@ -641,7 +656,8 @@ def update_company_verification(
                         '{verification}',
                         CAST(:verification_json AS jsonb)
                     ),
-                    active = :active,
+                    verified = :verified,
+                    verification_type = 'llm',
                     last_updated = NOW()
                 WHERE id = :company_id
             """)
@@ -649,7 +665,7 @@ def update_company_verification(
             session.execute(query, {
                 'company_id': company_id,
                 'verification_json': verification_json,
-                'active': active
+                'verified': verified_value
             })
         else:
             # Don't update active flag
@@ -661,13 +677,16 @@ def update_company_verification(
                         '{verification}',
                         CAST(:verification_json AS jsonb)
                     ),
+                    verified = :verified,
+                    verification_type = 'llm',
                     last_updated = NOW()
                 WHERE id = :company_id
             """)
 
             session.execute(query, {
                 'company_id': company_id,
-                'verification_json': verification_json
+                'verification_json': verification_json,
+                'verified': verified_value
             })
 
         session.commit()

@@ -170,7 +170,7 @@ def mark_duplicates(
             company = session.query(Company).filter(Company.id == company_id).first()
             if company:
                 company.active = False
-                company.last_updated = datetime.utcnow()
+                company.last_updated = datetime.now(timezone.utc)
                 marked_count += 1
         else:
             marked_count += 1

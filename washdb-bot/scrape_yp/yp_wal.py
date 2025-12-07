@@ -72,7 +72,7 @@ class WorkerWAL:
             data: Event data dict
         """
         event = {
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'worker_id': self.worker_id,
             'event_type': event_type,
             **data

@@ -45,12 +45,13 @@ class CitationWorker(BaseModuleWorker):
         self._crawler = None
 
     def _get_crawler(self):
-        """Get or create citation crawler."""
+        """Get or create citation crawler (SeleniumBase UC version)."""
         if self._crawler is None:
             try:
-                from seo_intelligence.scrapers.citation_crawler import CitationCrawler
-                self._crawler = CitationCrawler(headless=True)
-                logger.info("Citation crawler initialized")
+                # Use SeleniumBase version for better anti-detection on Yelp/BBB/YP
+                from seo_intelligence.scrapers.citation_crawler_selenium import CitationCrawlerSelenium
+                self._crawler = CitationCrawlerSelenium(headless=True)
+                logger.info("Citation crawler initialized (SeleniumBase UC)")
             except Exception as e:
                 logger.error(f"Failed to initialize citation crawler: {e}")
         return self._crawler
@@ -63,16 +64,19 @@ class CitationWorker(BaseModuleWorker):
         """
         Get companies that need citation checking.
 
-        Selects companies without recent citation checks.
+        Selects verified companies without recent citation checks.
         """
         session = self.Session()
         try:
-            # Get active companies for citation checking
-            query = text("""
+            # Get active verified companies for citation checking
+            # Only process verified companies (passed verification or human-labeled as provider)
+            verification_clause = self.get_verification_where_clause()
+            query = text(f"""
                 SELECT c.id
                 FROM companies c
                 WHERE c.website IS NOT NULL
                   AND c.active = true
+                  AND {verification_clause}
                   AND (:after_id IS NULL OR c.id > :after_id)
                 ORDER BY c.id ASC
                 LIMIT :limit
@@ -131,8 +135,8 @@ class CitationWorker(BaseModuleWorker):
                     error="Citation crawler not available"
                 )
 
-            # Build business info for CitationCrawler
-            from seo_intelligence.scrapers.citation_crawler import BusinessInfo
+            # Build business info for CitationCrawler (SeleniumBase version)
+            from seo_intelligence.scrapers.citation_crawler_selenium import BusinessInfo
             business_info = BusinessInfo(
                 name=company_name,
                 address=address,
