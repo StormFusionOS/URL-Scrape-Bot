@@ -289,7 +289,7 @@ def _safe_maximize_window(driver):
     This wrapper catches those errors and falls back gracefully.
     """
     try:
-        _safe_maximize_window(driver)
+        driver.maximize_window()
     except Exception as e:
         error_msg = str(e).lower()
         if "runtime.evaluate" in error_msg or "javascript" in error_msg:
