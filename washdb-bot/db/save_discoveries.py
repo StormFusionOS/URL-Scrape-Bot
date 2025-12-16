@@ -17,6 +17,13 @@ from sqlalchemy.orm import Session
 
 from db.models import Base, Company, BusinessSource, canonicalize_url, domain_from_url
 from runner.logging_setup import get_logger
+from scrape_yp.name_standardizer import (
+    score_name_quality,
+    standardize_name,
+    parse_location_from_address,
+    needs_standardization,
+    infer_name_from_domain
+)
 
 
 # Load environment
@@ -514,13 +521,44 @@ def upsert_discovered(companies: list[dict]) -> tuple[int, int, int]:
 
                 else:
                     # Insert new record
+                    name = company_data.get("name")
+                    address = company_data.get("address")
+
+                    # Calculate name quality score
+                    name_quality = score_name_quality(name) if name else 0
+                    name_flag = needs_standardization(name) if name else True
+
+                    # Parse location from address
+                    location = parse_location_from_address(address) if address else {}
+                    city = location.get("city")
+                    state = location.get("state")
+                    zip_code = location.get("zip_code")
+                    loc_source = "address_parse" if (city or state or zip_code) else None
+
+                    # Attempt to standardize name if needed
+                    std_name = None
+                    std_source = None
+                    std_confidence = None
+                    if name_flag and name:
+                        std_name, std_source, std_confidence = standardize_name(
+                            original_name=name,
+                            city=city,
+                            state=state,
+                            domain=domain
+                        )
+                        # Only keep if different from original
+                        if std_name == name:
+                            std_name = None
+                            std_source = None
+                            std_confidence = None
+
                     new_company = Company(
-                        name=company_data.get("name"),
+                        name=name,
                         website=canonical_website,
                         domain=domain,
                         phone=phone,
                         email=email,
-                        address=company_data.get("address"),
+                        address=address,
                         services=company_data.get("services"),
                         service_area=company_data.get("service_area"),
                         source=company_data.get("source"),
@@ -530,6 +568,16 @@ def upsert_discovered(companies: list[dict]) -> tuple[int, int, int]:
                         reviews_google=company_data.get("reviews_google"),
                         parse_metadata=parse_metadata if parse_metadata else None,
                         active=True,
+                        # Name standardization fields
+                        standardized_name=std_name,
+                        standardized_name_source=std_source,
+                        standardized_name_confidence=std_confidence,
+                        city=city,
+                        state=state,
+                        zip_code=zip_code,
+                        location_source=loc_source,
+                        name_length_flag=name_flag,
+                        name_quality_score=name_quality,
                     )
 
                     session.add(new_company)

@@ -22,6 +22,11 @@ from scrape_yp.yp_data_utils import (
     normalize_address,
     extract_email_from_text,
 )
+from scrape_yp.name_standardizer import (
+    score_name_quality,
+    parse_location_from_address,
+    needs_standardization,
+)
 
 
 def clean_text(text: str) -> str:
@@ -379,7 +384,13 @@ def parse_single_listing_enhanced(listing, source_page_url: Optional[str] = None
         "business_hours": None,
         "description": None,
         "services": [],
-        "source_page_url": source_page_url,  # NEW: for traceability
+        "source_page_url": source_page_url,  # for traceability
+        # Name standardization fields
+        "city": None,
+        "state": None,
+        "zip_code": None,
+        "name_quality_score": 50,
+        "name_length_flag": False,
     }
 
     # Extract business name
@@ -394,6 +405,10 @@ def parse_single_listing_enhanced(listing, source_page_url: Optional[str] = None
     if name_elem:
         raw_name = clean_text(name_elem.get_text())
         result["name"] = clean_business_name(raw_name)
+        # Calculate name quality score and flag
+        if result["name"]:
+            result["name_quality_score"] = score_name_quality(result["name"])
+            result["name_length_flag"] = needs_standardization(result["name"])
 
     # Extract phone number
     phone_elem = (
@@ -431,9 +446,14 @@ def parse_single_listing_enhanced(listing, source_page_url: Optional[str] = None
                 parts.append(clean_text(region.get_text()))
             result["address"] = ", ".join(parts) if parts else None
 
-    # Normalize address (NEW)
+    # Normalize address and parse location
     if result["address"]:
         result["normalized_address"] = normalize_address(result["address"])
+        # Parse city/state/zip from address
+        location = parse_location_from_address(result["address"])
+        result["city"] = location.get("city")
+        result["state"] = location.get("state")
+        result["zip_code"] = location.get("zip_code")
 
     # Extract website (enhanced with validation)
     raw_website = extract_website_url(listing)

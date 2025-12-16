@@ -21,6 +21,7 @@ from .scraper_review import scraper_review_page
 from .yp_discover import yp_discover_page
 from .verification import verification_page
 from .seo_dashboard import seo_dashboard_page
+from .standardization import standardization_page
 
 __all__ = [
     'dashboard_page',
@@ -41,4 +42,5 @@ __all__ = [
     'yp_discover_page',
     'verification_page',
     'seo_dashboard_page',
+    'standardization_page',
 ]

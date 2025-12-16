@@ -588,6 +588,123 @@ Answer (Yes/No):"""
             deep_verify=False
         )
 
+    def standardize_business_name(
+        self,
+        original_name: str,
+        services_text: str = "",
+        about_text: str = "",
+        homepage_text: str = "",
+        address: str = "",
+        website_url: str = ""
+    ) -> Optional[Dict]:
+        """
+        Use LLM to extract full business name from website content.
+
+        For companies with short/generic names like "Hydro" or "PW Services",
+        this method asks the LLM to extract the full business name from
+        the website content (title, meta tags, about section, etc.).
+
+        Args:
+            original_name: The current (possibly short) business name
+            services_text: Services section text from website
+            about_text: About section text from website
+            homepage_text: Homepage text (often contains business name in title/header)
+            address: Business address (for city/state extraction)
+            website_url: Website URL (domain can provide hints)
+
+        Returns:
+            Dict with:
+            - standardized_name: Full business name (or None if couldn't extract)
+            - city: City name if found
+            - state: State name/abbrev if found
+            - confidence: 0.0-1.0 confidence score
+            - source: "llm"
+            - reasoning: Why this name was extracted
+        """
+        try:
+            # Build context focusing on name-related content
+            context = f"Original business name: {original_name}\n"
+            if website_url:
+                context += f"Website: {website_url}\n"
+            if address:
+                context += f"Address: {address}\n"
+            if homepage_text:
+                # Take first 500 chars of homepage (usually contains title/header)
+                context += f"Homepage content: {homepage_text[:500]}\n"
+            if about_text:
+                context += f"About section: {about_text[:300]}\n"
+
+            # Ask LLM to extract full business name
+            prompt = f"""You are extracting business information from a website.
+
+{context}
+
+Based on the website content, what is the FULL official business name?
+Look for the name in:
+- Website title/header
+- About section
+- Logo text mentions
+- Footer
+- "Contact us" section
+
+Respond in this exact format:
+BUSINESS_NAME: [full name]
+CITY: [city if mentioned, or "unknown"]
+STATE: [state abbreviation if mentioned, or "unknown"]
+
+If you cannot determine a better name than "{original_name}", respond with:
+BUSINESS_NAME: {original_name}
+CITY: unknown
+STATE: unknown"""
+
+            response = self._generate(prompt, max_tokens=100)
+
+            # Parse response
+            result = {
+                'standardized_name': None,
+                'city': None,
+                'state': None,
+                'confidence': 0.0,
+                'source': 'llm',
+                'reasoning': response
+            }
+
+            # Extract business name
+            name_match = re.search(r'BUSINESS_NAME:\s*(.+?)(?:\n|$)', response, re.IGNORECASE)
+            if name_match:
+                extracted_name = name_match.group(1).strip()
+                # Only use if different and not just the original
+                if extracted_name and extracted_name.lower() != original_name.lower():
+                    result['standardized_name'] = extracted_name
+                    result['confidence'] = 0.70  # Base confidence for LLM extraction
+
+            # Extract city
+            city_match = re.search(r'CITY:\s*(.+?)(?:\n|$)', response, re.IGNORECASE)
+            if city_match:
+                city = city_match.group(1).strip()
+                if city.lower() != 'unknown':
+                    result['city'] = city
+
+            # Extract state
+            state_match = re.search(r'STATE:\s*(.+?)(?:\n|$)', response, re.IGNORECASE)
+            if state_match:
+                state = state_match.group(1).strip()
+                if state.lower() != 'unknown':
+                    result['state'] = state
+
+            # Boost confidence if we also extracted location
+            if result['standardized_name']:
+                if result['city'] and result['state']:
+                    result['confidence'] = 0.85
+                elif result['city'] or result['state']:
+                    result['confidence'] = 0.75
+
+            return result
+
+        except Exception as e:
+            self.logger.error(f"Error standardizing business name: {e}")
+            return None
+
 
 # Module-level instance for reuse across workers
 _llm_verifier_instance = None

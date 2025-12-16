@@ -42,6 +42,11 @@ from verification.ml_classifier import (
     compute_final_score,
     get_model_info,
 )
+from scrape_yp.name_standardizer import (
+    score_name_quality,
+    parse_location_from_address,
+    needs_standardization,
+)
 from verification.config_verifier import (
     MIN_DELAY_SECONDS,
     MAX_DELAY_SECONDS,
@@ -532,7 +537,8 @@ def update_company_verification(
     verification_result: Dict,
     combined_score: float,
     worker_id: int,
-    logger
+    logger,
+    website_metadata: Optional[Dict] = None
 ):
     """
     Update company record with verification results using proper triage logic.
@@ -542,6 +548,9 @@ def update_company_verification(
     - failed (auto-reject): Low final score OR multiple red flags + not legitimate
     - needs_review: Ambiguous signals, disagreement, or low confidence
 
+    Also extracts and stores name standardization data for companies with
+    short/poor-quality names using the website content that was already scraped.
+
     Args:
         session: SQLAlchemy session
         company_id: Company ID
@@ -550,6 +559,7 @@ def update_company_verification(
         combined_score: Combined score (discovery + website + reviews)
         worker_id: Worker ID for tracking
         logger: Logger instance
+        website_metadata: Parsed website content (name, services, about, homepage_text, etc.)
     """
     try:
         # === Extract decision signals ===
@@ -581,6 +591,72 @@ def update_company_verification(
                            f"final={final_score:.3f}")
         except Exception as e:
             logger.warning(f"ML prediction failed, using combined_score: {e}")
+
+        # === Name Standardization ===
+        # Extract better name from website content for companies with short/poor-quality names
+        name_quality = None
+        name_flag = False
+        standardized_name = None
+        std_name_source = None
+        std_name_confidence = None
+        city = None
+        state = None
+        zip_code = None
+        location_source = None
+
+        company_name = company_data.get('name', '')
+        company_address = company_data.get('address', '')
+
+        try:
+            # Calculate name quality score
+            if company_name:
+                name_quality = score_name_quality(company_name)
+                name_flag = needs_standardization(company_name)
+
+            # Parse location from address
+            if company_address:
+                location = parse_location_from_address(company_address)
+                city = location.get('city')
+                state = location.get('state')
+                zip_code = location.get('zip_code')
+                if city or state or zip_code:
+                    location_source = 'address_parse'
+
+            # Try to extract better name from website content if name is poor quality
+            if name_flag and website_metadata:
+                # First try: use name extracted from website by site_parse.py
+                website_name = website_metadata.get('name', '')
+                if website_name and len(website_name) > len(company_name) + 3:
+                    # Website has a longer name - use it
+                    standardized_name = website_name.strip()
+                    std_name_source = 'website_title'
+                    std_name_confidence = 0.85
+                    logger.info(f"Name improved from '{company_name}' to '{standardized_name}' (from website)")
+
+                # If website name not better, could also check about section
+                if not standardized_name:
+                    about_text = website_metadata.get('about', '')
+                    if about_text and len(about_text) > 20:
+                        # Look for business name patterns in about text
+                        # Common pattern: "Welcome to <Business Name>" or "<Business Name> is..."
+                        import re
+                        patterns = [
+                            r'Welcome to ([A-Z][A-Za-z\s&\'-]+(?:LLC|Inc|Co|Services|Wash|Cleaning)?)',
+                            r'^([A-Z][A-Za-z\s&\'-]+(?:LLC|Inc|Co|Services|Wash|Cleaning)?)\s+(?:is|has been|provides|offers)',
+                        ]
+                        for pattern in patterns:
+                            match = re.search(pattern, about_text[:500])
+                            if match:
+                                extracted_name = match.group(1).strip()
+                                if len(extracted_name) > len(company_name) + 3 and len(extracted_name) < 80:
+                                    standardized_name = extracted_name
+                                    std_name_source = 'about_section'
+                                    std_name_confidence = 0.70
+                                    logger.info(f"Name improved from '{company_name}' to '{standardized_name}' (from about)")
+                                    break
+
+        except Exception as e:
+            logger.warning(f"Name standardization failed: {e}")
 
         # === Three-way triage logic (using final_score) ===
         needs_review = False
@@ -635,6 +711,28 @@ def update_company_verification(
             f"red_flags={len(red_flags)}, svc={svc_status}"
         )
 
+        # === Store additional metadata we already extract ===
+        if website_metadata:
+            # Content metrics (SEO signals: word count, headers, content depth)
+            if website_metadata.get('content_metrics'):
+                verification_result['content_metrics'] = website_metadata['content_metrics']
+
+            # All contacts (not just the first one)
+            verification_result['contacts'] = {
+                'phones': website_metadata.get('phones', []),
+                'emails': website_metadata.get('emails', []),
+            }
+
+            # JSON-LD structured data (hours, social links, logo, etc.)
+            if website_metadata.get('json_ld'):
+                verification_result['schema_org'] = website_metadata['json_ld']
+
+            # Scrape info (track what was scraped)
+            verification_result['scrape_info'] = {
+                'deep_scraped': website_metadata.get('deep_scraped', False),
+                'scraped_at': datetime.now().isoformat()
+            }
+
         # Serialize to JSON
         verification_json = json.dumps(verification_result)
 
@@ -647,47 +745,44 @@ def update_company_verification(
             verified_value = False
         # Leave as None for 'unknown' status
 
-        if active is not None:
-            query = text("""
-                UPDATE companies
-                SET
-                    parse_metadata = jsonb_set(
-                        COALESCE(parse_metadata, '{}'::jsonb),
-                        '{verification}',
-                        CAST(:verification_json AS jsonb)
-                    ),
-                    verified = :verified,
-                    verification_type = 'llm',
-                    last_updated = NOW()
-                WHERE id = :company_id
-            """)
+        # Build the UPDATE query with name standardization fields
+        query = text("""
+            UPDATE companies
+            SET
+                parse_metadata = jsonb_set(
+                    COALESCE(parse_metadata, '{}'::jsonb),
+                    '{verification}',
+                    CAST(:verification_json AS jsonb)
+                ),
+                verified = :verified,
+                verification_type = 'llm',
+                name_quality_score = COALESCE(:name_quality, name_quality_score),
+                name_length_flag = COALESCE(:name_flag, name_length_flag),
+                standardized_name = COALESCE(:std_name, standardized_name),
+                standardized_name_source = COALESCE(:std_source, standardized_name_source),
+                standardized_name_confidence = COALESCE(:std_confidence, standardized_name_confidence),
+                city = COALESCE(:city, city),
+                state = COALESCE(:state, state),
+                zip_code = COALESCE(:zip_code, zip_code),
+                location_source = COALESCE(:loc_source, location_source),
+                last_updated = NOW()
+            WHERE id = :company_id
+        """)
 
-            session.execute(query, {
-                'company_id': company_id,
-                'verification_json': verification_json,
-                'verified': verified_value
-            })
-        else:
-            # Don't update active flag
-            query = text("""
-                UPDATE companies
-                SET
-                    parse_metadata = jsonb_set(
-                        COALESCE(parse_metadata, '{}'::jsonb),
-                        '{verification}',
-                        CAST(:verification_json AS jsonb)
-                    ),
-                    verified = :verified,
-                    verification_type = 'llm',
-                    last_updated = NOW()
-                WHERE id = :company_id
-            """)
-
-            session.execute(query, {
-                'company_id': company_id,
-                'verification_json': verification_json,
-                'verified': verified_value
-            })
+        session.execute(query, {
+            'company_id': company_id,
+            'verification_json': verification_json,
+            'verified': verified_value,
+            'name_quality': name_quality,
+            'name_flag': name_flag,
+            'std_name': standardized_name,
+            'std_source': std_name_source,
+            'std_confidence': std_name_confidence,
+            'city': city,
+            'state': state,
+            'zip_code': zip_code,
+            'loc_source': location_source,
+        })
 
         session.commit()
         logger.info(f"Updated company {company_id} with verification results")
@@ -776,6 +871,8 @@ def run_worker(worker_id: int, config: Dict):
             session = Session()
 
             try:
+                website_metadata = None  # Track website metadata for name extraction
+
                 if use_llm_queue and prefetch_buffer:
                     # PREFETCH MODE: Pull from buffer (fast - no network wait)
                     prefetched = prefetch_buffer.get(timeout=10.0)
@@ -793,6 +890,7 @@ def run_worker(worker_id: int, config: Dict):
 
                     # Verify using pre-fetched data (only LLM call, no network)
                     company = prefetched.company
+                    website_metadata = prefetched.metadata  # Save for name extraction
                     verification_result = verify_prefetched_company(prefetched, verifier, logger)
 
                 else:
@@ -822,7 +920,8 @@ def run_worker(worker_id: int, config: Dict):
                         verification_result,
                         combined_score,
                         worker_id,
-                        logger
+                        logger,
+                        website_metadata=website_metadata  # Pass website metadata for name extraction
                     )
 
                     processed_count += 1

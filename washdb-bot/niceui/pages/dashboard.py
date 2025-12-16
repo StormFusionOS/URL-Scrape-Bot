@@ -228,6 +228,22 @@ def create_donut_chart_custom(name: str, value: float, color: str = None):
     return ui.echart(options).classes('w-full h-64')
 
 
+def build_kpi_cards(kpi_container):
+    """Build KPI cards (called by timer for auto-refresh)."""
+    kpi_container.clear()
+
+    with kpi_container:
+        # Get fresh KPIs from backend
+        kpis = backend.kpis()
+
+        with ui.row().classes('w-full gap-4 mb-6'):
+            create_kpi_card('Total Companies', kpis['total_companies'], 'business', 'info')
+            create_kpi_card('Verified Providers', kpis.get('llm_verified', 0), 'verified', 'positive')
+            create_kpi_card('Standardized', kpis.get('standardized', 0), 'fact_check', 'positive')
+            create_kpi_card('Updated (30d)', kpis['updated_30d'], 'update', 'warning')
+            create_kpi_card('New (7d)', kpis['new_7d'], 'fiber_new', 'accent')
+
+
 def build_discovery_status_cards(status_container):
     """Build discovery source status cards (called by timer for auto-refresh)."""
     status_container.clear()
@@ -438,9 +454,6 @@ def dashboard_page():
     """Render dashboard page with tabs."""
     ui.label('Dashboard').classes('text-3xl font-bold mb-4')
 
-    # Get KPIs from backend
-    kpis = backend.kpis()
-
     # Create tabs
     with ui.tabs().classes('w-full') as tabs:
         overview_tab = ui.tab('Overview', icon='dashboard')
@@ -464,13 +477,14 @@ def dashboard_page():
                 # Auto-refresh every 10 seconds
                 ui.timer(10.0, lambda: build_discovery_status_cards(status_container))
 
-            # KPI Cards
-            with ui.row().classes('w-full gap-4 mb-6'):
-                create_kpi_card('Total Companies', kpis['total_companies'], 'business', 'info')
-                create_kpi_card('With Email', kpis['with_email'], 'email', 'positive')
-                create_kpi_card('With Phone', kpis['with_phone'], 'phone', 'positive')
-                create_kpi_card('Updated (30d)', kpis['updated_30d'], 'update', 'warning')
-                create_kpi_card('New (7d)', kpis['new_7d'], 'fiber_new', 'accent')
+            # KPI Cards - with auto-refresh
+            kpi_container = ui.column().classes('w-full')
+
+            # Initial population
+            build_kpi_cards(kpi_container)
+
+            # Auto-refresh KPIs every 15 seconds
+            ui.timer(15.0, lambda: build_kpi_cards(kpi_container))
 
         # DISCOVERY TAB
         with ui.tab_panel(discovery_tab):
@@ -556,10 +570,12 @@ def dashboard_page():
                 ui.label('Field Presence').classes('text-lg font-bold mb-4')
 
                 with ui.row().classes('w-full gap-4'):
-                    # Calculate percentages
-                    total = kpis['total_companies'] or 1  # Avoid division by zero
-                    email_pct = (kpis['with_email'] / total * 100) if total > 0 else 0
-                    phone_pct = (kpis['with_phone'] / total * 100) if total > 0 else 0
+                    # Calculate percentages - fetch fresh KPIs for data quality tab
+                    kpis = backend.kpis()
+                    total = kpis.get('total_companies', 0) or 1  # Avoid division by zero
+                    # Use .get() with defaults for fields that may not exist yet
+                    email_pct = (kpis.get('with_email', 0) / total * 100) if total > 0 else 0
+                    phone_pct = (kpis.get('with_phone', 0) / total * 100) if total > 0 else 0
 
                     # TODO: Add service_area to KPIs
                     # For now, use a placeholder

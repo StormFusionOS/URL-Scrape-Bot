@@ -59,6 +59,7 @@ def register_pages():
     router.register('yp_discover', pages.yp_discover_page)
     router.register('verification', pages.verification_page)
     router.register('seo_dashboard', pages.seo_dashboard_page)
+    router.register('standardization', pages.standardization_page)
 
 
 def create_app():

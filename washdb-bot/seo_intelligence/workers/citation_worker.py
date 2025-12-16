@@ -103,10 +103,11 @@ class CitationWorker(BaseModuleWorker):
         """
         session = self.Session()
         try:
-            # Get company details
+            # Get company details (including new standardization fields)
             result = session.execute(
                 text("""
-                    SELECT id, name, website, phone, address, service_area
+                    SELECT id, name, website, phone, address, service_area,
+                           standardized_name, city, state, zip_code
                     FROM companies WHERE id = :id
                 """),
                 {'id': company_id}
@@ -120,11 +121,19 @@ class CitationWorker(BaseModuleWorker):
                     error="Company not found"
                 )
 
-            company_name = row[1]
+            # Extract fields
+            original_name = row[1]
             website = row[2]
             phone = row[3] or ""
             address = row[4] or ""
             service_area = row[5] or ""
+            standardized_name = row[6]
+            city = row[7] or ""
+            state = row[8] or ""
+            zip_code = row[9] or ""
+
+            # Use standardized_name for searches if available, otherwise original
+            company_name = standardized_name if standardized_name else original_name
 
             # Get crawler
             crawler = self._get_crawler()
@@ -136,10 +145,14 @@ class CitationWorker(BaseModuleWorker):
                 )
 
             # Build business info for CitationCrawler (SeleniumBase version)
+            # Uses standardized_name + city/state for better search results
             from seo_intelligence.scrapers.citation_crawler_selenium import BusinessInfo
             business_info = BusinessInfo(
                 name=company_name,
                 address=address,
+                city=city,
+                state=state,
+                zip_code=zip_code,
                 phone=phone,
                 website=website
             )

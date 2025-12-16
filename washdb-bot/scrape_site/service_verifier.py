@@ -31,12 +31,13 @@ from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from runner.logging_setup import get_logger
-from verification.config_verifier import (
-    SCORE_CAP_DIRECTORY,
-    SCORE_CAP_AGENCY,
-    SCORE_CAP_BLOG_NO_NAP,
-    SCORE_CAP_FRANCHISE,
-)
+
+# Import score caps directly to avoid circular import with verification.__init__
+# These are simple constants defined in config_verifier.py
+SCORE_CAP_DIRECTORY = 0.25
+SCORE_CAP_AGENCY = 0.25
+SCORE_CAP_BLOG_NO_NAP = 0.25
+SCORE_CAP_FRANCHISE = 0.20
 
 logger = get_logger("service_verifier")
 
@@ -75,14 +76,26 @@ class ServiceVerifier:
         self.llm_verifier = None
 
         # Initialize LLM (primary classification method)
+        # Use trained model by default (single-shot), fall back to old model if needed
         if use_llm:
             try:
-                from scrape_site.llm_verifier import get_llm_verifier
-                self.llm_verifier = get_llm_verifier()
-                logger.info("✓ LLM verifier loaded (Mistral 7B on GPU)")
+                # Try trained model first (verification-mistral-proper)
+                from scrape_site.trained_llm_verifier import get_trained_llm_verifier
+                self.llm_verifier = get_trained_llm_verifier()
+                self.use_trained_model = True
+                logger.info("✓ TRAINED LLM verifier loaded (verification-mistral-proper)")
             except Exception as e:
-                logger.warning(f"Failed to load LLM verifier: {e}")
-                self.use_llm = False
+                logger.warning(f"Failed to load trained LLM verifier: {e}")
+                # Fall back to old multi-question verifier
+                try:
+                    from scrape_site.llm_verifier import get_llm_verifier
+                    self.llm_verifier = get_llm_verifier()
+                    self.use_trained_model = False
+                    logger.info("✓ LLM verifier loaded (Mistral 7B on GPU - fallback)")
+                except Exception as e2:
+                    logger.warning(f"Failed to load any LLM verifier: {e2}")
+                    self.use_llm = False
+                    self.use_trained_model = False
 
         # Extract service definitions
         self.services = {
@@ -593,6 +606,9 @@ class ServiceVerifier:
         """
         Get LLM classification for uncertain cases.
 
+        Uses the trained model (verification-mistral-proper) with actual page content
+        for single-shot classification, or falls back to the old multi-question model.
+
         Args:
             company_data: Company data dict
             website_metadata: Parsed website metadata
@@ -609,13 +625,31 @@ class ServiceVerifier:
             about_text = website_metadata.get('about', '')
             homepage_text = website_metadata.get('homepage_text', '')
 
-            # Call LLM classifier
-            classification = self.llm_verifier.classify_company(
-                company_name=company_name,
-                services_text=services_text,
-                about_text=about_text,
-                homepage_text=homepage_text
-            )
+            # Additional data for trained model
+            website = company_data.get('website', '')
+            phone = company_data.get('phone', '')
+            title = website_metadata.get('title', '')
+
+            # Check if using trained model (single-shot) vs old model (multi-question)
+            if getattr(self, 'use_trained_model', False):
+                # Trained model - pass all content directly
+                classification = self.llm_verifier.classify_company(
+                    company_name=company_name,
+                    website=website,
+                    phone=phone,
+                    title=title,
+                    services_text=services_text,
+                    about_text=about_text,
+                    homepage_text=homepage_text
+                )
+            else:
+                # Old model - uses multi-question approach
+                classification = self.llm_verifier.classify_company(
+                    company_name=company_name,
+                    services_text=services_text,
+                    about_text=about_text,
+                    homepage_text=homepage_text
+                )
 
             return classification
 

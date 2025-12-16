@@ -1,0 +1,20 @@
+[Unit]
+Description=WashDB Browser-Based Name Standardization Service
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=rivercityscrape
+Group=rivercityscrape
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+Environment=PATH=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=DISPLAY=:99
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python scripts/standardization_service_browser.py
+Restart=always
+RestartSec=30
+StandardOutput=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/standardization_browser.log
+StandardError=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/standardization_browser.log
+
+[Install]
+WantedBy=multi-user.target

@@ -15,8 +15,18 @@ Extracts:
 """
 
 import re
+import sys
+from pathlib import Path
 from typing import Dict, List, Optional
 from playwright.async_api import Page
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from scrape_yp.name_standardizer import (
+    score_name_quality,
+    parse_location_from_address,
+    needs_standardization,
+)
 
 from runner.logging_setup import get_logger
 
@@ -47,6 +57,10 @@ class YelpParser:
                 name_elem = await page.query_selector('h1')
                 if name_elem:
                     data['name'] = await name_elem.inner_text()
+                    # Calculate name quality score
+                    if data['name']:
+                        data['name_quality_score'] = score_name_quality(data['name'])
+                        data['name_length_flag'] = needs_standardization(data['name'])
             except Exception as e:
                 logger.debug(f"Failed to extract name: {e}")
 
@@ -92,6 +106,12 @@ class YelpParser:
                 if address_elem:
                     address_text = await address_elem.inner_text()
                     data['address'] = address_text.strip()
+                    # Parse city/state/zip from address
+                    if data['address']:
+                        location = parse_location_from_address(data['address'])
+                        data['city'] = location.get('city')
+                        data['state'] = location.get('state')
+                        data['zip_code'] = location.get('zip_code')
             except Exception as e:
                 logger.debug(f"Failed to extract address: {e}")
 
@@ -188,6 +208,10 @@ class YelpParser:
                     if name_link:
                         business['name'] = await name_link.inner_text()
                         business['url'] = 'https://www.yelp.com' + await name_link.get_attribute('href')
+                        # Calculate name quality score
+                        if business['name']:
+                            business['name_quality_score'] = score_name_quality(business['name'])
+                            business['name_length_flag'] = needs_standardization(business['name'])
 
                     # Extract rating
                     rating_elem = await card.query_selector('[aria-label*="star rating"]')
@@ -220,6 +244,12 @@ class YelpParser:
                     address_elem = await card.query_selector('p[data-testid="address"]')
                     if address_elem:
                         business['address'] = await address_elem.inner_text()
+                        # Parse city/state/zip from address
+                        if business['address']:
+                            location = parse_location_from_address(business['address'])
+                            business['city'] = location.get('city')
+                            business['state'] = location.get('state')
+                            business['zip_code'] = location.get('zip_code')
 
                     # Extract phone
                     phone_elem = await card.query_selector('[href^="tel:"]')

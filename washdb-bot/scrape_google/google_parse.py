@@ -15,8 +15,18 @@ Date: 2025-11-10
 """
 
 import re
+import sys
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from playwright.async_api import Page, ElementHandle
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from scrape_yp.name_standardizer import (
+    score_name_quality,
+    parse_location_from_address,
+    needs_standardization,
+)
 
 
 class GoogleMapsParser:
@@ -268,11 +278,19 @@ class GoogleMapsParser:
         if name:
             result["name"] = name
             result["_conf_name"] = name_conf
+            # Calculate name quality score
+            result["name_quality_score"] = score_name_quality(name)
+            result["name_length_flag"] = needs_standardization(name)
 
         address, addr_conf = await GoogleMapsParser.extract_address(page)
         if address:
             result["address"] = address
             result["_conf_address"] = addr_conf
+            # Parse city/state/zip from address
+            location = parse_location_from_address(address)
+            result["city"] = location.get("city")
+            result["state"] = location.get("state")
+            result["zip_code"] = location.get("zip_code")
 
         phone, phone_conf = await GoogleMapsParser.extract_phone(page)
         if phone:

@@ -70,8 +70,8 @@ def test_orphan_recovery_heartbeat_based(test_db):
         priority=1,
         status='IN_PROGRESS',
         claimed_by='worker_0_pid_12345',
-        claimed_at=datetime.utcnow() - timedelta(minutes=5),
-        heartbeat_at=datetime.utcnow() - timedelta(minutes=5),  # Recent heartbeat
+        claimed_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        heartbeat_at=datetime.now(timezone.utc) - timedelta(minutes=5),  # Recent heartbeat
         page_current=1,
         page_target=3
     )
@@ -91,8 +91,8 @@ def test_orphan_recovery_heartbeat_based(test_db):
         priority=2,
         status='IN_PROGRESS',
         claimed_by='worker_1_pid_99999',
-        claimed_at=datetime.utcnow() - timedelta(hours=2),
-        heartbeat_at=datetime.utcnow() - timedelta(hours=2),  # Stale heartbeat
+        claimed_at=datetime.now(timezone.utc) - timedelta(hours=2),
+        heartbeat_at=datetime.now(timezone.utc) - timedelta(hours=2),  # Stale heartbeat
         page_current=1,
         page_target=2
     )
@@ -112,7 +112,7 @@ def test_orphan_recovery_heartbeat_based(test_db):
         priority=3,
         status='IN_PROGRESS',
         claimed_by='worker_2_pid_88888',
-        claimed_at=datetime.utcnow() - timedelta(hours=1),
+        claimed_at=datetime.now(timezone.utc) - timedelta(hours=1),
         heartbeat_at=None,  # NULL heartbeat
         page_current=0,
         page_target=1

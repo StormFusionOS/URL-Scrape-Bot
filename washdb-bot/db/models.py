@@ -130,6 +130,48 @@ class Company(Base):
         comment="How company was verified: 'llm', 'claude', 'manual'"
     )
 
+    # Name Standardization (for citation lookup)
+    standardized_name: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, index=True,
+        comment="Full business name for citation searches (e.g., 'Hydro Soft Wash NE')"
+    )
+    standardized_name_source: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True,
+        comment="How name was standardized: 'llm', 'website', 'domain', 'original'"
+    )
+    standardized_name_confidence: Mapped[Optional[float]] = mapped_column(
+        Numeric(3, 2), nullable=True,
+        comment="Confidence score 0.00-1.00 for standardized name"
+    )
+
+    # Parsed Location Fields (for citation search)
+    city: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True, index=True,
+        comment="City parsed from address or inferred from service area"
+    )
+    state: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True, index=True,
+        comment="State parsed from address or inferred"
+    )
+    zip_code: Mapped[Optional[str]] = mapped_column(
+        String(20), nullable=True,
+        comment="ZIP code parsed from address"
+    )
+    location_source: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True,
+        comment="How location was determined: 'address_parse', 'llm', 'directory'"
+    )
+
+    # Name Quality Tracking
+    name_length_flag: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="TRUE if original name < 10 chars (needs standardization)"
+    )
+    name_quality_score: Mapped[int] = mapped_column(
+        Integer, default=50,
+        comment="Quality score 0-100 based on length, specificity, location"
+    )
+
     def __repr__(self) -> str:
         """String representation of Company."""
         return f"<Company(id={self.id}, name='{self.name}', domain='{self.domain}')>"

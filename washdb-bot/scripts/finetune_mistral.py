@@ -26,6 +26,12 @@ OUTPUT_DIR = Path(__file__).parent.parent / "models" / "verification-mistral"
 
 def find_latest_training_file():
     """Find the most recent training JSONL file."""
+    # Prefer balanced training files first (they have TRUE/FALSE examples)
+    balanced_files = list(DATA_DIR.glob("balanced_train_*.jsonl")) + list(DATA_DIR.glob("balanced_all_*.jsonl"))
+    if balanced_files:
+        return max(balanced_files, key=lambda f: f.stat().st_mtime)
+
+    # Fall back to old format
     files = list(DATA_DIR.glob("train_verification_2*.jsonl"))
     if not files:
         print("Error: No training files found in", DATA_DIR)
@@ -72,7 +78,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=3, help='Number of training epochs')
     parser.add_argument('--batch-size', type=int, default=2, help='Batch size (reduce if OOM)')
     parser.add_argument('--max-samples', type=int, default=10000, help='Max training samples')
-    parser.add_argument('--learning-rate', type=float, default=2e-4, help='Learning rate')
+    parser.add_argument('--learning-rate', type=float, default=5e-5, help='Learning rate (2e-4 causes mode collapse, use 1e-5 to 1e-4)')
     args = parser.parse_args()
 
     print("=" * 60)
@@ -137,11 +143,18 @@ def main():
     # Training arguments
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Calculate warmup steps: ~5% of total steps or 100 minimum
+    total_samples = len(dataset)
+    effective_batch = args.batch_size * 4  # batch_size * gradient_accumulation
+    steps_per_epoch = total_samples // effective_batch
+    total_steps = steps_per_epoch * args.epochs
+    warmup_steps = max(100, int(total_steps * 0.05))
+
     training_args = TrainingArguments(
         output_dir=str(OUTPUT_DIR),
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=4,
-        warmup_steps=10,
+        warmup_steps=warmup_steps,
         num_train_epochs=args.epochs,
         learning_rate=args.learning_rate,
         fp16=not is_bfloat16_supported(),
@@ -166,6 +179,7 @@ def main():
     # Train
     print(f"\nStarting training for {args.epochs} epochs...")
     print(f"Batch size: {args.batch_size}, Learning rate: {args.learning_rate}")
+    print(f"Warmup steps: {warmup_steps}, Total steps: ~{total_steps}")
     trainer.train()
 
     # Save model

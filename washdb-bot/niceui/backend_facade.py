@@ -1293,8 +1293,8 @@ class BackendFacade:
         Returns:
             Dict with keys:
             - total_companies: Total number of companies
-            - with_email: Companies with email addresses
-            - with_phone: Companies with phone numbers
+            - llm_verified: Companies verified by trained LLM (llm_verified=True)
+            - standardized: Companies with standardized names
             - updated_30d: Companies updated in last 30 days
             - new_7d: Companies added in last 7 days
         """
@@ -1306,31 +1306,38 @@ class BackendFacade:
             logger.warning(f"Database not available: {e}")
             return {
                 "total_companies": 0,
-                "with_email": 0,
-                "with_phone": 0,
+                "llm_verified": 0,
+                "standardized": 0,
                 "updated_30d": 0,
                 "new_7d": 0
             }
 
         try:
+            from sqlalchemy import text
+
             # Total companies (all companies, not just active)
             total = session.execute(
                 select(func.count(Company.id))
             ).scalar()
 
-            # With email
-            with_email = session.execute(
-                select(func.count(Company.id)).where(
-                    Company.email.isnot(None)
-                )
-            ).scalar()
+            # LLM Verified Service Providers (llm_verified = True)
+            # Use raw SQL since llm_verified may not be in ORM model yet
+            try:
+                llm_verified = session.execute(
+                    text("SELECT COUNT(*) FROM companies WHERE llm_verified = true")
+                ).scalar() or 0
+            except Exception:
+                # Column may not exist yet
+                llm_verified = 0
 
-            # With phone
-            with_phone = session.execute(
-                select(func.count(Company.id)).where(
-                    Company.phone.isnot(None)
-                )
-            ).scalar()
+            # Standardized Companies (standardized_name IS NOT NULL)
+            try:
+                standardized = session.execute(
+                    text("SELECT COUNT(*) FROM companies WHERE standardized_name IS NOT NULL")
+                ).scalar() or 0
+            except Exception:
+                # Column may not exist yet
+                standardized = 0
 
             # Updated in last 30 days
             thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
@@ -1350,8 +1357,8 @@ class BackendFacade:
 
             result = {
                 "total_companies": total or 0,
-                "with_email": with_email or 0,
-                "with_phone": with_phone or 0,
+                "llm_verified": llm_verified,
+                "standardized": standardized,
                 "updated_30d": updated_30d or 0,
                 "new_7d": new_7d or 0
             }
@@ -1363,8 +1370,8 @@ class BackendFacade:
             logger.error(f"Error calculating KPIs: {e}", exc_info=True)
             return {
                 "total_companies": 0,
-                "with_email": 0,
-                "with_phone": 0,
+                "llm_verified": 0,
+                "standardized": 0,
                 "updated_30d": 0,
                 "new_7d": 0
             }
