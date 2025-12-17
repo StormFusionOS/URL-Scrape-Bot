@@ -1,0 +1,205 @@
+You are extracting business names from website titles for a pressure washing / window cleaning / wood restoration company database.
+
+Your ONLY job: given the title, domain, and current DB name, return the **single best guess** at the COMPLETE business name, or `NONE` if there truly is no identifiable business name.
+
+---
+
+INPUT:
+- Title: "{title}"
+- Domain: {domain}
+- Current DB name: "{original_name}"
+
+---
+
+GOAL:
+
+Extract the **full, real-world business name** of the company that offers pressure washing, power washing, soft washing, exterior cleaning, window cleaning, or wood restoration services.
+
+You are NOT extracting:
+- the name of a directory (Yelp, Angi, HomeAdvisor, Thumbtack, etc.)
+- generic service phrases without any brand
+- navigation/page labels like “Home”, “Services”, “About”, etc.
+
+---
+
+KEY CONCEPT: What COUNTS as a business name?
+
+A string counts as a business name if it includes some **unique / branded element**, such as:
+- A person’s name:  
+  - “Mike’s Pressure Washing”  
+  - “Johnson Window Cleaning”
+- A unique phrase or branding word:  
+  - “Hydro Softwash”  
+  - “BlueWave Softwash”  
+  - “Elite Pressure Pros”
+- A city/region + service that sounds like a branded name:  
+  - “Austin Power Wash”  
+  - “River City Pressure Washing”  
+  - “Lone Star Exterior Cleaning”
+
+Service words like *Pressure Washing, Power Washing, Softwash, Exterior Cleaning, Window Cleaning, Wood Restoration, Deck Cleaning, Fence Staining,* etc. are OFTEN part of the business name. **DO NOT strip them off if they appear to be part of the brand.**
+
+---
+
+What is NOT a business name?
+
+The following are NOT valid business names (these should usually result in `NONE`):
+
+1. Purely generic descriptions with no unique element:
+   - “Pressure Washing Services”
+   - “Soft Washing Dallas”
+   - “Professional Cleaning”
+   - “Residential & Commercial Pressure Washing”
+   - “Window Cleaning & Gutter Cleaning”
+
+2. Navigation or page labels:
+   - “Home”
+   - “Contact Us”
+   - “About”
+   - “Services”
+   - “Gallery”
+
+3. Titles where only a large platform / marketplace is branded:
+   - “Pressure Washing in Dallas - Yelp” → (Yelp is NOT the contractor’s name) → `NONE`  
+   - “Best Pressure Washing Near Me | Angi” → `NONE`
+
+4. Titles where the only brand is clearly the platform and no contractor name is present:
+   - “Pressure Washing – Thumbtack” → `NONE`  
+   - “Window Cleaning – HomeAdvisor” → `NONE`
+
+---
+
+LEGAL SUFFIXES:
+
+If the business name contains legal suffixes, **remove them**:
+
+Remove things like:
+- LLC, L.L.C.
+- Inc, Incorporated
+- Corp, Corporation
+- Ltd, Limited
+- Co, Company
+
+Examples:
+- “River City Pressure Washing LLC” → `River City Pressure Washing`
+- “BlueWave Softwash, Inc.” → `BlueWave Softwash`
+
+Do NOT remove words that are part of the actual brand:
+- “The Window Company” → `The Window Company` (because “Company” is part of the brand phrase)
+
+---
+
+HOW TO USE THE TITLE, DOMAIN, AND CURRENT DB NAME
+
+You have three clues: **Title**, **Domain**, and **Current DB name**.
+
+Use them in this priority order:
+
+1. **Title (primary source)**
+   - Look for the business name around separators like `|`, `-`, `:` or `•`.
+   - Remove page-level words such as “Home”, “Welcome to”, “Services”, “Contact”, “Home Page”.
+   - Patterns:
+     - “Service in City | BUSINESS NAME” → take what’s after `|`
+     - “BUSINESS NAME | Service Description” → take what’s before `|`
+     - “Home | BUSINESS NAME” → ignore “Home”, use what’s after `|`
+     - “Welcome to BUSINESS NAME” → remove “Welcome to”
+     - “BUSINESS NAME - Home” → take “BUSINESS NAME”, ignore “Home”
+
+2. **Domain (secondary clue)**
+   - Ignore protocol (`http://`, `https://`) and `www.`.
+   - Ignore TLDs like `.com`, `.net`, `.org`, etc.
+   - Break the remaining domain part into words based on hyphens or readable chunks.
+   - If the domain clearly encodes the brand, you can use it to:
+     - Confirm the guess from the title.
+     - Refine spacing/capitalization (e.g., `bluewavesoftwash.com` → “BlueWave Softwash”).
+   - If the title is generic but the domain is clearly branded:
+     - Title: “Pressure Washing Services”  
+       Domain: `rivercitypressurewashing.com`  
+       → business name: `River City Pressure Washing`
+
+3. **Current DB name (tie-breaker / backup)**
+   - If the title is **ambiguous or generic**, and the DB name looks like a plausible business name, use the DB name AFTER cleaning suffixes.
+   - If the title provides a **clear, stronger** business name than the DB name, prefer the title.
+   - If the DB name is clearly generic or mismatched, ignore it.
+
+---
+
+TITLE PATTERN EXAMPLES
+
+Study how service words remain part of the name:
+
+- Title: “Pressure Washing San Antonio | River City Pressure Washing”  
+  → `River City Pressure Washing`
+
+- Title: “Home | Mike's Power Washing”  
+  → `Mike's Power Washing`
+
+- Title: “Austin Soft Wash | Residential & Commercial”  
+  → `Austin Soft Wash`
+
+- Title: “Lone Star Exterior Cleaning - Home”  
+  → `Lone Star Exterior Cleaning`
+
+- Title: “Welcome to Elite Pressure Pros”  
+  → `Elite Pressure Pros`
+
+- Title: “Squeaky Clean Window Washing | Dallas Fort Worth”  
+  → `Squeaky Clean Window Washing`
+
+- Title: “Pressure Washing Omaha | Hydro Softwash”  
+  → `Hydro Softwash`
+
+- Title: “BlueWave Softwash | Soft Washing & Pressure Washing”  
+  → `BlueWave Softwash`
+
+- Title: “Pressure Washing Services”  
+  → `NONE` (no unique identifier)
+
+- Title: “Professional Cleaning Dallas”  
+  → `NONE` (too generic)
+
+- Title: “Contact Us | ABC Company”  
+  → `ABC Company`
+
+---
+
+INDUSTRY-SPECIFIC EDGE CASES
+
+1. **Multi-location names**
+   - Keep the full branded phrase, including the location, if it appears in the name:
+     - “Sparkle Wash of Tampa Bay” → `Sparkle Wash of Tampa Bay`
+     - “Window Genie of North Dallas” → `Window Genie of North Dallas`
+
+2. **Combination brands**
+   - If a brand name plus a strong service phrase appear together, keep them all:
+     - “Deck Doctor Wood Restoration” → `Deck Doctor Wood Restoration`
+     - “Prestige Pressure & Window Cleaning” → `Prestige Pressure & Window Cleaning`
+
+3. **Social media pages**
+   - “Sparkle Wash Power Washing | Facebook” → `Sparkle Wash Power Washing`
+   - “Hydro Softwash (@hydrosoftwash) • Instagram Photos and Videos” → `Hydro Softwash`
+   - If ONLY the platform name is present (e.g. “Pressure Washing – Facebook”), and no clear contractor name → `NONE`
+
+---
+
+FINAL DECISION RULES (follow in order):
+
+1. Try to locate a unique business name in the title using the patterns and rules above.
+2. Clean off:
+   - page-level labels (Home, Welcome to, Services, Contact, etc.)
+   - legal suffixes (LLC, Inc, Co, Ltd, etc.) unless clearly part of brand.
+3. If the title is too generic but the domain clearly encodes a unique brand, derive the name from the domain.
+4. Use the Current DB name only as a backup or tie-breaker when the title is ambiguous.
+5. If after all this there is no clear, unique business identity, return `NONE`.
+
+---
+
+OUTPUT FORMAT (CRITICAL):
+
+- Output **only** the business name as plain text.
+- Do NOT include quotes, extra words, explanations, or labels.
+- If there is no valid business name, output exactly: `NONE`
+
+NOW EXTRACT FROM: "{title}"
+
+ANSWER (just the name or NONE):

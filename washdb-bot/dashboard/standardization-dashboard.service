@@ -1,0 +1,15 @@
+[Unit]
+Description=Standardization Dashboard - NiceGUI Web Interface
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=rivercityscrape
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python -m dashboard.app
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
