@@ -24,7 +24,8 @@ import time
 import random
 from typing import Dict, Any, List, Optional
 from datetime import datetime
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlencode
+from dataclasses import dataclass, field
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.wait import WebDriverWait
@@ -41,7 +42,8 @@ from seo_intelligence.services import (
     get_task_logger,
     get_content_hasher,
     get_content_embedder,
-    get_qdrant_manager
+    get_qdrant_manager,
+    get_google_coordinator,
 )
 from runner.logging_setup import get_logger
 
@@ -49,6 +51,91 @@ from runner.logging_setup import get_logger
 load_dotenv()
 
 logger = get_logger("serp_scraper_selenium")
+
+
+@dataclass
+class SerpInteractionConfig:
+    """
+    Configuration for SERP interaction scraping.
+
+    Controls which interactive elements to expand and how much data to capture.
+    Higher quality settings capture more data but are slower.
+    """
+    # PAA (People Also Ask) expansion
+    expand_paa: bool = True
+    paa_max_clicks: int = 8  # Maximum PAA questions to click
+    paa_scroll_for_more: bool = True  # Scroll to load additional PAA items
+
+    # AI Overview / SGE
+    expand_ai_overview: bool = True  # Click "Show more" on AI Overview
+    capture_ai_citations: bool = True  # Extract citation URLs
+
+    # Local Pack
+    expand_local_pack: bool = True
+    local_pack_click_each: bool = True  # Click each local result for full details
+
+    # Pagination
+    fetch_pages: int = 1  # Number of result pages (1-5)
+
+    # Geo/Locale control
+    geo_country: str = "us"  # gl parameter
+    geo_language: str = "en"  # hl parameter
+    disable_personalization: bool = True  # pws=0
+
+    # Scrolling
+    scroll_to_load: bool = True
+    scroll_steps: int = 4
+    scroll_delay: float = 0.5
+
+    # Wait times
+    element_click_delay: float = 0.3
+    content_load_wait: float = 1.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            'expand_paa': self.expand_paa,
+            'paa_max_clicks': self.paa_max_clicks,
+            'paa_scroll_for_more': self.paa_scroll_for_more,
+            'expand_ai_overview': self.expand_ai_overview,
+            'capture_ai_citations': self.capture_ai_citations,
+            'expand_local_pack': self.expand_local_pack,
+            'local_pack_click_each': self.local_pack_click_each,
+            'fetch_pages': self.fetch_pages,
+            'geo_country': self.geo_country,
+            'geo_language': self.geo_language,
+            'disable_personalization': self.disable_personalization,
+            'scroll_to_load': self.scroll_to_load,
+            'scroll_steps': self.scroll_steps,
+            'scroll_delay': self.scroll_delay,
+            'element_click_delay': self.element_click_delay,
+            'content_load_wait': self.content_load_wait,
+        }
+
+
+# Pre-configured interaction profiles
+DEFAULT_INTERACTION = SerpInteractionConfig()
+
+HIGH_QUALITY_INTERACTION = SerpInteractionConfig(
+    expand_paa=True,
+    paa_max_clicks=12,
+    paa_scroll_for_more=True,
+    expand_ai_overview=True,
+    capture_ai_citations=True,
+    expand_local_pack=True,
+    local_pack_click_each=True,
+    fetch_pages=3,
+    scroll_to_load=True,
+    scroll_steps=6,
+)
+
+FAST_INTERACTION = SerpInteractionConfig(
+    expand_paa=False,
+    expand_ai_overview=False,
+    expand_local_pack=False,
+    fetch_pages=1,
+    scroll_to_load=False,
+)
 
 
 class SerpScraperSelenium(BaseSeleniumScraper):
@@ -129,15 +216,47 @@ class SerpScraperSelenium(BaseSeleniumScraper):
         query: str,
         location: Optional[str] = None,
         num_results: int = 100,
+        page: int = 1,
+        interaction_config: Optional[SerpInteractionConfig] = None,
     ) -> str:
-        """Build Google search URL."""
+        """
+        Build Google search URL with geo/locale and pagination support.
+
+        Args:
+            query: Search query
+            location: Location context (added to query)
+            num_results: Results per page
+            page: Page number (1-indexed)
+            interaction_config: Interaction config with geo/locale settings
+
+        Returns:
+            str: Complete Google search URL
+        """
+        config = interaction_config or DEFAULT_INTERACTION
+
         full_query = query
         if location:
             full_query = f"{query} {location}"
 
-        encoded_query = quote_plus(full_query)
-        url = f"https://www.google.com/search?q={encoded_query}&num={num_results}"
+        # Build URL parameters
+        params = {
+            'q': full_query,
+            'num': num_results,
+        }
 
+        # Add pagination (start parameter is 0-indexed)
+        if page > 1:
+            params['start'] = (page - 1) * num_results
+
+        # Add geo/locale parameters
+        if config.geo_country:
+            params['gl'] = config.geo_country  # Geolocation country
+        if config.geo_language:
+            params['hl'] = config.geo_language  # Host language
+        if config.disable_personalization:
+            params['pws'] = '0'  # Disable personalized web search
+
+        url = f"https://www.google.com/search?{urlencode(params)}"
         return url
 
     def _perform_search_via_input(
@@ -400,6 +519,441 @@ class SerpScraperSelenium(BaseSeleniumScraper):
 
         session.commit()
 
+    # ==========================================================================
+    # SERP Interaction Methods - Expand PAA, AI Overview, Local Pack
+    # ==========================================================================
+
+    def _expand_paa_questions(
+        self,
+        driver,
+        config: SerpInteractionConfig,
+    ) -> List[Dict[str, Any]]:
+        """
+        Click on People Also Ask questions to reveal answers.
+
+        Args:
+            driver: Selenium driver
+            config: Interaction configuration
+
+        Returns:
+            List of expanded PAA data with answers
+        """
+        expanded_paa = []
+
+        try:
+            # Find all PAA question containers
+            paa_selectors = [
+                "div.related-question-pair",
+                "div[jsname='yEVEE']",
+                "div.cbphWd",
+                "div[data-q]",
+            ]
+
+            paa_elements = []
+            for selector in paa_selectors:
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                if elements:
+                    paa_elements = elements
+                    break
+
+            if not paa_elements:
+                logger.debug("No PAA elements found")
+                return expanded_paa
+
+            clicks_made = 0
+            for paa_elem in paa_elements:
+                if clicks_made >= config.paa_max_clicks:
+                    break
+
+                try:
+                    # Check if already expanded
+                    aria_expanded = paa_elem.get_attribute("aria-expanded")
+                    if aria_expanded == "true":
+                        continue
+
+                    # Find the clickable element (question button)
+                    clickable = None
+                    try:
+                        clickable = paa_elem.find_element(
+                            By.CSS_SELECTOR, "div[role='button'], span[jsname]"
+                        )
+                    except Exception:
+                        clickable = paa_elem  # Try clicking the container
+
+                    if clickable:
+                        # Scroll element into view
+                        driver.execute_script(
+                            "arguments[0].scrollIntoView({block: 'center'});",
+                            clickable
+                        )
+                        time.sleep(config.element_click_delay)
+
+                        # Click to expand
+                        self._human_click(driver, clickable)
+                        clicks_made += 1
+
+                        # Wait for content to load
+                        time.sleep(config.content_load_wait)
+
+                        # Extract the expanded content
+                        try:
+                            question_text = paa_elem.get_attribute("data-q")
+                            if not question_text:
+                                q_elem = paa_elem.find_element(
+                                    By.CSS_SELECTOR, "div[role='button'], span"
+                                )
+                                question_text = q_elem.text if q_elem else ""
+
+                            # Find answer content
+                            answer_text = ""
+                            source_url = ""
+                            source_domain = ""
+
+                            answer_selectors = [
+                                "div.hgKElc",
+                                "div.kno-rdesc",
+                                "span.hgKElc",
+                            ]
+                            for a_sel in answer_selectors:
+                                try:
+                                    answer_elem = paa_elem.find_element(By.CSS_SELECTOR, a_sel)
+                                    if answer_elem:
+                                        answer_text = answer_elem.text
+                                        break
+                                except Exception:
+                                    continue
+
+                            # Find source link
+                            try:
+                                source_link = paa_elem.find_element(By.CSS_SELECTOR, "a[href]")
+                                if source_link:
+                                    source_url = source_link.get_attribute("href") or ""
+                                    from urllib.parse import urlparse
+                                    source_domain = urlparse(source_url).netloc
+                            except Exception:
+                                pass
+
+                            if question_text:
+                                expanded_paa.append({
+                                    'question': question_text,
+                                    'answer': answer_text,
+                                    'source_url': source_url,
+                                    'source_domain': source_domain,
+                                    'position': clicks_made,
+                                    'expanded': True,
+                                })
+
+                        except Exception as e:
+                            logger.debug(f"Error extracting PAA content: {e}")
+
+                except Exception as e:
+                    logger.debug(f"Error clicking PAA element: {e}")
+                    continue
+
+            # Scroll to load more PAA if enabled
+            if config.paa_scroll_for_more and clicks_made > 0:
+                try:
+                    # Scroll down to trigger more PAA loading
+                    driver.execute_script("window.scrollBy(0, 300);")
+                    time.sleep(config.content_load_wait)
+                except Exception:
+                    pass
+
+            logger.info(f"Expanded {len(expanded_paa)} PAA questions")
+
+        except Exception as e:
+            logger.warning(f"Error in PAA expansion: {e}")
+
+        return expanded_paa
+
+    def _extract_ai_overview(
+        self,
+        driver,
+        config: SerpInteractionConfig,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Extract AI Overview / SGE content from SERP.
+
+        Clicks "Show more" if available and captures citations.
+
+        Args:
+            driver: Selenium driver
+            config: Interaction configuration
+
+        Returns:
+            Dict with AI overview content and citations, or None
+        """
+        ai_overview = None
+
+        try:
+            # Multiple selectors for AI Overview container
+            ai_selectors = [
+                "div[data-attrid='SGEResults']",
+                "div.c3AuYc",  # AI Overview container
+                "div[jsname='ub57id']",
+                "div.wDYxhc.NFQFxe",  # Large expandable
+                "div[data-sgrd]",  # SGE results data
+            ]
+
+            ai_container = None
+            for selector in ai_selectors:
+                try:
+                    ai_container = driver.find_element(By.CSS_SELECTOR, selector)
+                    if ai_container:
+                        break
+                except Exception:
+                    continue
+
+            if not ai_container:
+                return None
+
+            ai_overview = {
+                'content': '',
+                'citations': [],
+                'expanded': False,
+            }
+
+            # Try to click "Show more" if enabled
+            if config.expand_ai_overview:
+                try:
+                    show_more_selectors = [
+                        "div[role='button'][aria-label*='Show more']",
+                        "span.BNlZbe",  # Show more text
+                        "div.XLEeCf",  # Expandable button
+                    ]
+                    for sm_sel in show_more_selectors:
+                        try:
+                            show_more = ai_container.find_element(By.CSS_SELECTOR, sm_sel)
+                            if show_more and show_more.is_displayed():
+                                self._human_click(driver, show_more)
+                                time.sleep(config.content_load_wait)
+                                ai_overview['expanded'] = True
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+            # Extract main content
+            try:
+                content_text = ai_container.text
+                ai_overview['content'] = content_text[:5000]  # Limit size
+            except Exception:
+                pass
+
+            # Extract citations if enabled
+            if config.capture_ai_citations:
+                try:
+                    citation_links = ai_container.find_elements(
+                        By.CSS_SELECTOR, "a[href]:not([href^='#'])"
+                    )
+                    for link in citation_links[:20]:  # Limit to 20 citations
+                        try:
+                            href = link.get_attribute("href")
+                            title = link.text or link.get_attribute("aria-label") or ""
+                            if href and "google.com" not in href:
+                                from urllib.parse import urlparse
+                                ai_overview['citations'].append({
+                                    'url': href,
+                                    'title': title[:200],
+                                    'domain': urlparse(href).netloc,
+                                })
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+            logger.info(f"Extracted AI Overview with {len(ai_overview['citations'])} citations")
+
+        except Exception as e:
+            logger.debug(f"No AI Overview found or error: {e}")
+
+        return ai_overview
+
+    def _expand_local_pack(
+        self,
+        driver,
+        config: SerpInteractionConfig,
+    ) -> List[Dict[str, Any]]:
+        """
+        Click on local pack listings to extract detailed information.
+
+        Args:
+            driver: Selenium driver
+            config: Interaction configuration
+
+        Returns:
+            List of expanded local business details
+        """
+        local_results = []
+
+        try:
+            # Find local pack container
+            local_selectors = [
+                "div.VkpGBb",
+                "div[data-attrid='kc:/local:']",
+                "div.rlfl__tls",
+            ]
+
+            local_container = None
+            for selector in local_selectors:
+                try:
+                    local_container = driver.find_element(By.CSS_SELECTOR, selector)
+                    if local_container:
+                        break
+                except Exception:
+                    continue
+
+            if not local_container:
+                return local_results
+
+            # Find individual listings
+            listing_selectors = [
+                "div.VkpGBb",
+                "div.rllt__link",
+                "a.rllt__link",
+            ]
+
+            listings = []
+            for selector in listing_selectors:
+                try:
+                    listings = local_container.find_elements(By.CSS_SELECTOR, selector)
+                    if listings:
+                        break
+                except Exception:
+                    continue
+
+            for i, listing in enumerate(listings[:5], 1):  # Limit to top 5
+                try:
+                    local_data = {"position": i}
+
+                    # Extract basic info before clicking
+                    try:
+                        name_elem = listing.find_element(
+                            By.CSS_SELECTOR, "div.dbg0pd, span.OSrXXb, div.qBF1Pd"
+                        )
+                        local_data['name'] = name_elem.text if name_elem else ""
+                    except Exception:
+                        local_data['name'] = ""
+
+                    # Click to expand if configured
+                    if config.local_pack_click_each:
+                        try:
+                            driver.execute_script(
+                                "arguments[0].scrollIntoView({block: 'center'});",
+                                listing
+                            )
+                            time.sleep(config.element_click_delay)
+                            self._human_click(driver, listing)
+                            time.sleep(config.content_load_wait * 1.5)  # Longer wait for panel
+
+                            # Extract expanded details from side panel
+                            try:
+                                # Rating
+                                rating_elem = driver.find_element(
+                                    By.CSS_SELECTOR, "span.Aq14fc, span.yi40Hd"
+                                )
+                                local_data['rating'] = rating_elem.text if rating_elem else ""
+                            except Exception:
+                                pass
+
+                            try:
+                                # Review count
+                                reviews = driver.find_element(
+                                    By.CSS_SELECTOR, "span.RDApEe, span.z5jxId"
+                                )
+                                local_data['review_count'] = reviews.text if reviews else ""
+                            except Exception:
+                                pass
+
+                            try:
+                                # Phone
+                                phone = driver.find_element(
+                                    By.CSS_SELECTOR, "span.LrzXr, a[href^='tel:']"
+                                )
+                                if phone:
+                                    local_data['phone'] = phone.text or phone.get_attribute("href")
+                            except Exception:
+                                pass
+
+                            try:
+                                # Address
+                                addr = driver.find_element(
+                                    By.CSS_SELECTOR, "span.LrzXr[data-dtype='d3adr']"
+                                )
+                                local_data['address'] = addr.text if addr else ""
+                            except Exception:
+                                pass
+
+                            try:
+                                # Website
+                                website = driver.find_element(
+                                    By.CSS_SELECTOR, "a[data-rc='website'], a.lcr4fd"
+                                )
+                                if website:
+                                    local_data['website'] = website.get_attribute("href") or ""
+                            except Exception:
+                                pass
+
+                            try:
+                                # Hours
+                                hours = driver.find_element(By.CSS_SELECTOR, "span.zhFJpc")
+                                local_data['hours'] = hours.text if hours else ""
+                            except Exception:
+                                pass
+
+                            # Close the panel by clicking elsewhere
+                            try:
+                                driver.execute_script("document.body.click();")
+                            except Exception:
+                                pass
+
+                        except Exception as e:
+                            logger.debug(f"Error expanding local listing {i}: {e}")
+
+                    if local_data.get('name'):
+                        local_results.append(local_data)
+
+                except Exception as e:
+                    logger.debug(f"Error processing local listing {i}: {e}")
+                    continue
+
+            logger.info(f"Extracted {len(local_results)} local pack results")
+
+        except Exception as e:
+            logger.debug(f"Error in local pack expansion: {e}")
+
+        return local_results
+
+    def _scroll_and_load_serp(
+        self,
+        driver,
+        config: SerpInteractionConfig,
+    ):
+        """
+        Scroll through SERP to load lazy content.
+
+        Args:
+            driver: Selenium driver
+            config: Interaction configuration
+        """
+        if not config.scroll_to_load:
+            return
+
+        try:
+            for i in range(config.scroll_steps):
+                driver.execute_script(
+                    f"window.scrollTo(0, document.body.scrollHeight * {(i+1) / config.scroll_steps});"
+                )
+                time.sleep(config.scroll_delay)
+
+            # Scroll back to top
+            driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(0.5)
+
+        except Exception as e:
+            logger.debug(f"Error during SERP scroll: {e}")
+
     def scrape_query(
         self,
         query: str,
@@ -501,6 +1055,437 @@ class SerpScraperSelenium(BaseSeleniumScraper):
 
         except Exception as e:
             logger.error(f"Error scraping SERP for '{query}': {e}", exc_info=True)
+            return None
+
+    def scrape_serp(
+        self,
+        keyword: str,
+        country: str = "us",
+        language: str = "en",
+        num_results: int = 100,
+        use_coordinator: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Backwards-compatible method that returns a dict instead of SerpSnapshot.
+
+        This method exists for compatibility with keyword_intelligence and
+        competitive_analysis orchestrators that expect a dict return type.
+
+        Args:
+            keyword: Search query
+            country: Country code (gl parameter)
+            language: Language code (hl parameter)
+            num_results: Number of results to request
+            use_coordinator: If True, use GoogleCoordinator for rate limiting
+                            and browser session sharing (recommended).
+                            If False, use direct scraping (standalone mode).
+
+        Returns:
+            Dict with organic_results, people_also_ask, local_pack, etc.
+            or None on failure
+        """
+        # If using coordinator, route through it with SHARED browser
+        if use_coordinator:
+            try:
+                coordinator = get_google_coordinator()
+                # Use execute() which provides the shared browser
+                return coordinator.execute(
+                    "serp",
+                    lambda driver: self._scrape_serp_with_driver(driver, keyword, country, language, num_results),
+                    priority=5
+                )
+            except Exception as e:
+                logger.warning(f"Coordinator failed, falling back to direct: {e}")
+                # Fall through to direct scraping
+
+        return self._scrape_serp_direct(keyword, country, language, num_results)
+
+    def _scrape_serp_with_driver(
+        self,
+        driver,
+        keyword: str,
+        country: str = "us",
+        language: str = "en",
+        num_results: int = 100,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Scrape SERP using a provided driver (from GoogleCoordinator's shared browser).
+
+        Args:
+            driver: Selenium WebDriver instance
+            keyword: Search query
+            country: Country code
+            language: Language code
+            num_results: Number of results
+
+        Returns:
+            Dict with SERP data or None
+        """
+        import random
+        import time
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.wait import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+
+        config = SerpInteractionConfig(
+            geo_country=country,
+            geo_language=language,
+        )
+
+        try:
+            # Navigate to Google homepage
+            driver.get("https://www.google.com/")
+            time.sleep(random.uniform(1, 2))
+
+            # Simulate human behavior
+            self._simulate_human_behavior(driver, intensity="light")
+
+            # Try to search via input
+            search_success = self._perform_search_via_input(driver, keyword, None)
+
+            if not search_success:
+                # Fallback to direct URL
+                url = self._build_search_url(keyword, None, num_results, interaction_config=config)
+                driver.get(url)
+                time.sleep(random.uniform(2, 4))
+
+            # Wait for results
+            wait = WebDriverWait(driver, self.page_timeout)
+            try:
+                wait.until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, '#search, #rso'))
+                )
+            except Exception:
+                logger.warning("Timeout waiting for search results")
+
+            time.sleep(random.uniform(1, 2))
+
+            # Simulate reading
+            self._simulate_human_behavior(driver, intensity="normal")
+
+            # Get page source
+            html = driver.page_source
+
+            if not html or len(html) < 1000:
+                logger.error(f"Failed to fetch SERP for: {keyword}")
+                return None
+
+            # Validate response
+            is_valid, reason = self._validate_page_response(driver, driver.current_url)
+            if not is_valid:
+                logger.error(f"SERP validation failed: {reason}")
+                return None
+
+            # Parse the SERP
+            snapshot = self.parser.parse(html, keyword, None)
+
+            if not snapshot:
+                return None
+
+            return self._snapshot_to_dict(snapshot)
+
+        except Exception as e:
+            logger.error(f"Error in _scrape_serp_with_driver: {e}")
+            return None
+
+    def _scrape_serp_direct(
+        self,
+        keyword: str,
+        country: str = "us",
+        language: str = "en",
+        num_results: int = 100,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Direct SERP scraping without coordinator (internal method).
+
+        Called by scrape_serp when use_coordinator=False or as fallback.
+        """
+        # Create interaction config with country/language
+        config = SerpInteractionConfig(
+            geo_country=country,
+            geo_language=language,
+        )
+
+        # Use scrape_query_interactive for richer data, fall back to scrape_query
+        snapshot = self.scrape_query_interactive(
+            query=keyword,
+            location=None,
+            num_results=num_results,
+            interaction_config=config,
+        )
+
+        if not snapshot:
+            # Fallback to basic scrape_query
+            snapshot = self.scrape_query(
+                query=keyword,
+                num_results=num_results,
+            )
+
+        if not snapshot:
+            return None
+
+        # Convert SerpSnapshot to legacy dict format expected by orchestrators
+        return self._snapshot_to_dict(snapshot)
+
+    def _snapshot_to_dict(self, snapshot: SerpSnapshot) -> Dict[str, Any]:
+        """
+        Convert SerpSnapshot to legacy dict format for orchestrator compatibility.
+
+        Args:
+            snapshot: SerpSnapshot object
+
+        Returns:
+            Dict in legacy format with organic_results, people_also_ask, etc.
+        """
+        organic_results = []
+        for result in snapshot.results:
+            organic_results.append({
+                'position': result.position,
+                'title': result.title,
+                'url': result.url,
+                'domain': result.domain,
+                'snippet': result.description,  # SerpResult uses 'description' not 'snippet'
+                'is_featured_snippet': result.is_featured,  # SerpResult uses 'is_featured' not 'is_featured_snippet'
+                'sitelinks': [sl.to_dict() if hasattr(sl, 'to_dict') else sl for sl in (getattr(result, 'sitelinks', None) or [])],
+                'metadata': result.metadata or {},
+            })
+
+        paa_questions = []
+        for paa in (snapshot.people_also_ask or []):
+            if hasattr(paa, 'question'):
+                paa_questions.append({
+                    'question': paa.question,
+                    'answer': getattr(paa, 'answer', ''),
+                    'source_url': getattr(paa, 'source_url', ''),
+                    'source_domain': getattr(paa, 'source_domain', ''),
+                })
+            elif isinstance(paa, dict):
+                paa_questions.append(paa)
+
+        local_pack = []
+        for local in (snapshot.local_pack or []):
+            if isinstance(local, dict):
+                local_pack.append(local)
+            elif hasattr(local, 'to_dict'):
+                local_pack.append(local.to_dict())
+
+        return {
+            'query': snapshot.query,
+            'location': snapshot.location,
+            'organic_results': organic_results,
+            'total_results': snapshot.total_results,
+            'people_also_ask': paa_questions,
+            'local_pack': local_pack,
+            'ai_overview': snapshot.ai_overview,
+            'featured_snippet': {
+                'title': organic_results[0]['title'] if organic_results and organic_results[0].get('is_featured_snippet') else None,
+                'url': organic_results[0]['url'] if organic_results and organic_results[0].get('is_featured_snippet') else None,
+                'snippet': organic_results[0]['snippet'] if organic_results and organic_results[0].get('is_featured_snippet') else None,
+            } if organic_results and any(r.get('is_featured_snippet') for r in organic_results) else None,
+            'has_knowledge_panel': bool(snapshot.knowledge_panel),
+            'has_local_pack': len(local_pack) > 0,
+            'has_people_also_ask': len(paa_questions) > 0,
+            'has_featured_snippet': any(r.get('is_featured_snippet') for r in organic_results),
+            'has_ai_overview': bool(snapshot.ai_overview),
+            'metadata': snapshot.metadata or {},
+        }
+
+    def scrape_query_interactive(
+        self,
+        query: str,
+        location: Optional[str] = None,
+        our_domains: Optional[List[str]] = None,
+        competitor_domains: Optional[Dict[str, int]] = None,
+        num_results: int = 100,
+        interaction_config: Optional[SerpInteractionConfig] = None,
+    ) -> Optional[SerpSnapshot]:
+        """
+        Scrape SERP with full interactions - PAA expansion, AI Overview, local pack, pagination.
+
+        This is an enhanced version of scrape_query that:
+        - Expands People Also Ask questions to get answers
+        - Extracts AI Overview/SGE content with citations
+        - Clicks local pack results for detailed info
+        - Supports multi-page scraping
+        - Uses geo/locale parameters for consistent results
+
+        Args:
+            query: Search query
+            location: Location context (e.g., "Austin, TX")
+            our_domains: List of our company's domains
+            competitor_domains: Dict of competitor domain -> competitor_id
+            num_results: Number of results per page
+            interaction_config: Configuration for interaction behavior
+
+        Returns:
+            SerpSnapshot with enriched data if successful, None otherwise
+        """
+        config = interaction_config or DEFAULT_INTERACTION
+        all_results = []
+        all_paa = []
+        ai_overview_data = None
+        local_pack_data = []
+
+        logger.info(
+            f"Scraping SERP (interactive) for: '{query}' "
+            f"({location or 'no location'}) - {config.fetch_pages} page(s)"
+        )
+
+        try:
+            with self.browser_session("google") as driver:
+                # Navigate to Google first
+                driver.get("https://www.google.com/")
+                time.sleep(random.uniform(1, 2))
+                self._simulate_human_behavior(driver, intensity="light")
+
+                # Process each page
+                for page_num in range(1, config.fetch_pages + 1):
+                    url = self._build_search_url(
+                        query, location, num_results,
+                        page=page_num, interaction_config=config
+                    )
+
+                    if page_num == 1:
+                        # First page: try human-like search
+                        search_success = self._perform_search_via_input(driver, query, location)
+                        if not search_success:
+                            driver.get(url)
+                    else:
+                        # Subsequent pages: navigate directly
+                        driver.get(url)
+
+                    time.sleep(random.uniform(2, 4))
+
+                    # Wait for results
+                    wait = WebDriverWait(driver, self.page_timeout)
+                    try:
+                        wait.until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, '#search, #rso'))
+                        )
+                    except Exception:
+                        logger.warning(f"Timeout waiting for results on page {page_num}")
+                        if page_num == 1:
+                            return None
+                        break
+
+                    # Extra wait for JS
+                    time.sleep(random.uniform(1, 2))
+
+                    # Scroll to load lazy content
+                    self._scroll_and_load_serp(driver, config)
+
+                    # Page 1: Do all the interactions
+                    if page_num == 1:
+                        # Extract AI Overview (only on page 1)
+                        if config.expand_ai_overview:
+                            ai_overview_data = self._extract_ai_overview(driver, config)
+
+                        # Expand PAA questions
+                        if config.expand_paa:
+                            paa_data = self._expand_paa_questions(driver, config)
+                            all_paa.extend(paa_data)
+
+                        # Expand local pack
+                        if config.expand_local_pack:
+                            local_pack_data = self._expand_local_pack(driver, config)
+
+                    # Validate response
+                    is_valid, reason = self._validate_page_response(driver, url)
+                    if not is_valid:
+                        logger.error(f"SERP validation failed on page {page_num}: {reason}")
+                        if page_num == 1:
+                            return None
+                        break
+
+                    # Get final HTML after interactions
+                    html = driver.page_source
+
+                    if not html or len(html) < 1000:
+                        logger.error(f"Failed to fetch SERP page {page_num}")
+                        if page_num == 1:
+                            return None
+                        break
+
+                    # Parse the page
+                    page_snapshot = self.parser.parse(html, query, location)
+
+                    # Adjust positions for pagination
+                    position_offset = (page_num - 1) * num_results
+                    for result in page_snapshot.results:
+                        result.position += position_offset
+                        result.metadata['page'] = page_num
+
+                    all_results.extend(page_snapshot.results)
+
+                    # Only get PAA/local pack from parser on page 1 if not expanded
+                    if page_num == 1:
+                        if not all_paa and page_snapshot.people_also_ask:
+                            all_paa = page_snapshot.people_also_ask
+                        if not local_pack_data and page_snapshot.local_pack:
+                            local_pack_data = page_snapshot.local_pack
+
+                    logger.info(f"Page {page_num}: {len(page_snapshot.results)} results")
+
+                    # Rate limit between pages
+                    if page_num < config.fetch_pages:
+                        time.sleep(random.uniform(2, 4))
+
+                # Build final snapshot
+                final_snapshot = SerpSnapshot(
+                    query=query,
+                    location=location,
+                    results=all_results,
+                    total_results=len(all_results),
+                    people_also_ask=all_paa if isinstance(all_paa, list) and all_paa and hasattr(all_paa[0], 'question') else [],
+                    local_pack=local_pack_data,
+                    ai_overview=ai_overview_data,
+                    metadata={
+                        'interaction_config': config.to_dict(),
+                        'pages_fetched': min(page_num, config.fetch_pages),
+                        'scraper': 'selenium_interactive',
+                    }
+                )
+
+                # Convert expanded PAA dicts to PAAQuestion objects if needed
+                if all_paa and isinstance(all_paa[0], dict):
+                    from seo_intelligence.scrapers.serp_parser import PAAQuestion
+                    final_snapshot.people_also_ask = [
+                        PAAQuestion(
+                            question=p.get('question', ''),
+                            answer=p.get('answer', ''),
+                            source_url=p.get('source_url', ''),
+                            source_domain=p.get('source_domain', ''),
+                            position=p.get('position', 0),
+                            metadata={'expanded': p.get('expanded', False)}
+                        )
+                        for p in all_paa
+                    ]
+
+                # Save to database if enabled
+                if self.engine:
+                    with Session(self.engine) as session:
+                        query_id = self._get_or_create_query(session, query, location)
+                        snapshot_id = self._save_snapshot(
+                            session, query_id, final_snapshot, html
+                        )
+                        self._save_results(
+                            session, snapshot_id, final_snapshot,
+                            our_domains, competitor_domains
+                        )
+                        self._save_paa_questions(
+                            session, snapshot_id, query_id, final_snapshot
+                        )
+
+                        logger.info(
+                            f"Saved interactive SERP snapshot {snapshot_id} with "
+                            f"{len(final_snapshot.results)} results, "
+                            f"{len(final_snapshot.people_also_ask)} PAA questions"
+                        )
+
+                return final_snapshot
+
+        except Exception as e:
+            logger.error(f"Error in interactive SERP scrape for '{query}': {e}", exc_info=True)
             return None
 
     def run(

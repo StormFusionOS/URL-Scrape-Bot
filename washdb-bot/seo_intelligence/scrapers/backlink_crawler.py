@@ -1,5 +1,5 @@
 """
-Backlink Crawler Module
+Backlink Crawler Module (Playwright Version)
 
 Discovers and tracks backlinks pointing to our websites.
 
@@ -8,11 +8,21 @@ Features:
 - Track referring domains
 - Calculate domain authority estimates
 - Store in backlinks and referring_domains tables
+- Enhanced backlink metadata: placement, rel attributes, context
 
 Per SCRAPING_NOTES.md:
 - Use YP-style stealth tactics (2-5s delays, human behavior simulation)
 - Track anchor text and link context
 - Aggregate at domain level for LAS calculation
+
+KNOWN LIMITATIONS:
+- Common Crawl CDX API searches for pages ON a domain, not pages LINKING TO
+  a domain. The search_common_crawl() method is marked as deprecated and
+  documented to return unreliable results for backlink discovery.
+- For reliable backlink discovery, consider paid APIs (Ahrefs, Majestic, Moz).
+
+NOTE: The SeleniumBase version (backlink_crawler_selenium.py) is recommended
+for production use due to better anti-detection.
 """
 
 import os
@@ -461,10 +471,19 @@ class BacklinkCrawler(BaseScraper):
         index: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Search Common Crawl index for pages that link to our domain.
+        [DEPRECATED] Search Common Crawl index for pages containing our domain.
 
-        Common Crawl provides free access to billions of crawled web pages.
-        This searches their CDX (URL index) for pages containing links to our domain.
+        WARNING: This method is fundamentally broken for backlink discovery.
+        The CDX API searches for pages ON a domain (domain/*), not pages that
+        LINK TO that domain. It returns the target domain's own URLs, not
+        inbound links from other sites.
+
+        For reliable backlink discovery, use:
+        - search_bing_backlinks() for free discovery (mentions + links)
+        - Paid APIs (Ahrefs, Majestic, Moz) for comprehensive backlink data
+
+        This method is kept for backwards compatibility but results should
+        not be trusted for backlink analysis.
 
         Args:
             domain: Domain to find backlinks for (e.g., "example.com")
@@ -472,9 +491,20 @@ class BacklinkCrawler(BaseScraper):
             index: Specific Common Crawl index to use (default: latest)
 
         Returns:
-            List of potential backlink sources with metadata
+            List of URLs on the target domain (NOT backlinks!)
         """
-        logger.info(f"Searching Common Crawl for backlinks to {domain} (max {max_results} results)")
+        import warnings
+        warnings.warn(
+            "search_common_crawl() returns pages ON the domain, not pages LINKING TO it. "
+            "This method is deprecated for backlink discovery. Use search_bing_backlinks() instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+
+        logger.warning(
+            f"[DEPRECATED] search_common_crawl() called for {domain}. "
+            "This method returns the domain's own URLs, not inbound backlinks."
+        )
 
         # Clean domain
         domain = domain.lower().strip()

@@ -1,5 +1,5 @@
 """
-Competitor Crawler Module
+Competitor Crawler Module (Playwright Version)
 
 Crawls competitor websites to analyze their SEO strategy.
 
@@ -14,19 +14,75 @@ Per SCRAPING_NOTES.md:
 - Use Tier B rate limits (10-20s delay) for competitor sites
 - Respect robots.txt for each domain
 - Hash content for change detection
+
+NOTE: The SeleniumBase version (competitor_crawler_selenium.py) includes additional
+features:
+- Sitemap-based page discovery (robots.txt parsing, sitemap index handling)
+- Internal link graph building with anchor text analysis
+- Smart URL prioritization (services, locations, blog pages)
+
+Use the SeleniumBase version for production due to better anti-detection and
+more comprehensive features.
 """
 
 import os
+import sys
 import json
+import time
+import random
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from urllib.parse import urlparse, urljoin
+from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 from seo_intelligence.scrapers.base_scraper import BaseScraper
+
+# Import YP stealth features for anti-detection
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+try:
+    from scrape_yp.yp_stealth import (
+        get_playwright_context_params,
+        human_delay,
+        get_exponential_backoff_delay,
+        get_enhanced_playwright_init_scripts,
+        get_human_reading_delay,
+        get_scroll_delays,
+        SessionBreakManager,
+    )
+    HAS_YP_STEALTH = True
+except ImportError:
+    HAS_YP_STEALTH = False
+    # Fallback implementations
+    def human_delay(min_seconds=1.0, max_seconds=3.0, jitter=0.5):
+        base = random.uniform(min_seconds, max_seconds)
+        actual_jitter = base * random.uniform(-jitter, jitter)
+        time.sleep(max(0.1, base + actual_jitter))
+
+    def get_human_reading_delay(content_length):
+        """Simulate human reading time based on content length."""
+        words_per_minute = random.uniform(180, 250)
+        words = content_length / 5
+        return min(max(0.5, (words / words_per_minute) * 60), 5.0)
+
+    def get_scroll_delays(num_scrolls=3):
+        """Get random delays between scroll actions."""
+        return [random.uniform(0.3, 1.2) for _ in range(num_scrolls)]
+
+    class SessionBreakManager:
+        def __init__(self, requests_per_session=50):
+            self.count = 0
+            self.limit = requests_per_session
+        def increment(self):
+            self.count += 1
+            if self.count >= self.limit:
+                time.sleep(random.uniform(10, 30))
+                self.count = 0
+                return True
+            return False
 from seo_intelligence.scrapers.competitor_parser import get_competitor_parser, PageMetrics
 from seo_intelligence.services import (
     get_task_logger,
@@ -102,7 +158,31 @@ class CompetitorCrawler(BaseScraper):
             self.engine = None
             logger.warning("DATABASE_URL not set - database storage disabled")
 
-        logger.info(f"CompetitorCrawler initialized (tier=B, max_pages={max_pages_per_site})")
+        # Session break manager (YP-style: take breaks after N requests to appear human)
+        self.session_manager = SessionBreakManager(
+            requests_per_session=30  # Take break after 30 requests (competitor pages)
+        )
+        self.request_count = 0
+
+        logger.info(f"CompetitorCrawler initialized (tier=B, max_pages={max_pages_per_site}, YP-stealth={HAS_YP_STEALTH})")
+
+    def _get_stealth_context_options(self) -> dict:
+        """
+        Override to use YP-style stealth context options.
+
+        Combines base scraper options with YP anti-detection parameters
+        for better stealth when crawling competitor sites.
+        """
+        # Get base scraper options
+        base_options = super()._get_stealth_context_options()
+
+        # Merge with YP params if available (YP params take precedence)
+        if HAS_YP_STEALTH:
+            yp_context_params = get_playwright_context_params()
+            merged_options = {**base_options, **yp_context_params}
+            return merged_options
+
+        return base_options
 
     def _get_or_create_competitor(
         self,
@@ -386,8 +466,17 @@ class CompetitorCrawler(BaseScraper):
             "schema_types": set(),
         }
 
+        # Check for session break (YP-style anti-detection)
+        self.request_count += 1
+        break_taken = self.session_manager.increment()
+        if break_taken:
+            logger.info(f"[SESSION BREAK] Break taken after {self.request_count} requests")
+
         try:
             with self.browser_session() as (browser, context, page):
+                # Human delay before starting crawl (YP-style)
+                human_delay(min_seconds=2.0, max_seconds=4.0, jitter=0.3)
+
                 # Crawl homepage first
                 html = self.fetch_page(
                     url=website_url,
@@ -415,12 +504,27 @@ class CompetitorCrawler(BaseScraper):
                 results["total_words"] += metrics.word_count
                 results["schema_types"].update(metrics.schema_types)
 
+                # Simulate human reading the homepage (YP-style)
+                try:
+                    reading_time = get_human_reading_delay(len(html))
+                    scroll_delays = get_scroll_delays(num_scrolls=random.randint(2, 4))
+                    for i, scroll_delay in enumerate(scroll_delays):
+                        scroll_position = random.randint(300, 700) * (i + 1)
+                        page.evaluate(f"window.scrollTo(0, {scroll_position})")
+                        time.sleep(scroll_delay)
+                    time.sleep(min(reading_time, 2.0))
+                except Exception as e:
+                    logger.debug(f"Error during homepage scroll simulation: {e}")
+
                 # Discover and crawl additional pages
                 additional_urls = self._discover_pages(website_url, html)
                 logger.info(f"Discovered {len(additional_urls)} additional pages for {domain}")
 
                 for url in additional_urls:
                     try:
+                        # Human delay between pages (YP-style)
+                        human_delay(min_seconds=1.5, max_seconds=3.5, jitter=0.3)
+
                         page_html = self.fetch_page(
                             url=url,
                             page=page,

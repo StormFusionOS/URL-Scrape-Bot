@@ -48,6 +48,12 @@ from seo_intelligence.drivers import (
     get_uc_driver,
     click_element_human_like,
 )
+from seo_intelligence.models.artifacts import (
+    PageArtifact,
+    ScrapeQualityProfile,
+    ArtifactStorage,
+    DEFAULT_QUALITY_PROFILE,
+)
 from runner.logging_setup import get_logger
 
 
@@ -76,6 +82,7 @@ class BaseSeleniumScraper(ABC):
         use_proxy: bool = True,  # Enabled by default (unlike Playwright version)
         max_retries: int = 3,
         page_timeout: int = 30,
+        mobile_mode: bool = False,
     ):
         """
         Initialize base Selenium scraper.
@@ -88,6 +95,7 @@ class BaseSeleniumScraper(ABC):
             use_proxy: Use proxy pool (recommended for SEO scraping)
             max_retries: Maximum retry attempts on failure
             page_timeout: Page load timeout in seconds
+            mobile_mode: Emulate mobile device (iPhone X viewport and user agent)
         """
         self.name = name
         self.tier = tier
@@ -96,6 +104,7 @@ class BaseSeleniumScraper(ABC):
         self.use_proxy = use_proxy
         self.max_retries = max_retries
         self.page_timeout = page_timeout
+        self.mobile_mode = mobile_mode
 
         # Initialize logger
         self.logger = get_logger(name)
@@ -303,6 +312,7 @@ class BaseSeleniumScraper(ABC):
                 site=site,
                 headless=self.headless,
                 use_proxy=self.use_proxy,
+                mobile_mode=self.mobile_mode,
                 retry_attempts=self.max_retries,
                 wait_time=self.page_timeout,
             )
@@ -494,6 +504,310 @@ class BaseSeleniumScraper(ABC):
         self.stats["pages_failed"] += 1
         self.logger.error(f"Failed to fetch {url} after {self.max_retries} attempts")
         return None
+
+    def fetch_page_with_artifact(
+        self,
+        driver,
+        url: str,
+        quality_profile: Optional[ScrapeQualityProfile] = None,
+        save_artifact: bool = False,
+        wait_for_selector: Optional[str] = None,
+    ) -> Optional[PageArtifact]:
+        """
+        Fetch a page and capture comprehensive artifacts for later re-parsing.
+
+        This method captures raw HTML, screenshots, console logs, and metadata
+        so data can be re-parsed offline without re-scraping.
+
+        Args:
+            driver: Selenium driver
+            url: URL to fetch
+            quality_profile: Quality settings (defaults to DEFAULT_QUALITY_PROFILE)
+            save_artifact: Whether to persist artifact to disk
+            wait_for_selector: CSS selector to wait for before capturing
+
+        Returns:
+            PageArtifact with all captured data, or None if fetch failed
+        """
+        from datetime import datetime, timezone
+        import base64
+
+        profile = quality_profile or DEFAULT_QUALITY_PROFILE
+        domain = urlparse(url).netloc
+        start_time = time.time()
+
+        # Check quarantine
+        if self.domain_quarantine.is_quarantined(domain):
+            self.logger.warning(f"Domain {domain} is quarantined, skipping")
+            self.stats["pages_skipped"] += 1
+            return None
+
+        # Check robots
+        if not self._check_robots(url):
+            self.stats["pages_skipped"] += 1
+            return None
+
+        # Initialize artifact
+        artifact = PageArtifact(
+            url=url,
+            final_url=url,
+            engine="selenium",
+            quality_profile=profile.to_dict(),
+            user_agent=driver.execute_script("return navigator.userAgent;") if driver else None,
+            viewport={
+                "width": profile.viewport_width,
+                "height": profile.viewport_height,
+            },
+        )
+
+        timeout = profile.navigation_timeout // 1000  # Convert ms to seconds
+        wait = WebDriverWait(driver, timeout)
+
+        for attempt in range(profile.max_retries):
+            try:
+                self.logger.debug(f"Fetching with artifact: {url} (attempt {attempt + 1})")
+
+                # Navigate to URL
+                driver.get(url)
+
+                # Update final URL after redirects
+                artifact.final_url = driver.current_url
+
+                # Wait for selector if specified
+                if wait_for_selector:
+                    try:
+                        wait.until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, wait_for_selector))
+                        )
+                    except TimeoutException:
+                        self.logger.warning(f"Timeout waiting for {wait_for_selector}")
+
+                # Wait based on strategy
+                if profile.wait_strategy == "networkidle":
+                    # Selenium doesn't have networkidle, so we wait longer
+                    time.sleep(3.0)
+                elif profile.wait_strategy == "load":
+                    wait.until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
+                    )
+
+                # Extra wait
+                if profile.extra_wait_seconds > 0:
+                    time.sleep(profile.extra_wait_seconds)
+
+                # Scroll page if configured
+                if profile.scroll_page:
+                    self._scroll_page_for_artifact(driver, profile)
+
+                # Capture console errors if available
+                if profile.capture_console:
+                    try:
+                        logs = driver.get_log('browser')
+                        for entry in logs:
+                            level = entry.get('level', '')
+                            message = entry.get('message', '')
+                            if level == 'SEVERE':
+                                artifact.console_errors.append(message)
+                            elif level == 'WARNING':
+                                artifact.console_warnings.append(message)
+                    except Exception as e:
+                        self.logger.debug(f"Could not capture console logs: {e}")
+
+                # Human behavior
+                self._simulate_human_behavior(driver, intensity="normal")
+
+                # Validate response
+                is_valid, reason = self._validate_page_response(driver, url)
+
+                if not is_valid:
+                    self.logger.warning(f"Page validation failed: {reason}")
+                    artifact.detected_captcha = reason == "CAPTCHA_DETECTED"
+                    artifact.detected_login_wall = reason == "BOT_DETECTED"
+
+                    if reason in ("CAPTCHA_DETECTED", "BOT_DETECTED"):
+                        self.domain_quarantine.quarantine_domain(
+                            domain=domain,
+                            reason=reason,
+                            duration_minutes=60,
+                        )
+
+                    # Still capture what we can
+                    artifact.html_raw = driver.page_source
+                    artifact.status_code = 403 if reason == "BOT_DETECTED" else 429
+                    artifact.fetch_duration_ms = int((time.time() - start_time) * 1000)
+
+                    self.stats["pages_failed"] += 1
+
+                    if save_artifact:
+                        storage = ArtifactStorage()
+                        storage.save(artifact)
+
+                    return artifact
+
+                # Success - capture all artifacts
+                artifact.status_code = 200
+
+                # Capture HTML
+                if profile.capture_html:
+                    artifact.html_raw = driver.page_source
+
+                # Check for consent overlay
+                artifact.detected_consent_overlay = self._detect_consent_overlay_selenium(driver)
+
+                # Capture screenshot
+                if profile.capture_screenshot:
+                    try:
+                        # Full page screenshot
+                        screenshot_data = driver.get_screenshot_as_png()
+                        if screenshot_data and save_artifact:
+                            storage = ArtifactStorage()
+                            artifact_dir = storage._get_artifact_dir(artifact)
+                            screenshot_path = artifact_dir / "screenshot.png"
+                            with open(screenshot_path, 'wb') as f:
+                                f.write(screenshot_data)
+                            artifact.screenshot_path = str(screenshot_path)
+                    except Exception as e:
+                        self.logger.debug(f"Screenshot capture failed: {e}")
+
+                # Compute fetch duration
+                artifact.fetch_duration_ms = int((time.time() - start_time) * 1000)
+
+                # Update stats
+                self.domain_quarantine.reset_retry_attempts(domain)
+                self.stats["pages_crawled"] += 1
+
+                self.logger.debug(
+                    f"Fetched artifact for {url} ({artifact.html_size_bytes} bytes, "
+                    f"{artifact.fetch_duration_ms}ms)"
+                )
+
+                # Save artifact if requested
+                if save_artifact:
+                    storage = ArtifactStorage()
+                    artifact_path = storage.save(artifact)
+                    self.logger.debug(f"Artifact saved to {artifact_path}")
+
+                # Post-request delay
+                time.sleep(self._get_random_delay())
+
+                return artifact
+
+            except TimeoutException as e:
+                self.logger.warning(f"Timeout: {e}")
+                if attempt < profile.max_retries - 1:
+                    time.sleep(self._get_random_delay())
+                continue
+
+            except WebDriverException as e:
+                self.logger.warning(f"WebDriver error: {e}")
+                if attempt < profile.max_retries - 1:
+                    time.sleep(self._get_random_delay())
+                continue
+
+            except Exception as e:
+                self.logger.error(f"Error fetching artifact for {url}: {e}")
+                if attempt < profile.max_retries - 1:
+                    time.sleep(self._get_random_delay())
+                continue
+
+        # All retries failed
+        artifact.fetch_duration_ms = int((time.time() - start_time) * 1000)
+        self.stats["pages_failed"] += 1
+        self.logger.error(f"Failed to fetch artifact for {url} after {profile.max_retries} attempts")
+
+        if save_artifact:
+            storage = ArtifactStorage()
+            storage.save(artifact)
+
+        return artifact
+
+    def _scroll_page_for_artifact(self, driver, profile: ScrapeQualityProfile):
+        """
+        Scroll through page to trigger lazy loading.
+
+        Args:
+            driver: Selenium driver
+            profile: Quality profile with scroll settings
+        """
+        try:
+            viewport_height = driver.execute_script("return window.innerHeight")
+            total_height = driver.execute_script("return document.body.scrollHeight")
+
+            scroll_increment = viewport_height * 0.8
+            current_position = 0
+
+            for step in range(profile.scroll_steps):
+                current_position += scroll_increment
+
+                driver.execute_script(f"window.scrollTo({{top: {current_position}, behavior: 'smooth'}});")
+                time.sleep(profile.scroll_delay)
+
+                # Check if we've reached the bottom
+                new_height = driver.execute_script("return document.body.scrollHeight")
+                if new_height > total_height:
+                    total_height = new_height
+
+                if current_position >= total_height:
+                    break
+
+            # Scroll back to top
+            driver.execute_script("window.scrollTo({top: 0, behavior: 'smooth'});")
+            time.sleep(0.5)
+
+        except Exception as e:
+            self.logger.debug(f"Scroll for artifact failed: {e}")
+
+    def _detect_consent_overlay_selenium(self, driver) -> bool:
+        """
+        Detect common consent/cookie overlays.
+
+        Args:
+            driver: Selenium driver
+
+        Returns:
+            True if consent overlay detected
+        """
+        try:
+            page_source = driver.page_source.lower()
+            consent_indicators = [
+                'cookie-consent',
+                'cookie-banner',
+                'cookieconsent',
+                'gdpr-consent',
+                'privacy-consent',
+                'consent-dialog',
+                'cookie-notice',
+                'accept cookies',
+                'we use cookies',
+            ]
+
+            for indicator in consent_indicators:
+                if indicator in page_source:
+                    return True
+
+            # Check for common consent overlay selectors
+            consent_selectors = [
+                '#cookie-consent',
+                '.cookie-banner',
+                '[class*="cookie-consent"]',
+                '[class*="gdpr"]',
+                '#onetrust-banner-sdk',
+                '.cc-banner',
+            ]
+
+            for selector in consent_selectors:
+                try:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                    if elements and any(e.is_displayed() for e in elements):
+                        return True
+                except Exception:
+                    continue
+
+            return False
+
+        except Exception as e:
+            self.logger.debug(f"Consent detection failed: {e}")
+            return False
 
     def wait_for_element(
         self,

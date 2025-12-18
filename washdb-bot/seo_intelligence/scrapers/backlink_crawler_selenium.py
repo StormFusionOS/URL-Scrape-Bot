@@ -9,11 +9,18 @@ Features:
 - Track referring domains
 - Calculate domain authority estimates
 - Store in backlinks and referring_domains tables
+- Enhanced backlink metadata: placement, rel attributes, context
 
 Per SCRAPING_NOTES.md:
 - Use YP-style stealth tactics (2-5s delays, human behavior simulation)
 - Track anchor text and link context
 - Aggregate at domain level for LAS calculation
+
+KNOWN LIMITATIONS:
+- Common Crawl CDX API searches for pages ON a domain, not pages LINKING TO
+  a domain. The search_common_crawl() method is marked as deprecated and
+  documented to return unreliable results for backlink discovery.
+- For reliable backlink discovery, consider paid APIs (Ahrefs, Majestic, Moz).
 """
 
 import os
@@ -22,7 +29,7 @@ import sys
 import time
 import random
 import requests
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List, Optional, Set, Tuple
 from datetime import datetime
 from urllib.parse import urlparse, urljoin, quote
 from pathlib import Path
@@ -64,8 +71,9 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
 
     def __init__(
         self,
-        headless: bool = True,
-        use_proxy: bool = False,
+        headless: bool = False,  # Non-headless by default for max stealth
+        use_proxy: bool = True,  # Enable proxy for better anti-detection
+        mobile_mode: bool = False,
     ):
         """
         Initialize backlink crawler with SeleniumBase UC drivers.
@@ -73,6 +81,7 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
         Args:
             headless: Run browser in headless mode
             use_proxy: Use proxy pool
+            mobile_mode: Use mobile viewport and user agent
         """
         super().__init__(
             name="backlink_crawler_selenium",
@@ -81,7 +90,9 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
             use_proxy=use_proxy,
             max_retries=3,
             page_timeout=30000,
+            mobile_mode=mobile_mode,
         )
+        self._mobile_mode = mobile_mode
 
         # Database connection
         database_url = os.getenv("DATABASE_URL")
@@ -437,10 +448,19 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
         index: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Search Common Crawl index for pages that link to our domain.
+        [DEPRECATED] Search Common Crawl index for pages containing our domain.
 
-        Common Crawl provides free access to billions of crawled web pages.
-        This searches their CDX (URL index) for pages containing links to our domain.
+        WARNING: This method is fundamentally broken for backlink discovery.
+        The CDX API searches for pages ON a domain (domain/*), not pages that
+        LINK TO that domain. It returns the target domain's own URLs, not
+        inbound links from other sites.
+
+        For reliable backlink discovery, use:
+        - search_bing_backlinks() for free discovery (mentions + links)
+        - Paid APIs (Ahrefs, Majestic, Moz) for comprehensive backlink data
+
+        This method is kept for backwards compatibility but results should
+        not be trusted for backlink analysis.
 
         Args:
             domain: Domain to find backlinks for (e.g., "example.com")
@@ -448,9 +468,20 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
             index: Specific Common Crawl index to use (default: latest)
 
         Returns:
-            List of potential backlink sources with metadata
+            List of URLs on the target domain (NOT backlinks!)
         """
-        logger.info(f"Searching Common Crawl for backlinks to {domain} (max {max_results} results)")
+        import warnings
+        warnings.warn(
+            "search_common_crawl() returns pages ON the domain, not pages LINKING TO it. "
+            "This method is deprecated for backlink discovery. Use search_bing_backlinks() instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+
+        logger.warning(
+            f"[DEPRECATED] search_common_crawl() called for {domain}. "
+            "This method returns the domain's own URLs, not inbound backlinks."
+        )
 
         # Clean domain
         domain = domain.lower().strip()
@@ -575,20 +606,27 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
         self,
         domain: str,
         max_results: int = 50,
+        verify_links: bool = True,
     ) -> List[Dict[str, Any]]:
         """
-        Use Bing's link: operator to find pages linking to our domain.
+        Use Bing search to find pages mentioning/linking to our domain.
 
         Uses SeleniumBase UC mode to scrape Bing search results.
+        Optionally verifies that found pages actually contain backlinks.
+
+        Note: Bing deprecated the "link:" operator in 2017. This method
+        searches for domain mentions which may include both links and
+        text-only mentions. Use verify_links=True to confirm actual backlinks.
 
         Args:
             domain: Domain to find backlinks for (e.g., "example.com")
             max_results: Maximum number of results to scrape (default 50)
+            verify_links: If True, verify each result contains an actual link
 
         Returns:
             List of backlink sources found via Bing
         """
-        logger.info(f"Searching Bing for backlinks to {domain} (max {max_results} results)")
+        logger.info(f"Searching Bing for backlinks to {domain} (max {max_results} results, verify={verify_links})")
 
         # Clean domain
         domain = domain.lower().strip()
@@ -598,12 +636,13 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
         backlink_sources = []
         seen_domains: Set[str] = set()
 
-        # Use site-specific search to find mentions
-        alternative_query = f'"{domain}"'
+        # Search for domain mentions (excludes the domain itself with -site:)
+        # This finds pages that mention the domain, which may include links
+        alternative_query = f'"{domain}" -site:{domain}'
 
         try:
             # Use SeleniumBase browser session
-            with self.browser_session(site_type="generic") as driver:
+            with self.browser_session(site="generic") as driver:
                 # Search Bing
                 search_url = f"https://www.bing.com/search?q={quote(alternative_query)}"
 
@@ -672,6 +711,8 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
                             'target_domain': domain,
                             'discovered_via': 'bing_search',
                             'context': snippet[:200],
+                            'verified': False,  # Will be set by verify step
+                            'contains_link': None,  # Unknown until verified
                         })
 
                     except Exception as e:
@@ -683,7 +724,466 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
         except Exception as e:
             logger.error(f"Bing search failed: {e}")
 
+        # Optionally verify results contain actual backlinks
+        if verify_links and backlink_sources:
+            verified_sources = []
+            for source in backlink_sources[:min(10, len(backlink_sources))]:  # Verify top 10
+                backlinks = self.check_page_for_backlinks(
+                    source['source_url'],
+                    [domain]
+                )
+                if backlinks:
+                    source['verified'] = True
+                    source['contains_link'] = True
+                    source['found_backlinks'] = backlinks
+                    verified_sources.append(source)
+                else:
+                    source['verified'] = True
+                    source['contains_link'] = False
+                    # Still include but mark as mention-only
+                    source['is_mention_only'] = True
+                    verified_sources.append(source)
+
+            logger.info(f"Verified {len([s for s in verified_sources if s.get('contains_link')])} "
+                       f"actual backlinks out of {len(verified_sources)} checked")
+
+            return verified_sources
+
         return backlink_sources
+
+    def search_wayback_machine(
+        self,
+        domain: str,
+        target_domain: str,
+        max_results: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search Wayback Machine for historical snapshots containing links to target domain.
+
+        Uses the Wayback Machine CDX API to find archived pages that might contain
+        backlinks. Then fetches archived versions to verify link presence.
+
+        This is useful for:
+        - Finding historical backlinks that may have been removed
+        - Discovering links from sites that have changed
+        - Building link velocity data (when links were first/last seen)
+
+        Args:
+            domain: Source domain to search for snapshots (e.g., "example.com")
+            target_domain: Our domain we're looking for links TO
+            max_results: Maximum snapshots to check
+
+        Returns:
+            List of backlink sources found via Wayback Machine
+        """
+        logger.info(f"Searching Wayback Machine for {domain} -> {target_domain} links")
+
+        backlink_sources = []
+        seen_urls = set()
+
+        # Clean domains
+        domain = domain.lower().strip()
+        if domain.startswith('www.'):
+            domain = domain[4:]
+        target_domain = target_domain.lower().strip()
+        if target_domain.startswith('www.'):
+            target_domain = target_domain[4:]
+
+        try:
+            # Search Wayback Machine CDX API for all captures of the domain
+            cdx_url = "https://web.archive.org/cdx/search/cdx"
+            params = {
+                'url': f'{domain}/*',
+                'output': 'json',
+                'filter': 'statuscode:200',
+                'filter': 'mimetype:text/html',
+                'limit': max_results * 2,  # Get more to filter
+                'fl': 'original,timestamp,statuscode',
+                'collapse': 'urlkey',  # Dedupe by URL
+            }
+
+            response = requests.get(cdx_url, params=params, timeout=30)
+            response.raise_for_status()
+
+            data = response.json()
+            if not data or len(data) < 2:
+                logger.info(f"No Wayback Machine captures found for {domain}")
+                return []
+
+            # Skip header row
+            captures = data[1:]
+            logger.info(f"Found {len(captures)} Wayback Machine captures for {domain}")
+
+            # Check a sample of captures for backlinks
+            checked = 0
+            for capture in captures[:max_results]:
+                if checked >= max_results // 2:  # Limit verification checks
+                    break
+
+                try:
+                    original_url = capture[0]
+                    timestamp = capture[1]
+
+                    # Skip if already seen
+                    if original_url in seen_urls:
+                        continue
+                    seen_urls.add(original_url)
+
+                    # Construct Wayback URL
+                    wayback_url = f"https://web.archive.org/web/{timestamp}/{original_url}"
+
+                    # Fetch archived page
+                    human_delay(min_seconds=1.0, max_seconds=2.0, jitter=0.3)
+
+                    archive_response = requests.get(
+                        wayback_url,
+                        timeout=15,
+                        headers={'User-Agent': 'BacklinkCrawler/1.0'}
+                    )
+
+                    if archive_response.status_code != 200:
+                        continue
+
+                    html = archive_response.text
+
+                    # Check for links to target domain
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(html, 'html.parser')
+
+                    found_link = False
+                    link_details = {}
+
+                    for link in soup.find_all('a', href=True):
+                        href = link.get('href', '')
+
+                        # Skip Wayback navigation links
+                        if 'web.archive.org' in href:
+                            continue
+
+                        # Check if link points to target domain
+                        href_lower = href.lower()
+                        if target_domain in href_lower:
+                            found_link = True
+                            anchor_text = link.get_text(strip=True)
+
+                            # Get surrounding context
+                            context = ""
+                            parent = link.parent
+                            if parent:
+                                context = parent.get_text(strip=True)[:200]
+
+                            # Determine link type
+                            rel = link.get('rel', [])
+                            if isinstance(rel, str):
+                                rel = [rel]
+                            link_type = "dofollow"
+                            if 'nofollow' in rel:
+                                link_type = "nofollow"
+
+                            link_details = {
+                                'anchor_text': anchor_text,
+                                'link_type': link_type,
+                                'context': context,
+                                'target_url': href,
+                            }
+                            break
+
+                    if found_link:
+                        # Parse timestamp to date
+                        crawl_date = None
+                        if len(timestamp) >= 8:
+                            try:
+                                crawl_date = datetime.strptime(timestamp[:8], '%Y%m%d').isoformat()
+                            except:
+                                pass
+
+                        source_domain = urlparse(original_url).netloc
+                        if source_domain.startswith('www.'):
+                            source_domain = source_domain[4:]
+
+                        backlink_sources.append({
+                            'source_url': original_url,
+                            'source_domain': source_domain,
+                            'target_domain': target_domain,
+                            'discovered_via': 'wayback_machine',
+                            'wayback_url': wayback_url,
+                            'wayback_timestamp': timestamp,
+                            'crawl_date': crawl_date,
+                            'verified': True,
+                            'contains_link': True,
+                            **link_details,
+                        })
+
+                        logger.debug(f"Found historical backlink: {original_url} -> {target_domain}")
+
+                    checked += 1
+
+                except Exception as e:
+                    logger.debug(f"Error checking Wayback capture: {e}")
+                    continue
+
+            logger.info(f"Found {len(backlink_sources)} historical backlinks via Wayback Machine")
+
+        except Exception as e:
+            logger.error(f"Wayback Machine search failed: {e}")
+
+        return backlink_sources
+
+    def discover_backlinks(
+        self,
+        domain: str,
+        max_results: int = 50,
+        verify: bool = True,
+        include_historical: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Comprehensive backlink discovery using multiple methods.
+
+        Combines Bing search with optional verification. This is the
+        recommended entry point for backlink discovery.
+
+        Args:
+            domain: Domain to find backlinks for
+            max_results: Maximum results to return
+            verify: Whether to verify backlinks exist on found pages
+            include_historical: Also search Wayback Machine for historical links
+
+        Returns:
+            List of discovered backlink sources
+        """
+        logger.info(f"Starting comprehensive backlink discovery for {domain}")
+
+        all_sources = []
+        seen_urls = set()
+
+        # Method 1: Bing search (primary free method)
+        bing_results = self.search_bing_backlinks(
+            domain,
+            max_results=max_results,
+            verify_links=verify
+        )
+        for result in bing_results:
+            if result['source_url'] not in seen_urls:
+                seen_urls.add(result['source_url'])
+                all_sources.append(result)
+
+        # Method 2: Wayback Machine for historical links (optional)
+        if include_historical:
+            # Search for top referring domains from Bing results
+            referring_domains = set()
+            for source in all_sources[:10]:
+                rd = source.get('source_domain')
+                if rd and rd != domain:
+                    referring_domains.add(rd)
+
+            # Check Wayback Machine for historical snapshots
+            for rd in list(referring_domains)[:5]:  # Limit to avoid too many requests
+                wayback_results = self.search_wayback_machine(
+                    rd,
+                    target_domain=domain,
+                    max_results=10
+                )
+                for result in wayback_results:
+                    if result['source_url'] not in seen_urls:
+                        seen_urls.add(result['source_url'])
+                        all_sources.append(result)
+
+        logger.info(f"Discovered {len(all_sources)} backlink sources for {domain}")
+
+        return all_sources
+
+    def discover_backlinks_with_artifact(
+        self,
+        domain: str,
+        max_results: int = 50,
+        verify: bool = True,
+        save_artifact: bool = True,
+        quality_profile: Optional['ScrapeQualityProfile'] = None,
+    ) -> Tuple[List[Dict[str, Any]], List['PageArtifact']]:
+        """
+        Discover backlinks with comprehensive artifact capture for each verified page.
+
+        This method captures raw HTML, screenshots, and metadata for each page
+        checked for backlinks, allowing offline re-parsing and analysis.
+
+        Args:
+            domain: Domain to find backlinks for
+            max_results: Maximum results to return
+            verify: Whether to verify backlinks exist on found pages
+            save_artifact: Whether to save artifacts to disk
+            quality_profile: Quality profile for artifact capture
+
+        Returns:
+            Tuple of (list of backlink sources, list of PageArtifacts)
+        """
+        from seo_intelligence.models.artifacts import (
+            PageArtifact,
+            ScrapeQualityProfile,
+            ArtifactStorage,
+            HIGH_QUALITY_PROFILE,
+            DEFAULT_QUALITY_PROFILE,
+        )
+        from datetime import datetime, timezone
+        import time
+
+        profile = quality_profile or DEFAULT_QUALITY_PROFILE
+        artifacts = []
+        storage = ArtifactStorage() if save_artifact else None
+
+        logger.info(f"Starting backlink discovery with artifact capture for {domain}")
+
+        # First, discover potential backlink sources via Bing
+        all_sources = []
+        seen_urls = set()
+
+        # Method 1: Bing search (primary free method)
+        bing_results = self.search_bing_backlinks(
+            domain,
+            max_results=max_results,
+            verify_links=False  # We'll verify manually with artifact capture
+        )
+
+        for result in bing_results:
+            if result['source_url'] not in seen_urls:
+                seen_urls.add(result['source_url'])
+                all_sources.append(result)
+
+        logger.info(f"Found {len(all_sources)} potential backlink sources for {domain}")
+
+        # Now verify each source with artifact capture
+        verified_sources = []
+        for source in all_sources[:min(20, len(all_sources))]:  # Limit verification
+            source_url = source['source_url']
+
+            try:
+                # Apply human delay
+                human_delay(min_seconds=2.0, max_seconds=4.0, jitter=0.5)
+
+                with self.browser_session(site="generic") as driver:
+                    start_time = time.time()
+
+                    # Configure viewport if specified
+                    if profile.viewport_width and profile.viewport_height:
+                        driver.set_window_size(profile.viewport_width, profile.viewport_height)
+
+                    # Navigate to page
+                    driver.get(source_url)
+
+                    # Wait based on profile
+                    if profile.wait_strategy == "networkidle":
+                        time.sleep(3.0)
+                    else:
+                        time.sleep(random.uniform(1.5, 2.5))
+
+                    # Extra wait if configured
+                    if profile.extra_wait_seconds > 0:
+                        time.sleep(profile.extra_wait_seconds)
+
+                    # Get final URL after redirects
+                    final_url = driver.current_url
+
+                    # Get page source
+                    html = driver.page_source
+
+                    # Calculate fetch duration
+                    fetch_duration = int((time.time() - start_time) * 1000)
+
+                    # Create artifact
+                    artifact = PageArtifact(
+                        url=source_url,
+                        final_url=final_url,
+                        status_code=200,
+                        html_raw=html,
+                        engine="seleniumbase",
+                        fetch_duration_ms=fetch_duration,
+                        quality_profile=profile.to_dict(),
+                        viewport={"width": profile.viewport_width, "height": profile.viewport_height},
+                        metadata={
+                            "scraper": "backlink_crawler_selenium",
+                            "target_domain": domain,
+                            "source_domain": source.get('source_domain', ''),
+                            "discovered_via": source.get('discovered_via', 'bing_search'),
+                        }
+                    )
+
+                    # Capture screenshot if configured
+                    if profile.capture_screenshot:
+                        try:
+                            screenshot_path = f"/tmp/backlink_{artifact.url_hash}.png"
+                            driver.save_screenshot(screenshot_path)
+                            artifact.screenshot_path = screenshot_path
+                        except Exception as e:
+                            logger.debug(f"Screenshot capture failed: {e}")
+
+                    # Capture console logs if available
+                    if profile.capture_console:
+                        try:
+                            logs = driver.get_log('browser')
+                            for log in logs:
+                                if log.get('level') == 'SEVERE':
+                                    artifact.console_errors.append(log.get('message', ''))
+                                elif log.get('level') == 'WARNING':
+                                    artifact.console_warnings.append(log.get('message', ''))
+                        except Exception:
+                            pass
+
+                    # Extract backlinks from page
+                    backlinks = self._extract_backlinks_from_page(
+                        html, source_url, [domain]
+                    )
+
+                    # Update source with verification results
+                    if backlinks:
+                        source['verified'] = True
+                        source['contains_link'] = True
+                        source['found_backlinks'] = backlinks
+                        verified_sources.append(source)
+
+                        # Add backlink details to artifact metadata
+                        artifact.metadata['backlinks_found'] = len(backlinks)
+                        artifact.metadata['backlinks'] = backlinks[:5]  # First 5
+
+                        # Save to database
+                        if self.engine:
+                            source_domain = urlparse(source_url).netloc
+                            if source_domain.startswith('www.'):
+                                source_domain = source_domain[4:]
+
+                            with Session(self.engine) as session:
+                                self._get_or_create_referring_domain(session, source_domain)
+                                for bl in backlinks:
+                                    self._save_backlink(
+                                        session,
+                                        source_domain=source_domain,
+                                        target_url=bl["target_url"],
+                                        source_url=bl["source_url"],
+                                        anchor_text=bl["anchor_text"],
+                                        link_type=bl["link_type"],
+                                        context=bl["context"],
+                                    )
+                    else:
+                        source['verified'] = True
+                        source['contains_link'] = False
+                        source['is_mention_only'] = True
+
+                    # Save artifact
+                    if storage:
+                        artifact_path = storage.save(artifact)
+                        artifact.metadata['artifact_path'] = artifact_path
+
+                    artifacts.append(artifact)
+
+            except Exception as e:
+                logger.warning(f"Error verifying backlink source {source_url}: {e}")
+                source['verified'] = False
+                source['error'] = str(e)
+
+        logger.info(
+            f"Backlink discovery complete: {len(verified_sources)} verified backlinks, "
+            f"{len(artifacts)} artifacts captured"
+        )
+
+        return verified_sources, artifacts
 
     def check_page_for_backlinks(
         self,
@@ -712,7 +1212,7 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
         human_delay(min_seconds=2.0, max_seconds=5.0, jitter=0.5)
 
         try:
-            with self.browser_session(site_type="generic") as driver:
+            with self.browser_session(site="generic") as driver:
                 # Navigate to page
                 driver.get(source_url)
 

@@ -43,6 +43,12 @@ from scrape_yp.yp_stealth import (
     get_scroll_delays,
     SessionBreakManager,
 )
+from seo_intelligence.scrapers.directory_adapters import (
+    get_adapter,
+    parse_directory_page,
+    DirectoryListing,
+    DIRECTORY_ADAPTERS,
+)
 
 # Load environment
 load_dotenv()
@@ -364,6 +370,10 @@ class CitationCrawler(BaseScraper):
         """
         Extract listing information from directory search results.
 
+        Uses directory-specific adapters for accurate structured parsing
+        instead of naive text matching. This eliminates false positives
+        and provides complete NAP + metadata extraction.
+
         Args:
             html: Page HTML
             directory: Directory key
@@ -371,6 +381,112 @@ class CitationCrawler(BaseScraper):
 
         Returns:
             CitationResult or None
+        """
+        dir_info = CITATION_DIRECTORIES.get(directory, {})
+
+        result = CitationResult(
+            directory=directory,
+            directory_url=dir_info.get("name", directory),
+        )
+
+        # Use directory adapter for structured parsing
+        try:
+            all_listings, best_match = parse_directory_page(
+                html=html,
+                directory=directory,
+                target_name=business.name,
+                target_phone=business.phone,
+                target_address=business.address,
+                target_city=business.city,
+                target_state=business.state,
+            )
+
+            # Log how many listings were found
+            if all_listings:
+                logger.debug(f"Found {len(all_listings)} listings on {directory}")
+            else:
+                logger.debug(f"No listings parsed from {directory}")
+
+            if best_match:
+                # We found a matching listing
+                result.is_listed = True
+                result.listing_url = best_match.profile_url or best_match.listing_url
+
+                # Get match details from adapter
+                match_score = best_match.raw_data.get("match_score", 0.0)
+                field_matches = best_match.raw_data.get("field_matches", {})
+
+                result.name_match = field_matches.get("name", False)
+                result.address_match = field_matches.get("address", False)
+                result.phone_match = field_matches.get("phone", False)
+                result.nap_score = match_score
+
+                # Copy review info from parsed listing
+                if best_match.rating is not None:
+                    result.rating = best_match.rating
+                    result.has_reviews = True
+                if best_match.review_count > 0:
+                    result.review_count = best_match.review_count
+                    result.has_reviews = True
+
+                # Store rich metadata from structured parsing
+                result.metadata = {
+                    "parsed_name": best_match.name,
+                    "parsed_phone": best_match.phone,
+                    "parsed_address": best_match.address,
+                    "parsed_city": best_match.city,
+                    "parsed_state": best_match.state,
+                    "parsed_zip": best_match.zip_code,
+                    "parsed_website": best_match.website,
+                    "categories": best_match.categories,
+                    "is_claimed": best_match.is_claimed,
+                    "is_sponsored": best_match.is_sponsored,
+                    "completeness_score": best_match.completeness_score,
+                    "confidence": best_match.confidence,
+                    "total_listings_found": len(all_listings),
+                    "adapter_used": directory,
+                }
+
+                logger.debug(
+                    f"Match found on {directory}: '{best_match.name}' "
+                    f"(score={match_score:.2f}, name={result.name_match}, "
+                    f"phone={result.phone_match}, addr={result.address_match})"
+                )
+
+            else:
+                # No match found - may still have listings but none match
+                result.is_listed = False
+                result.metadata = {
+                    "total_listings_found": len(all_listings),
+                    "adapter_used": directory,
+                    "no_match_reason": "no_matching_listing" if all_listings else "no_listings_found",
+                }
+
+        except Exception as e:
+            logger.warning(f"Adapter parsing failed for {directory}, falling back to generic: {e}")
+            # Fall back to basic detection if adapter fails
+            result = self._extract_listing_info_fallback(html, directory, business)
+
+        return result
+
+    def _extract_listing_info_fallback(
+        self,
+        html: str,
+        directory: str,
+        business: BusinessInfo,
+    ) -> CitationResult:
+        """
+        Fallback extraction using basic text matching.
+
+        Used when directory adapter parsing fails.
+
+        Args:
+            html: Page HTML
+            directory: Directory key
+            business: Expected business info
+
+        Returns:
+            CitationResult with basic detection
         """
         from bs4 import BeautifulSoup
 
@@ -449,6 +565,8 @@ class CitationCrawler(BaseScraper):
                     except ValueError:
                         pass
                     break
+
+            result.metadata["fallback_used"] = True
 
         return result
 

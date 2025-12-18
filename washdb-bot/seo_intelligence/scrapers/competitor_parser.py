@@ -340,7 +340,7 @@ class CompetitorParser:
             })
         signals['tel_link_count'] = len(tel_links)
 
-        # Detect forms
+        # Detect forms with detailed field analysis
         forms = soup.find_all('form')
         for form in forms:
             form_data = {
@@ -368,6 +368,149 @@ class CompetitorParser:
                 form_data['type'] = 'newsletter'
             else:
                 form_data['type'] = 'other'
+
+            # ============ EXPANDED FORM FIELD ANALYSIS ============
+            # Analyze individual form fields
+            fields_analysis = {
+                'total_fields': 0,
+                'required_fields': 0,
+                'field_types': [],
+                'has_name_field': False,
+                'has_email_field': False,
+                'has_phone_field': False,
+                'has_message_field': False,
+                'has_address_field': False,
+                'has_service_selector': False,
+                'has_date_picker': False,
+                'has_file_upload': False,
+                'has_captcha': False,
+                'validation_patterns': [],
+            }
+
+            # Field type classification patterns
+            name_patterns = ['name', 'full-name', 'fullname', 'your-name', 'customer-name']
+            email_patterns = ['email', 'e-mail', 'mail', 'your-email']
+            phone_patterns = ['phone', 'tel', 'telephone', 'mobile', 'cell', 'number']
+            message_patterns = ['message', 'comment', 'inquiry', 'question', 'details', 'description']
+            address_patterns = ['address', 'street', 'city', 'state', 'zip', 'postal', 'location']
+            service_patterns = ['service', 'services', 'type', 'project', 'work-type']
+            date_patterns = ['date', 'time', 'schedule', 'appointment', 'when', 'day']
+
+            # Analyze each input/textarea/select
+            for input_elem in form.find_all(['input', 'textarea', 'select']):
+                fields_analysis['total_fields'] += 1
+
+                # Get field identifiers
+                input_name = input_elem.get('name', '').lower()
+                input_id = input_elem.get('id', '').lower()
+                input_type = input_elem.get('type', 'text').lower()
+                input_placeholder = input_elem.get('placeholder', '').lower()
+                input_class = ' '.join(input_elem.get('class', [])).lower()
+                is_required = input_elem.get('required') is not None or 'required' in input_class
+
+                # Combine for pattern matching
+                field_indicators = f"{input_name} {input_id} {input_placeholder} {input_class}"
+
+                if is_required:
+                    fields_analysis['required_fields'] += 1
+
+                # Detect field types
+                field_type = 'other'
+
+                # Check input type first
+                if input_type == 'email':
+                    field_type = 'email'
+                    fields_analysis['has_email_field'] = True
+                elif input_type == 'tel':
+                    field_type = 'phone'
+                    fields_analysis['has_phone_field'] = True
+                elif input_type == 'file':
+                    field_type = 'file'
+                    fields_analysis['has_file_upload'] = True
+                elif input_type in ['date', 'datetime-local', 'time']:
+                    field_type = 'date'
+                    fields_analysis['has_date_picker'] = True
+                elif input_type == 'hidden':
+                    field_type = 'hidden'
+                elif input_type in ['submit', 'button', 'reset']:
+                    continue  # Skip submit buttons
+                else:
+                    # Pattern-based detection
+                    if any(p in field_indicators for p in name_patterns):
+                        field_type = 'name'
+                        fields_analysis['has_name_field'] = True
+                    elif any(p in field_indicators for p in email_patterns):
+                        field_type = 'email'
+                        fields_analysis['has_email_field'] = True
+                    elif any(p in field_indicators for p in phone_patterns):
+                        field_type = 'phone'
+                        fields_analysis['has_phone_field'] = True
+                    elif any(p in field_indicators for p in message_patterns) or input_elem.name == 'textarea':
+                        field_type = 'message'
+                        fields_analysis['has_message_field'] = True
+                    elif any(p in field_indicators for p in address_patterns):
+                        field_type = 'address'
+                        fields_analysis['has_address_field'] = True
+                    elif any(p in field_indicators for p in service_patterns):
+                        field_type = 'service'
+                        fields_analysis['has_service_selector'] = True
+                    elif any(p in field_indicators for p in date_patterns):
+                        field_type = 'date'
+                        fields_analysis['has_date_picker'] = True
+
+                # Track validation patterns
+                if input_elem.get('pattern'):
+                    fields_analysis['validation_patterns'].append({
+                        'field': input_name or input_id or field_type,
+                        'pattern': input_elem.get('pattern')
+                    })
+
+                fields_analysis['field_types'].append({
+                    'name': input_name,
+                    'type': field_type,
+                    'html_type': input_type,
+                    'required': is_required
+                })
+
+            # Check for captcha
+            captcha_indicators = ['recaptcha', 'captcha', 'hcaptcha', 'turnstile', 'g-recaptcha']
+            form_html = str(form).lower()
+            if any(ind in form_html for ind in captcha_indicators):
+                fields_analysis['has_captcha'] = True
+
+            # Calculate form complexity score
+            complexity_score = 0
+            if fields_analysis['has_name_field']:
+                complexity_score += 10
+            if fields_analysis['has_email_field']:
+                complexity_score += 10
+            if fields_analysis['has_phone_field']:
+                complexity_score += 10
+            if fields_analysis['has_message_field']:
+                complexity_score += 15
+            if fields_analysis['has_service_selector']:
+                complexity_score += 15
+            if fields_analysis['has_date_picker']:
+                complexity_score += 10
+            if fields_analysis['has_address_field']:
+                complexity_score += 10
+            if fields_analysis['has_file_upload']:
+                complexity_score += 10
+            if fields_analysis['has_captcha']:
+                complexity_score += 5  # Adds friction but improves lead quality
+            complexity_score = min(100, complexity_score)
+
+            fields_analysis['complexity_score'] = complexity_score
+
+            # Determine if this is a high-quality lead form
+            # (has contact info + service/message)
+            is_lead_form = (
+                (fields_analysis['has_email_field'] or fields_analysis['has_phone_field']) and
+                (fields_analysis['has_name_field'] or fields_analysis['has_message_field'])
+            )
+            fields_analysis['is_lead_form'] = is_lead_form
+
+            form_data['fields'] = fields_analysis
 
             signals['forms'].append(form_data)
 

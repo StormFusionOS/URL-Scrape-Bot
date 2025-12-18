@@ -12,6 +12,11 @@ Features:
 - Broken link checking
 - Schema.org validation
 - Core Web Vitals estimation
+- HTTP Response Header Analysis:
+  - Cache-Control, ETag, Content-Encoding
+  - X-Robots-Tag, HSTS, Content-Security-Policy
+  - Redirect chain analysis
+  - Security headers audit
 
 Stores results in page_audits and audit_issues tables.
 """
@@ -130,23 +135,28 @@ class TechnicalAuditor(BaseScraper):
         self,
         headless: bool = True,  # Hybrid mode: starts headless, upgrades to headed on detection
         use_proxy: bool = False,  # Don't use proxy for own site audits
+        tier: str = "C",  # Tier C for external sites (moderate delays), D for own sites
     ):
         """
-        Initialize technical auditor.
+        Initialize technical auditor with stealth features.
 
         Args:
             headless: Run browser in headless mode
             use_proxy: Use proxy pool (typically False for own sites)
+            tier: Rate limiting tier (A=slowest/safest, D=fastest). Use C for external sites.
         """
         super().__init__(
             name="technical_auditor",
-            tier="D",  # Faster rate limits for own properties
+            tier=tier,  # Configurable tier - use C for external sites to avoid detection
             headless=headless,
             respect_robots=False,  # Can audit own sites regardless
             use_proxy=use_proxy,
             max_retries=2,
-            page_timeout=20000,  # Reduced from 45s to 20s
+            page_timeout=25000,  # Slightly longer timeout for external sites
         )
+
+        # Store tier for logging
+        self._tier = tier
 
         # Database connection
         database_url = os.getenv("DATABASE_URL")
@@ -156,7 +166,7 @@ class TechnicalAuditor(BaseScraper):
             self.engine = None
             logger.warning("DATABASE_URL not set - database storage disabled")
 
-        logger.info("TechnicalAuditor initialized (tier=D)")
+        logger.info(f"TechnicalAuditor initialized (tier={tier}, stealth features enabled via BaseScraper)")
 
     def _http_fallback_audit(self, url: str) -> Optional[Tuple[str, Dict[str, Any], List[AuditIssue]]]:
         """
@@ -254,6 +264,363 @@ class TechnicalAuditor(BaseScraper):
                 description="Site not using HTTPS",
                 recommendation="Install SSL certificate and redirect HTTP to HTTPS"
             ))
+
+        return issues, metrics
+
+    def _check_response_headers(
+        self,
+        url: str,
+        timeout: int = 15,
+    ) -> Tuple[List[AuditIssue], Dict[str, Any]]:
+        """
+        Check HTTP response headers for SEO and security best practices.
+
+        Analyzes:
+        - Cache-Control, ETag, Content-Encoding (performance)
+        - X-Robots-Tag (SEO directives)
+        - HSTS, CSP, X-Frame-Options (security)
+        - Redirect chains (performance/SEO)
+
+        Args:
+            url: URL to check
+            timeout: Request timeout in seconds
+
+        Returns:
+            Tuple of (issues, metrics) with header analysis
+        """
+        issues = []
+        metrics = {
+            "headers_checked": True,
+            "headers": {},
+        }
+
+        try:
+            # Make request with redirects tracked
+            response = requests.get(
+                url,
+                timeout=timeout,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                },
+                allow_redirects=True,
+                verify=True,
+            )
+
+            headers = response.headers
+            metrics["final_status_code"] = response.status_code
+
+            # ============================================
+            # 1. REDIRECT CHAIN ANALYSIS
+            # ============================================
+            redirect_chain = []
+            for resp in response.history:
+                redirect_chain.append({
+                    "url": resp.url,
+                    "status": resp.status_code,
+                    "location": resp.headers.get("Location", ""),
+                })
+
+            metrics["redirect_count"] = len(redirect_chain)
+            metrics["redirect_chain"] = redirect_chain
+
+            if len(redirect_chain) > 2:
+                issues.append(AuditIssue(
+                    category=IssueCategory.PERFORMANCE.value,
+                    severity=IssueSeverity.MEDIUM.value,
+                    issue_type="long_redirect_chain",
+                    description=f"Long redirect chain ({len(redirect_chain)} hops)",
+                    affected_element=" -> ".join(r["url"][:50] for r in redirect_chain[:3]),
+                    recommendation="Minimize redirect chains to 1-2 hops maximum",
+                    metadata={"redirect_count": len(redirect_chain)}
+                ))
+            elif len(redirect_chain) == 0:
+                metrics["no_redirects"] = True
+
+            # Check for HTTP->HTTPS redirect
+            if redirect_chain:
+                first_url = redirect_chain[0]["url"]
+                if first_url.startswith("http://") and response.url.startswith("https://"):
+                    metrics["http_to_https_redirect"] = True
+
+            # ============================================
+            # 2. CACHE-CONTROL ANALYSIS
+            # ============================================
+            cache_control = headers.get("Cache-Control", "")
+            metrics["headers"]["cache_control"] = cache_control
+
+            if cache_control:
+                # Parse directives
+                directives = [d.strip().lower() for d in cache_control.split(",")]
+                metrics["cache_directives"] = directives
+
+                # Check for no-cache/no-store on cacheable pages
+                if "no-store" in directives or "no-cache" in directives:
+                    issues.append(AuditIssue(
+                        category=IssueCategory.PERFORMANCE.value,
+                        severity=IssueSeverity.LOW.value,
+                        issue_type="no_cache_header",
+                        description="Cache-Control prevents caching (no-store/no-cache)",
+                        affected_element=cache_control[:100],
+                        recommendation="Enable caching for static resources to improve performance",
+                        metadata={"cache_control": cache_control}
+                    ))
+
+                # Check max-age
+                for directive in directives:
+                    if directive.startswith("max-age="):
+                        try:
+                            max_age = int(directive.split("=")[1])
+                            metrics["cache_max_age_seconds"] = max_age
+                            if max_age < 3600:  # Less than 1 hour
+                                issues.append(AuditIssue(
+                                    category=IssueCategory.PERFORMANCE.value,
+                                    severity=IssueSeverity.INFO.value,
+                                    issue_type="short_cache_duration",
+                                    description=f"Short cache duration ({max_age}s)",
+                                    recommendation="Consider longer cache durations for static content",
+                                ))
+                        except ValueError:
+                            pass
+            else:
+                # No cache-control header
+                issues.append(AuditIssue(
+                    category=IssueCategory.PERFORMANCE.value,
+                    severity=IssueSeverity.LOW.value,
+                    issue_type="missing_cache_control",
+                    description="Missing Cache-Control header",
+                    recommendation="Add Cache-Control header to optimize repeat visits",
+                ))
+
+            # ============================================
+            # 3. ETAG ANALYSIS
+            # ============================================
+            etag = headers.get("ETag", "")
+            metrics["headers"]["etag"] = etag if etag else None
+            metrics["has_etag"] = bool(etag)
+
+            # ============================================
+            # 4. CONTENT-ENCODING (COMPRESSION)
+            # ============================================
+            content_encoding = headers.get("Content-Encoding", "")
+            metrics["headers"]["content_encoding"] = content_encoding if content_encoding else None
+
+            if content_encoding:
+                metrics["compression_enabled"] = True
+                metrics["compression_type"] = content_encoding
+            else:
+                # Check content type - only flag for text-based content
+                content_type = headers.get("Content-Type", "")
+                if any(t in content_type.lower() for t in ["text/html", "text/css", "text/javascript", "application/javascript", "application/json"]):
+                    issues.append(AuditIssue(
+                        category=IssueCategory.PERFORMANCE.value,
+                        severity=IssueSeverity.MEDIUM.value,
+                        issue_type="missing_compression",
+                        description="No compression enabled (gzip/br)",
+                        affected_element=f"Content-Type: {content_type[:50]}",
+                        recommendation="Enable gzip or Brotli compression to reduce transfer size",
+                    ))
+
+            # ============================================
+            # 5. X-ROBOTS-TAG (SEO)
+            # ============================================
+            x_robots = headers.get("X-Robots-Tag", "")
+            metrics["headers"]["x_robots_tag"] = x_robots if x_robots else None
+
+            if x_robots:
+                x_robots_lower = x_robots.lower()
+                metrics["x_robots_directives"] = x_robots
+
+                # Check for blocking directives
+                if "noindex" in x_robots_lower:
+                    issues.append(AuditIssue(
+                        category=IssueCategory.SEO.value,
+                        severity=IssueSeverity.HIGH.value,
+                        issue_type="x_robots_noindex",
+                        description="X-Robots-Tag: noindex blocks indexing",
+                        affected_element=x_robots,
+                        recommendation="Remove noindex from X-Robots-Tag if page should be indexed",
+                        metadata={"x_robots_tag": x_robots}
+                    ))
+
+                if "nofollow" in x_robots_lower:
+                    issues.append(AuditIssue(
+                        category=IssueCategory.SEO.value,
+                        severity=IssueSeverity.MEDIUM.value,
+                        issue_type="x_robots_nofollow",
+                        description="X-Robots-Tag: nofollow prevents link following",
+                        affected_element=x_robots,
+                        recommendation="Remove nofollow if links should pass PageRank",
+                    ))
+
+                if "none" in x_robots_lower:
+                    issues.append(AuditIssue(
+                        category=IssueCategory.SEO.value,
+                        severity=IssueSeverity.CRITICAL.value,
+                        issue_type="x_robots_none",
+                        description="X-Robots-Tag: none blocks all crawling",
+                        affected_element=x_robots,
+                        recommendation="Remove 'none' directive to allow indexing and crawling",
+                    ))
+
+            # ============================================
+            # 6. HSTS (HTTP Strict Transport Security)
+            # ============================================
+            hsts = headers.get("Strict-Transport-Security", "")
+            metrics["headers"]["hsts"] = hsts if hsts else None
+
+            if response.url.startswith("https://"):
+                if hsts:
+                    metrics["hsts_enabled"] = True
+                    # Parse max-age
+                    if "max-age=" in hsts.lower():
+                        try:
+                            max_age_match = re.search(r'max-age=(\d+)', hsts, re.IGNORECASE)
+                            if max_age_match:
+                                hsts_max_age = int(max_age_match.group(1))
+                                metrics["hsts_max_age"] = hsts_max_age
+                                # Recommended: at least 1 year (31536000)
+                                if hsts_max_age < 31536000:
+                                    issues.append(AuditIssue(
+                                        category=IssueCategory.SECURITY.value,
+                                        severity=IssueSeverity.LOW.value,
+                                        issue_type="hsts_short_duration",
+                                        description=f"HSTS max-age is short ({hsts_max_age}s)",
+                                        recommendation="Set HSTS max-age to at least 31536000 (1 year)",
+                                    ))
+                        except ValueError:
+                            pass
+
+                    # Check for includeSubDomains and preload
+                    metrics["hsts_include_subdomains"] = "includesubdomains" in hsts.lower()
+                    metrics["hsts_preload"] = "preload" in hsts.lower()
+                else:
+                    issues.append(AuditIssue(
+                        category=IssueCategory.SECURITY.value,
+                        severity=IssueSeverity.MEDIUM.value,
+                        issue_type="missing_hsts",
+                        description="Missing HSTS header on HTTPS site",
+                        recommendation="Add Strict-Transport-Security header to enforce HTTPS",
+                    ))
+
+            # ============================================
+            # 7. CONTENT-SECURITY-POLICY (CSP)
+            # ============================================
+            csp = headers.get("Content-Security-Policy", "")
+            csp_report = headers.get("Content-Security-Policy-Report-Only", "")
+            metrics["headers"]["csp"] = csp if csp else None
+            metrics["headers"]["csp_report_only"] = csp_report if csp_report else None
+
+            if csp or csp_report:
+                metrics["csp_enabled"] = True
+            else:
+                issues.append(AuditIssue(
+                    category=IssueCategory.SECURITY.value,
+                    severity=IssueSeverity.LOW.value,
+                    issue_type="missing_csp",
+                    description="Missing Content-Security-Policy header",
+                    recommendation="Add CSP header to prevent XSS and injection attacks",
+                ))
+
+            # ============================================
+            # 8. X-FRAME-OPTIONS
+            # ============================================
+            x_frame = headers.get("X-Frame-Options", "")
+            metrics["headers"]["x_frame_options"] = x_frame if x_frame else None
+
+            if x_frame:
+                metrics["clickjacking_protection"] = True
+            else:
+                # CSP frame-ancestors can also provide this protection
+                if not (csp and "frame-ancestors" in csp.lower()):
+                    issues.append(AuditIssue(
+                        category=IssueCategory.SECURITY.value,
+                        severity=IssueSeverity.LOW.value,
+                        issue_type="missing_x_frame_options",
+                        description="Missing X-Frame-Options header",
+                        recommendation="Add X-Frame-Options: DENY or SAMEORIGIN to prevent clickjacking",
+                    ))
+
+            # ============================================
+            # 9. X-CONTENT-TYPE-OPTIONS
+            # ============================================
+            x_content_type = headers.get("X-Content-Type-Options", "")
+            metrics["headers"]["x_content_type_options"] = x_content_type if x_content_type else None
+
+            if x_content_type and "nosniff" in x_content_type.lower():
+                metrics["mime_sniffing_protection"] = True
+            else:
+                issues.append(AuditIssue(
+                    category=IssueCategory.SECURITY.value,
+                    severity=IssueSeverity.LOW.value,
+                    issue_type="missing_x_content_type_options",
+                    description="Missing X-Content-Type-Options: nosniff",
+                    recommendation="Add X-Content-Type-Options: nosniff to prevent MIME sniffing",
+                ))
+
+            # ============================================
+            # 10. REFERRER-POLICY
+            # ============================================
+            referrer_policy = headers.get("Referrer-Policy", "")
+            metrics["headers"]["referrer_policy"] = referrer_policy if referrer_policy else None
+
+            # ============================================
+            # 11. PERMISSIONS-POLICY (formerly Feature-Policy)
+            # ============================================
+            permissions_policy = headers.get("Permissions-Policy", "")
+            feature_policy = headers.get("Feature-Policy", "")
+            metrics["headers"]["permissions_policy"] = permissions_policy if permissions_policy else None
+            metrics["headers"]["feature_policy"] = feature_policy if feature_policy else None
+
+            # ============================================
+            # 12. SERVER HEADER (info leak check)
+            # ============================================
+            server_header = headers.get("Server", "")
+            metrics["headers"]["server"] = server_header if server_header else None
+
+            if server_header:
+                # Check for version disclosure
+                version_pattern = re.search(r'[\d]+\.[\d]+', server_header)
+                if version_pattern:
+                    issues.append(AuditIssue(
+                        category=IssueCategory.SECURITY.value,
+                        severity=IssueSeverity.INFO.value,
+                        issue_type="server_version_disclosure",
+                        description=f"Server header reveals version: {server_header}",
+                        recommendation="Consider hiding server version information",
+                    ))
+
+            # ============================================
+            # SUMMARY METRICS
+            # ============================================
+            # Count security headers present
+            security_headers = [
+                bool(hsts),
+                bool(csp) or bool(csp_report),
+                bool(x_frame),
+                bool(x_content_type and "nosniff" in x_content_type.lower()),
+                bool(referrer_policy),
+            ]
+            metrics["security_headers_count"] = sum(security_headers)
+            metrics["security_headers_max"] = len(security_headers)
+            metrics["security_score_headers"] = round(sum(security_headers) / len(security_headers) * 100)
+
+            logger.debug(
+                f"Header analysis for {url}: "
+                f"redirects={len(redirect_chain)}, "
+                f"cache={bool(cache_control)}, "
+                f"compression={bool(content_encoding)}, "
+                f"security={metrics['security_headers_count']}/{metrics['security_headers_max']}"
+            )
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"Header check timeout for {url}")
+            metrics["headers_error"] = "timeout"
+        except requests.exceptions.SSLError as e:
+            logger.warning(f"SSL error checking headers for {url}: {e}")
+            metrics["headers_error"] = "ssl_error"
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Error checking headers for {url}: {e}")
+            metrics["headers_error"] = str(e)[:100]
 
         return issues, metrics
 
@@ -1031,6 +1398,17 @@ class TechnicalAuditor(BaseScraper):
             if not ssl_issues:
                 passed_checks.append("SSL/HTTPS configured")
 
+            # HTTP Response Headers check (cache, compression, security headers)
+            header_issues, header_metrics = self._check_response_headers(url)
+            all_issues.extend(header_issues)
+            all_metrics.update(header_metrics)
+            if header_metrics.get("compression_enabled"):
+                passed_checks.append("Compression enabled")
+            if header_metrics.get("hsts_enabled"):
+                passed_checks.append("HSTS configured")
+            if header_metrics.get("security_headers_count", 0) >= 4:
+                passed_checks.append("Security headers configured")
+
             # Fetch page - try Playwright first, fall back to HTTP if in asyncio loop
             html = None
             page = None
@@ -1278,12 +1656,18 @@ def main():
         logger.info("")
         logger.info("Checks performed:")
         logger.info("  - SSL/HTTPS configuration")
+        logger.info("  - HTTP Response Headers:")
+        logger.info("    - Cache-Control, ETag, Content-Encoding")
+        logger.info("    - X-Robots-Tag (SEO directives)")
+        logger.info("    - HSTS, CSP, X-Frame-Options (security)")
+        logger.info("    - Redirect chain analysis")
         logger.info("  - Meta tags (title, description, canonical)")
         logger.info("  - Heading structure (H1, H2)")
         logger.info("  - Image optimization (alt text)")
         logger.info("  - Link analysis")
         logger.info("  - Schema.org markup")
         logger.info("  - Performance indicators")
+        logger.info("  - Core Web Vitals (LCP, CLS, INP)")
         logger.info("")
         logger.info("Example usage:")
         logger.info("  python technical_auditor.py 'https://example.com'")

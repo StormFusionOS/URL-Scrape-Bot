@@ -153,11 +153,23 @@ def _get_proxy_string() -> Optional[str]:
         return None
 
 
+# Mobile device configuration (iPhone X)
+MOBILE_VIEWPORT = {
+    "width": 375,
+    "height": 812,
+}
+MOBILE_USER_AGENT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+)
+
+
 def get_uc_driver(
     headless: bool = DEFAULT_HEADLESS,
     use_proxy: bool = True,
     locale: str = "en",
     use_virtual_display: bool = True,
+    mobile_mode: bool = False,
     **kwargs  # Accept extra args for compatibility with get_driver_for_site
 ) -> Optional[Driver]:
     """
@@ -168,6 +180,7 @@ def get_uc_driver(
         use_proxy: Whether to use proxy from ProxyManager
         locale: Browser locale
         use_virtual_display: Use Xvfb virtual display for headed mode (no visible window)
+        mobile_mode: Emulate mobile device (iPhone X viewport and user agent)
         **kwargs: Additional arguments (ignored, for compatibility)
 
     Returns:
@@ -180,21 +193,45 @@ def get_uc_driver(
 
         proxy = _get_proxy_string() if use_proxy else None
 
+        # Build driver options
+        driver_kwargs = {
+            "uc": True,
+            "headless": headless,
+            "locale_code": locale,
+        }
+
         if proxy:
-            driver = Driver(
-                uc=True,
-                headless=headless,
-                proxy=proxy,
-                locale_code=locale
-            )
-            logger.debug(f"Created UC driver with proxy")
-        else:
-            driver = Driver(
-                uc=True,
-                headless=headless,
-                locale_code=locale
-            )
-            logger.debug("Created UC driver without proxy")
+            driver_kwargs["proxy"] = proxy
+
+        # Apply mobile mode settings
+        if mobile_mode:
+            driver_kwargs["agent"] = MOBILE_USER_AGENT
+            logger.debug("Mobile mode enabled - using iPhone X user agent")
+
+        driver = Driver(**driver_kwargs)
+
+        # Set mobile viewport after driver creation
+        if mobile_mode:
+            try:
+                driver.set_window_size(
+                    MOBILE_VIEWPORT["width"],
+                    MOBILE_VIEWPORT["height"]
+                )
+                # Enable touch emulation via CDP
+                driver.execute_cdp_cmd(
+                    "Emulation.setTouchEmulationEnabled",
+                    {"enabled": True, "maxTouchPoints": 5}
+                )
+                logger.debug(f"Mobile viewport set: {MOBILE_VIEWPORT['width']}x{MOBILE_VIEWPORT['height']}")
+            except Exception as e:
+                logger.warning(f"Could not set mobile viewport: {e}")
+
+        log_msg = "Created UC driver"
+        if proxy:
+            log_msg += " with proxy"
+        if mobile_mode:
+            log_msg += " (mobile mode)"
+        logger.debug(log_msg)
 
         return driver
 
@@ -805,6 +842,7 @@ def get_driver_for_site(
     site: str,
     headless: bool = DEFAULT_HEADLESS,
     use_proxy: bool = True,
+    mobile_mode: bool = False,
     **kwargs
 ) -> Optional[Driver]:
     """
@@ -814,6 +852,7 @@ def get_driver_for_site(
         site: Site name (google, yelp, bbb, yellowpages, gbp, etc.)
         headless: Run in headless mode
         use_proxy: Whether to use proxy
+        mobile_mode: Emulate mobile device (iPhone X viewport and user agent)
         **kwargs: Additional arguments for driver factory
 
     Returns:
@@ -821,4 +860,9 @@ def get_driver_for_site(
     """
     site_lower = site.lower()
     factory = DRIVER_FACTORY.get(site_lower, get_uc_driver)
+
+    # Only pass mobile_mode to get_uc_driver (generic driver) - site-specific drivers don't support it
+    if factory == get_uc_driver:
+        kwargs['mobile_mode'] = mobile_mode
+
     return factory(headless=headless, use_proxy=use_proxy, **kwargs)

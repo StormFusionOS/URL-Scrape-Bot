@@ -28,6 +28,8 @@ This module contains core services:
 - engagement_analyzer: Page engagement metrics and UX signals
 - traffic_estimator: CTR-based organic traffic estimation
 - ranking_trends: Position change tracking and alerts
+- recommendations_engine: Prioritized SEO recommendations from audit data
+- backlink_history_tracker: Historical backlink tracking with diff detection
 
 All services support ethical scraping with rate limiting and robots.txt compliance.
 """
@@ -146,6 +148,27 @@ from .serp_priority_queue import (
     Priority,
     get_serp_priority_queue
 )
+from .recommendations_engine import (
+    RecommendationsEngine,
+    SEORecommendation,
+    RecommendationCategory,
+    EffortLevel,
+    ImpactLevel,
+    generate_recommendations_from_audit,
+)
+from .backlink_history_tracker import (
+    BacklinkHistoryTracker,
+    BacklinkSnapshot,
+    BacklinkDiff,
+    LinkChange,
+    LinkChangeType,
+    get_backlink_history_tracker,
+)
+from .google_coordinator import (
+    GoogleCoordinator,
+    get_google_coordinator,
+    reset_google_coordinator,
+)
 
 __all__ = [
     "TaskLogger",
@@ -257,4 +280,22 @@ __all__ = [
     "QueuedCompany",
     "Priority",
     "get_serp_priority_queue",
+    # Phase 6: SEO Recommendations Engine
+    "RecommendationsEngine",
+    "SEORecommendation",
+    "RecommendationCategory",
+    "EffortLevel",
+    "ImpactLevel",
+    "generate_recommendations_from_audit",
+    # Phase 7: Backlink History Tracking
+    "BacklinkHistoryTracker",
+    "BacklinkSnapshot",
+    "BacklinkDiff",
+    "LinkChange",
+    "LinkChangeType",
+    "get_backlink_history_tracker",
+    # Phase 8: Google Request Coordination
+    "GoogleCoordinator",
+    "get_google_coordinator",
+    "reset_google_coordinator",
 ]

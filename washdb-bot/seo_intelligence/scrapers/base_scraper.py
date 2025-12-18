@@ -35,6 +35,12 @@ from seo_intelligence.services import (
     get_domain_quarantine,
     get_browser_profile_manager,
 )
+from seo_intelligence.models.artifacts import (
+    PageArtifact,
+    ScrapeQualityProfile,
+    ArtifactStorage,
+    DEFAULT_QUALITY_PROFILE,
+)
 from runner.logging_setup import get_logger
 
 
@@ -1699,6 +1705,301 @@ class BaseScraper(ABC):
         self.browser_profile_manager.record_failure(domain, self._current_headed_mode, "MAX_RETRIES_EXCEEDED")
         self.logger.error(f"Failed to fetch {url} after {self.max_retries} attempts")
         return None
+
+    def fetch_page_with_artifact(
+        self,
+        url: str,
+        page: Page,
+        quality_profile: Optional[ScrapeQualityProfile] = None,
+        save_artifact: bool = False,
+    ) -> Optional[PageArtifact]:
+        """
+        Fetch a page and return a full PageArtifact with all captured data.
+
+        This is the enhanced version of fetch_page that captures raw artifacts
+        (HTML, screenshots, headers, etc.) for later re-parsing and debugging.
+
+        Args:
+            url: URL to fetch
+            page: Playwright Page object
+            quality_profile: Quality settings (defaults to DEFAULT_QUALITY_PROFILE)
+            save_artifact: If True, automatically save artifact to disk
+
+        Returns:
+            PageArtifact: Full artifact with all captured data, or None if failed
+        """
+        from datetime import datetime, timezone
+
+        domain = urlparse(url).netloc
+        profile = quality_profile or DEFAULT_QUALITY_PROFILE
+        start_time = time.time()
+
+        # Check if domain is quarantined
+        if self.domain_quarantine.is_quarantined(domain):
+            quarantine_end = self.domain_quarantine.get_quarantine_end(domain)
+            self.logger.warning(
+                f"Domain {domain} is quarantined until {quarantine_end}, skipping"
+            )
+            self.stats["pages_skipped"] += 1
+            return None
+
+        # Check robots.txt
+        if not self._check_robots(url):
+            self.stats["pages_skipped"] += 1
+            return None
+
+        # Check for honeypot URL patterns
+        if self._avoid_honeypot_patterns(url):
+            self.logger.warning(f"Skipping honeypot URL: {url}")
+            self.stats["pages_skipped"] += 1
+            return None
+
+        # Initialize artifact
+        artifact = PageArtifact(
+            url=url,
+            final_url=url,
+            engine="playwright",
+            user_agent=self.ua_rotator.get_random(),
+            viewport=page.viewport_size,
+            quality_profile=profile.to_dict(),
+        )
+
+        # Collect console messages if enabled
+        console_errors = []
+        console_warnings = []
+
+        if profile.capture_console:
+            def handle_console(msg):
+                if msg.type == 'error':
+                    console_errors.append(msg.text)
+                elif msg.type == 'warning':
+                    console_warnings.append(msg.text)
+
+            page.on("console", handle_console)
+
+        # Fetch with retries
+        for attempt in range(self.max_retries):
+            # Apply exponential backoff
+            retry_attempt = self.domain_quarantine.get_retry_attempt(domain)
+            backoff_delay = self.domain_quarantine.get_backoff_delay(retry_attempt)
+
+            if backoff_delay > 0:
+                self.logger.info(f"Exponential backoff for {domain}: waiting {backoff_delay}s")
+                time.sleep(backoff_delay)
+
+            try:
+                self.logger.debug(f"Fetching {url} (attempt {attempt + 1}/{self.max_retries})")
+
+                # Navigate with configured wait strategy
+                response = page.goto(
+                    url,
+                    wait_until=profile.wait_strategy,
+                    timeout=profile.navigation_timeout
+                )
+
+                if response is None:
+                    self.logger.warning(f"No response from {url}")
+                    continue
+
+                # Capture response info
+                artifact.final_url = page.url
+                artifact.status_code = response.status
+                artifact.response_headers = dict(response.headers)
+
+                # Handle HTTP errors (same as fetch_page)
+                if response.status >= 400:
+                    self.logger.warning(f"HTTP {response.status} from {url}")
+
+                    if response.status == 403:
+                        self.domain_quarantine.quarantine_domain(
+                            domain=domain,
+                            reason="403_FORBIDDEN",
+                            metadata={"url": url}
+                        )
+                        self.browser_profile_manager.record_detection(domain, "403_FORBIDDEN")
+                        self.stats["pages_failed"] += 1
+                        artifact.detected_login_wall = True
+                        return artifact  # Return partial artifact
+
+                    if response.status == 429:
+                        self.domain_quarantine.record_error_event(domain, "429")
+                        retry_after = response.headers.get('retry-after')
+                        wait_time = int(retry_after) if retry_after and retry_after.isdigit() else self._get_random_delay() * 2
+                        time.sleep(wait_time)
+                        continue
+
+                    if response.status >= 500:
+                        self.domain_quarantine.record_error_event(domain, f"{response.status}")
+                        continue
+
+                    self.stats["pages_failed"] += 1
+                    return artifact
+
+                # Extra wait if configured
+                if profile.extra_wait_seconds > 0:
+                    time.sleep(profile.extra_wait_seconds)
+
+                # Scroll page if configured
+                if profile.scroll_page:
+                    self._scroll_page_for_artifact(page, profile)
+
+                # Human behavior simulation
+                self._simulate_human_behavior(page, intensity="normal")
+
+                # Capture HTML
+                if profile.capture_html:
+                    artifact.html_raw = page.content()
+
+                # Capture screenshot if configured
+                if profile.capture_screenshot:
+                    try:
+                        screenshot_dir = f"data/artifacts/{domain.replace(':', '_')}/{datetime.now().strftime('%Y-%m-%d')}"
+                        os.makedirs(screenshot_dir, exist_ok=True)
+                        screenshot_path = f"{screenshot_dir}/{artifact.url_hash}_screenshot.png"
+                        page.screenshot(path=screenshot_path, full_page=True)
+                        artifact.screenshot_path = screenshot_path
+                        self.logger.debug(f"Screenshot saved: {screenshot_path}")
+                    except Exception as e:
+                        self.logger.warning(f"Screenshot failed: {e}")
+
+                # Capture console messages
+                if profile.capture_console:
+                    artifact.console_errors = console_errors
+                    artifact.console_warnings = console_warnings
+
+                # Validate HTML
+                content_type = response.headers.get('content-type')
+                is_valid, reason_code = self._validate_html_response(artifact.html_raw, url, content_type)
+
+                if not is_valid:
+                    self.logger.warning(f"HTML validation failed: {reason_code}")
+
+                    if reason_code == "CAPTCHA_DETECTED":
+                        artifact.detected_captcha = True
+                        self.domain_quarantine.quarantine_domain(domain, reason=reason_code, duration_minutes=60)
+                        self.browser_profile_manager.record_detection(domain, reason_code)
+                    elif reason_code == "BOT_DETECTED":
+                        artifact.detected_login_wall = True
+                        self.domain_quarantine.quarantine_domain(domain, reason=reason_code, duration_minutes=60)
+                        self.browser_profile_manager.record_detection(domain, reason_code)
+
+                    self.stats["pages_failed"] += 1
+                    return artifact
+
+                # Check for consent overlays
+                if self._detect_consent_overlay(page):
+                    artifact.detected_consent_overlay = True
+
+                # SUCCESS
+                self.domain_quarantine.reset_retry_attempts(domain)
+                self.browser_profile_manager.record_success(domain, self._current_headed_mode)
+                self.stats["pages_crawled"] += 1
+
+                # Calculate fetch duration
+                artifact.fetch_duration_ms = int((time.time() - start_time) * 1000)
+
+                self.logger.debug(
+                    f"Fetched {url} ({len(artifact.html_raw)} chars, "
+                    f"{artifact.fetch_duration_ms}ms)"
+                )
+
+                # Save artifact if requested
+                if save_artifact:
+                    storage = ArtifactStorage()
+                    artifact_dir = storage.save(artifact)
+                    self.logger.info(f"Artifact saved: {artifact_dir}")
+
+                # Add delay before next request
+                delay = self._get_random_delay()
+                time.sleep(delay)
+
+                return artifact
+
+            except PlaywrightTimeout as e:
+                self.logger.warning(f"Timeout fetching {url}: {e}")
+                if attempt < self.max_retries - 1:
+                    time.sleep(self._get_random_delay())
+                continue
+
+            except Exception as e:
+                self.logger.error(f"Error fetching {url}: {e}")
+                if attempt < self.max_retries - 1:
+                    time.sleep(self._get_random_delay())
+                continue
+
+        # All retries failed
+        self.stats["pages_failed"] += 1
+        self.browser_profile_manager.record_failure(domain, self._current_headed_mode, "MAX_RETRIES_EXCEEDED")
+        artifact.fetch_duration_ms = int((time.time() - start_time) * 1000)
+        return artifact
+
+    def _scroll_page_for_artifact(self, page: Page, profile: ScrapeQualityProfile):
+        """
+        Scroll the page to trigger lazy loading and capture full content.
+
+        Args:
+            page: Playwright Page object
+            profile: Quality profile with scroll settings
+        """
+        try:
+            viewport = page.viewport_size
+            viewport_height = viewport['height'] if viewport else 800
+
+            for step in range(profile.scroll_steps):
+                # Calculate scroll amount (roughly one viewport at a time)
+                scroll_amount = viewport_height * 0.8
+
+                # Scroll down
+                page.mouse.wheel(0, scroll_amount)
+
+                # Wait between scrolls
+                time.sleep(profile.scroll_delay)
+
+                # Occasional back-scroll (more human-like)
+                if step > 0 and random.random() < 0.2:
+                    page.mouse.wheel(0, -scroll_amount * 0.3)
+                    time.sleep(profile.scroll_delay * 0.5)
+
+            # Scroll back to top
+            page.evaluate("window.scrollTo(0, 0)")
+            time.sleep(0.5)
+
+        except Exception as e:
+            self.logger.debug(f"Scroll for artifact failed: {e}")
+
+    def _detect_consent_overlay(self, page: Page) -> bool:
+        """
+        Detect if a cookie consent or GDPR overlay is present.
+
+        Args:
+            page: Playwright Page object
+
+        Returns:
+            bool: True if consent overlay detected
+        """
+        try:
+            # Common consent overlay selectors
+            consent_selectors = [
+                '[class*="cookie-consent"]',
+                '[class*="gdpr"]',
+                '[class*="consent-banner"]',
+                '[id*="cookie-banner"]',
+                '[class*="cookie-notice"]',
+                '#onetrust-consent-sdk',
+                '.cc-banner',
+                '#CybotCookiebotDialog',
+            ]
+
+            for selector in consent_selectors:
+                elements = page.query_selector_all(selector)
+                for el in elements:
+                    if el.is_visible():
+                        return True
+
+            return False
+
+        except Exception:
+            return False
 
     def get_stats(self) -> Dict[str, int]:
         """Get scraper statistics."""

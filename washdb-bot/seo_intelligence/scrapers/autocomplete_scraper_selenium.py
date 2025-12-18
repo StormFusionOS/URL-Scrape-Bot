@@ -33,8 +33,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import quote_plus, urlparse
 
+from selenium.webdriver.common.keys import Keys
+
 from seo_intelligence.scrapers.base_selenium_scraper import BaseSeleniumScraper
-from seo_intelligence.services import get_task_logger
+from seo_intelligence.services import get_task_logger, get_google_coordinator
 from runner.logging_setup import get_logger
 
 
@@ -187,6 +189,7 @@ class AutocompleteScraperSelenium(BaseSeleniumScraper):
         query: str,
         driver=None,
         suggestion_type: str = "related",
+        use_coordinator: bool = True,
     ) -> List[AutocompleteSuggestion]:
         """
         Get autocomplete suggestions for a query.
@@ -195,6 +198,9 @@ class AutocompleteScraperSelenium(BaseSeleniumScraper):
             query: Search query
             driver: Optional Selenium driver (creates new session if not provided)
             suggestion_type: Type of suggestion for categorization
+            use_coordinator: If True, use GoogleCoordinator for rate limiting
+                           and SHARED browser session (recommended).
+                           If False, use direct scraping (standalone mode).
 
         Returns:
             list: AutocompleteSuggestion objects
@@ -210,19 +216,62 @@ class AutocompleteScraperSelenium(BaseSeleniumScraper):
             self.logger.debug(f"Query already scraped: {query}")
             return []
 
+        # If a driver is provided, use it directly (caller is managing coordination)
+        if driver:
+            suggestions = self._fetch_suggestions(driver, "", query, suggestion_type)
+            self._scraped_queries.add(query_hash)
+            self.keyword_stats["queries_made"] += 1
+            self.keyword_stats["suggestions_found"] += len(suggestions)
+            return suggestions
+
+        # Use GoogleCoordinator if enabled (for SHARED browser with other Google modules)
+        if use_coordinator:
+            try:
+                coordinator = get_google_coordinator()
+                # Use execute() which provides the SHARED browser (same as SERP)
+                suggestions = coordinator.execute(
+                    "autocomplete",
+                    lambda drv: self._fetch_suggestions(drv, "", query, suggestion_type),
+                    priority=5
+                )
+                if suggestions is None:
+                    suggestions = []
+                self._scraped_queries.add(query_hash)
+                self.keyword_stats["queries_made"] += 1
+                self.keyword_stats["suggestions_found"] += len(suggestions)
+                return suggestions
+            except Exception as e:
+                self.logger.warning(f"Coordinator failed, falling back to direct: {e}")
+
+        # Direct scraping (standalone mode or fallback)
+        return self._get_suggestions_direct(query, suggestion_type)
+
+    def _get_suggestions_direct(
+        self,
+        query: str,
+        suggestion_type: str = "related",
+    ) -> List[AutocompleteSuggestion]:
+        """
+        Direct scraping implementation without coordinator.
+
+        Args:
+            query: Search query
+            suggestion_type: Type of suggestion for categorization
+
+        Returns:
+            list: AutocompleteSuggestion objects
+        """
         suggestions = []
         url = self._build_autocomplete_url(query)
         domain = urlparse(url).netloc
 
-        # Use provided driver or create new session
-        if driver:
-            suggestions = self._fetch_suggestions(driver, url, query, suggestion_type)
-        else:
-            with self.browser_session(site_type="google_serp") as drv:
-                with self._rate_limit_and_concurrency(domain):
-                    suggestions = self._fetch_suggestions(drv, url, query, suggestion_type)
+        # Use site="google" for human-like search box interaction (same as SerpScraperSelenium)
+        with self.browser_session(site="google") as drv:
+            with self._rate_limit_and_concurrency(domain):
+                suggestions = self._fetch_suggestions(drv, url, query, suggestion_type)
 
-        # Mark query as scraped
+        # Update stats (only for direct calls, coordinator path handles this above)
+        query_hash = hashlib.md5(query.encode()).hexdigest()[:8]
         self._scraped_queries.add(query_hash)
         self.keyword_stats["queries_made"] += 1
         self.keyword_stats["suggestions_found"] += len(suggestions)
@@ -237,11 +286,17 @@ class AutocompleteScraperSelenium(BaseSeleniumScraper):
         suggestion_type: str,
     ) -> List[AutocompleteSuggestion]:
         """
-        Fetch suggestions using SeleniumBase driver.
+        Fetch suggestions using human-like Google search box interaction.
+
+        Uses the same technique as SerpScraperSelenium:
+        1. Navigate to Google homepage
+        2. Type query into search box with human-like delays
+        3. Wait for autocomplete dropdown to appear
+        4. Extract suggestions from the dropdown
 
         Args:
             driver: Selenium WebDriver
-            url: Autocomplete URL
+            url: Ignored - we go to Google homepage instead
             seed_query: Original query
             suggestion_type: Suggestion categorization
 
@@ -249,50 +304,66 @@ class AutocompleteScraperSelenium(BaseSeleniumScraper):
             list: Parsed suggestions
         """
         try:
-            # Navigate to the autocomplete endpoint
-            driver.get(url)
+            # Navigate to Google homepage (not the API endpoint)
+            driver.get("https://www.google.com")
+            time.sleep(random.uniform(1.0, 2.0))
 
-            # Wait a brief moment for content
-            time.sleep(random.uniform(0.3, 0.7))
-
-            # Get page source
-            content = driver.page_source
-
-            # Check for rate limiting (429 or captcha)
-            if "unusual traffic" in content.lower() or "captcha" in content.lower():
-                self.logger.warning("Rate limited by Google autocomplete")
+            # Check for rate limiting or captcha
+            content = driver.page_source.lower()
+            if "unusual traffic" in content or "captcha" in content:
+                self.logger.warning("Rate limited by Google - CAPTCHA detected")
                 self.keyword_stats["rate_limited"] += 1
-                # Add extra delay
                 time.sleep(random.uniform(30, 60))
                 return []
 
-            # Extract text between <pre> tags (Chrome JSON format)
-            pre_match = re.search(r'<pre[^>]*>(.*?)</pre>', content, re.DOTALL)
-            if pre_match:
-                json_text = pre_match.group(1)
-            else:
-                # Try getting body text
-                try:
-                    body = driver.find_element("tag name", "body")
-                    json_text = body.text
-                except Exception:
-                    json_text = content
+            # Find search input
+            search_input = None
+            input_selectors = [
+                'input[name="q"]',
+                'textarea[name="q"]',
+                'input[aria-label="Search"]',
+            ]
 
-            # Parse suggestions
-            raw_suggestions = self._parse_suggestions(json_text)
+            for selector in input_selectors:
+                try:
+                    search_input = self.wait_for_element(
+                        driver, selector, timeout=10, condition="clickable"
+                    )
+                    if search_input:
+                        break
+                except Exception:
+                    continue
+
+            if not search_input:
+                self.logger.warning("Could not find Google search input")
+                return []
+
+            # Click on search box with human-like behavior
+            self._human_click(driver, search_input)
+            time.sleep(random.uniform(0.3, 0.6))
+
+            # Clear and type query with human-like delays
+            search_input.clear()
+            self._human_type(driver, search_input, seed_query, clear_first=False)
+
+            # Wait for autocomplete dropdown to appear
+            time.sleep(random.uniform(0.8, 1.5))
+
+            # Extract suggestions from dropdown
+            raw_suggestions = self._extract_dropdown_suggestions(driver)
 
             # Convert to AutocompleteSuggestion objects
             suggestions = []
-            for i, suggestion in enumerate(raw_suggestions[:self.max_suggestions]):
+            for i, suggestion_text in enumerate(raw_suggestions[:self.max_suggestions]):
                 # Clean the suggestion
-                suggestion = suggestion.strip().lower()
+                suggestion_text = suggestion_text.strip().lower()
 
-                if suggestion and suggestion != seed_query:
+                if suggestion_text and suggestion_text != seed_query.lower():
                     # Calculate relevance score based on position
                     relevance = 1.0 - (i * 0.05)  # First = 1.0, decreases by 0.05
 
                     suggestions.append(AutocompleteSuggestion(
-                        keyword=suggestion,
+                        keyword=suggestion_text,
                         seed_keyword=seed_query,
                         source="google_autocomplete",
                         suggestion_type=suggestion_type,
@@ -310,6 +381,63 @@ class AutocompleteScraperSelenium(BaseSeleniumScraper):
         except Exception as e:
             self.logger.error(f"Error fetching suggestions for '{seed_query}': {e}")
             return []
+
+    def _extract_dropdown_suggestions(self, driver) -> List[str]:
+        """
+        Extract autocomplete suggestions from Google's dropdown.
+
+        Args:
+            driver: Selenium WebDriver
+
+        Returns:
+            list: Raw suggestion strings
+        """
+        suggestions = []
+
+        # Various selectors for Google autocomplete dropdown
+        dropdown_selectors = [
+            'div[role="listbox"] li',
+            'ul[role="listbox"] li',
+            'div.sbct',
+            'div.aajZCb div.lnnVSe',
+            'div.UUbT9 div.wM6W7d',
+            'div[jsname="bN97Pc"] li',
+            'div.erkvQe li',
+            'div.OBMEnb li',
+        ]
+
+        for selector in dropdown_selectors:
+            try:
+                elements = driver.find_elements("css selector", selector)
+                if elements:
+                    for elem in elements:
+                        try:
+                            text = elem.text.strip()
+                            if text and len(text) > 1:
+                                suggestions.append(text)
+                        except Exception:
+                            continue
+                    if suggestions:
+                        break
+            except Exception:
+                continue
+
+        # Fallback: try to get suggestions from aria-label or data attributes
+        if not suggestions:
+            try:
+                # Try getting elements with suggestion text
+                elements = driver.find_elements("css selector", "[role='option']")
+                for elem in elements:
+                    try:
+                        text = elem.text.strip() or elem.get_attribute("aria-label") or ""
+                        if text and len(text) > 1:
+                            suggestions.append(text)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        return suggestions
 
     def expand_keyword(
         self,
@@ -343,7 +471,8 @@ class AutocompleteScraperSelenium(BaseSeleniumScraper):
 
         self.logger.info(f"Expanding keyword: {seed_keyword}")
 
-        with self.browser_session(site_type="google_serp") as driver:
+        # Use site="google" for human-like search box interaction (same as SerpScraperSelenium)
+        with self.browser_session(site="google") as driver:
             # 1. Get base suggestions
             with self._rate_limit_and_concurrency(domain):
                 base_suggestions = self.get_suggestions(
@@ -419,7 +548,8 @@ class AutocompleteScraperSelenium(BaseSeleniumScraper):
         questions: Dict[str, AutocompleteSuggestion] = {}
         domain = "www.google.com"
 
-        with self.browser_session(site_type="google_serp") as driver:
+        # Use site="google" for human-like search box interaction (same as SerpScraperSelenium)
+        with self.browser_session(site="google") as driver:
             for prefix in self.QUESTION_PREFIXES:
                 query = f"{prefix} {keyword}"
 
