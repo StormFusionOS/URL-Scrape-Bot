@@ -1,0 +1,17 @@
+[Unit]
+Description=SEO Chrome Process Cleanup
+After=network.target
+
+[Service]
+Type=oneshot
+User=rivercityscrape
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+EnvironmentFile=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/.env
+Environment=DISPLAY=:99
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python scripts/seo_health_check.py --cleanup --quiet
+StandardOutput=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/chrome_cleanup.log
+StandardError=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/chrome_cleanup.log
+TimeoutSec=120
+
+[Install]
+WantedBy=multi-user.target
