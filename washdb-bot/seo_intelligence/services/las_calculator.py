@@ -187,7 +187,7 @@ class LASCalculator:
             if directory in citations:
                 citation = citations[directory]
                 is_present = citation[1]
-                nap_score = citation[2] or 0
+                nap_score = float(citation[2] or 0)
 
                 if is_present:
                     # Base points for presence
@@ -256,15 +256,15 @@ class LASCalculator:
                 text("""
                     SELECT
                         COUNT(DISTINCT b.backlink_id) as total_backlinks,
-                        COUNT(DISTINCT b.domain_id) as referring_domains,
+                        COUNT(DISTINCT b.source_domain) as referring_domains,
                         SUM(CASE WHEN b.link_type = 'dofollow' THEN 1 ELSE 0 END) as dofollow_count,
-                        AVG(rd.domain_authority) as avg_da
+                        AVG(rd.local_authority_score) as avg_da
                     FROM backlinks b
-                    JOIN referring_domains rd ON b.domain_id = rd.domain_id
-                    WHERE b.target_url LIKE :domain_pattern
+                    LEFT JOIN referring_domains rd ON b.source_domain = rd.domain
+                    WHERE b.target_domain = :domain
                     AND b.is_active = TRUE
                 """),
-                {"domain_pattern": f"%{domain}%"}
+                {"domain": domain}
             )
             row = result.fetchone()
         except Exception as e:
@@ -318,6 +318,7 @@ class LASCalculator:
         self,
         session: Session,
         business_name: str,
+        domain: Optional[str] = None,
     ) -> tuple[float, List[str]]:
         """
         Calculate review component score.
@@ -325,43 +326,85 @@ class LASCalculator:
         Args:
             session: Database session
             business_name: Business name
+            domain: Business domain (optional)
 
         Returns:
             Tuple of (score, recommendations)
         """
         recommendations = []
         score = 0.0
-
-        # Get review data from citations metadata (handle missing table)
-        try:
-            result = session.execute(
-                text("""
-                    SELECT directory_name, metadata
-                    FROM citations
-                    WHERE business_name = :name
-                    AND is_present = TRUE
-                """),
-                {"name": business_name}
-            )
-        except Exception as e:
-            logger.warning(f"Citations table not available for reviews: {e}")
-            session.rollback()  # Clear failed transaction state
-            return 50.0, ["Collect customer reviews on Google", "Respond to existing reviews"]
-
         total_reviews = 0
         ratings = []
 
-        for row in result.fetchall():
-            metadata = row[1] or {}
-            if isinstance(metadata, str):
-                import json
-                metadata = json.loads(metadata)
+        # First, try to get review data from companies table (primary source)
+        if domain:
+            try:
+                result = session.execute(
+                    text("""
+                        SELECT
+                            MAX(COALESCE(reviews_google, 0)) as reviews_google,
+                            MAX(rating_google) as rating_google,
+                            MAX(COALESCE(reviews_yp, 0)) as reviews_yp,
+                            MAX(rating_yp) as rating_yp
+                        FROM companies
+                        WHERE domain = :domain
+                    """),
+                    {"domain": domain}
+                )
+                row = result.fetchone()
 
-            if metadata.get('has_reviews'):
-                total_reviews += metadata.get('review_count', 0)
+                if row:
+                    reviews_google = row[0] or 0
+                    rating_google = float(row[1]) if row[1] else None
+                    reviews_yp = row[2] or 0
+                    rating_yp = float(row[3]) if row[3] else None
 
-            if metadata.get('rating'):
-                ratings.append(metadata['rating'])
+                    total_reviews = reviews_google + reviews_yp
+
+                    if rating_google:
+                        ratings.append(rating_google)
+                    if rating_yp:
+                        ratings.append(rating_yp)
+
+            except Exception as e:
+                logger.debug(f"Companies review query failed: {e}")
+                session.rollback()
+
+        # Fallback: Get review data from citations metadata
+        if total_reviews == 0:
+            try:
+                result = session.execute(
+                    text("""
+                        SELECT directory_name, metadata, rating, review_count
+                        FROM citations
+                        WHERE business_name = :name
+                        AND is_present = TRUE
+                    """),
+                    {"name": business_name}
+                )
+
+                for row in result.fetchall():
+                    # Use direct columns if available
+                    if row[3]:  # review_count column
+                        total_reviews += row[3]
+                    if row[2]:  # rating column
+                        ratings.append(float(row[2]))
+
+                    # Also check metadata
+                    metadata = row[1] or {}
+                    if isinstance(metadata, str):
+                        import json
+                        metadata = json.loads(metadata)
+
+                    if metadata.get('has_reviews'):
+                        total_reviews += metadata.get('review_count', 0)
+                    if metadata.get('rating') and not row[2]:
+                        ratings.append(float(metadata['rating']))
+
+            except Exception as e:
+                logger.warning(f"Citations table not available for reviews: {e}")
+                session.rollback()
+                return 50.0, ["Collect customer reviews on Google", "Respond to existing reviews"]
 
         # Score based on review volume (up to 50 points)
         # 1-10: 15 pts, 11-25: 25 pts, 26-50: 35 pts, 51+: 50 pts
@@ -405,6 +448,17 @@ class LASCalculator:
         """
         Calculate profile completeness score.
 
+        Scoring breakdown (100 points max):
+        - Google Business listed: 20 pts
+        - NAP accurate: 15 pts
+        - Website present: 20 pts
+        - Citation coverage (3+): 10 pts
+        - Business hours: 10 pts
+        - Reviews (10+): 10 pts
+        - Years in business: 5 pts
+        - Certifications: 5 pts
+        - Social links: 5 pts
+
         Args:
             session: Database session
             business_name: Business name
@@ -431,32 +485,26 @@ class LASCalculator:
         except Exception as e:
             logger.warning(f"Citations table not available for completeness: {e}")
             session.rollback()  # Clear failed transaction state
-            # Return score based on domain only
-            if domain:
-                return 60.0, ["Set up Google Business Profile", "Expand directory presence"]
-            return 30.0, ["Create business website", "Set up Google Business Profile"]
+            row = None
 
         if row:
             is_present = row[0]
-            nap_score = row[1] or 0
-            metadata = row[2] or {}
+            nap_score = float(row[1] or 0)
 
             if is_present:
-                score += 30  # Listed on Google
+                score += 20  # Listed on Google
                 if nap_score >= 0.8:
-                    score += 20  # NAP accurate
+                    score += 15  # NAP accurate
                 else:
                     recommendations.append("Update Google Business Profile with accurate NAP")
             else:
                 recommendations.append("Claim and verify Google Business Profile")
         else:
-            score += 0
             recommendations.append("Set up Google Business Profile")
 
         # Check website presence
         if domain:
-            score += 30  # Has website
-            # Could add more checks here (SSL, mobile-friendly, etc.)
+            score += 20  # Has website
         else:
             recommendations.append("Create a business website")
 
@@ -471,9 +519,7 @@ class LASCalculator:
             )
             citation_count = result.fetchone()[0]
 
-            if citation_count >= 5:
-                score += 20
-            elif citation_count >= 3:
+            if citation_count >= 3:
                 score += 10
             else:
                 recommendations.append("Expand presence across more directories")
@@ -481,6 +527,63 @@ class LASCalculator:
             logger.warning(f"Citations count query failed: {e}")
             session.rollback()
             recommendations.append("Expand presence across more directories")
+
+        # Check enhanced discovery data from companies table
+        if domain:
+            try:
+                result = session.execute(
+                    text("""
+                        SELECT
+                            google_hours IS NOT NULL as has_hours,
+                            COALESCE(reviews_google, 0) as reviews_count,
+                            years_in_business IS NOT NULL as has_years,
+                            certifications IS NOT NULL AND jsonb_array_length(COALESCE(certifications, '[]'::jsonb)) > 0 as has_certs,
+                            social_links IS NOT NULL AND social_links != '{}'::jsonb as has_social
+                        FROM companies
+                        WHERE domain = :domain
+                        LIMIT 1
+                    """),
+                    {"domain": domain}
+                )
+                company_row = result.fetchone()
+
+                if company_row:
+                    has_hours, reviews_count, has_years, has_certs, has_social = company_row
+
+                    # Business hours (10 pts)
+                    if has_hours:
+                        score += 10
+                    else:
+                        recommendations.append("Add business hours to Google profile")
+
+                    # Reviews count (10 pts)
+                    if reviews_count >= 10:
+                        score += 10
+                    elif reviews_count > 0:
+                        score += 5
+                        recommendations.append("Encourage more customer reviews")
+                    else:
+                        recommendations.append("Request reviews from satisfied customers")
+
+                    # Years in business (5 pts)
+                    if has_years:
+                        score += 5
+
+                    # Certifications (5 pts)
+                    if has_certs:
+                        score += 5
+                    else:
+                        recommendations.append("Highlight certifications (BBB, licensed, insured)")
+
+                    # Social links (5 pts)
+                    if has_social:
+                        score += 5
+                    else:
+                        recommendations.append("Add social media links to profiles")
+
+            except Exception as e:
+                logger.debug(f"Enhanced company data query failed: {e}")
+                session.rollback()
 
         return min(score, 100.0), recommendations
 
@@ -518,7 +621,7 @@ class LASCalculator:
                 all_recommendations.extend(backlink_recs)
 
                 review_score, review_recs = self._calculate_review_score(
-                    session, business_name
+                    session, business_name, domain
                 )
                 components.review_score = review_score
                 all_recommendations.extend(review_recs)
