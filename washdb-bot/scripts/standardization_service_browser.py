@@ -187,6 +187,9 @@ stats = {
     'last_batch_time': None,
 }
 
+# Module-level heartbeat manager for watchdog integration
+_heartbeat_manager = None
+
 
 class BlockTracker:
     """
@@ -1417,6 +1420,11 @@ def process_batch_with_pool(engine, pool: 'EnterpriseBrowserPool') -> int:
                 update_standardized_name(engine, company['id'], std_name, confidence, source)
                 batch_success += 1
                 logger.info(f"Standardized: '{company['name']}' -> '{std_name}' (source: {source})")
+
+                # Record success for watchdog
+                if _heartbeat_manager:
+                    _heartbeat_manager.record_job_complete()
+                    _heartbeat_manager.set_current_work(company_id=company['id'], module='standardization')
             else:
                 batch_errors += 1
 
@@ -1431,9 +1439,24 @@ def process_batch_with_pool(engine, pool: 'EnterpriseBrowserPool') -> int:
                 else:
                     logger.warning(f"Failed to standardize '{company['name']}': {result}")
 
+                # Record failure for watchdog
+                if _heartbeat_manager:
+                    _heartbeat_manager.record_job_failed(
+                        error=result[:200],
+                        module_name='standardization',
+                        company_id=company['id']
+                    )
+
         except Exception as e:
             batch_errors += 1
             logger.error(f"Error processing '{company['name']}': {e}")
+            # Record exception for watchdog
+            if _heartbeat_manager:
+                _heartbeat_manager.record_job_failed(
+                    error=str(e)[:200],
+                    module_name='standardization',
+                    company_id=company.get('id')
+                )
 
         # Small delay between requests
         time.sleep(random.uniform(MIN_DELAY_BETWEEN_REQUESTS, MAX_DELAY_BETWEEN_REQUESTS))
@@ -1499,6 +1522,11 @@ def process_batch(engine, driver: Driver) -> Tuple[int, bool]:
                 update_standardized_name(engine, company['id'], std_name, confidence, source)
                 batch_success += 1
                 logger.info(f"Standardized: '{company['name']}' -> '{std_name}' (source: {source})")
+
+                # Record success for watchdog
+                if _heartbeat_manager:
+                    _heartbeat_manager.record_job_complete()
+                    _heartbeat_manager.set_current_work(company_id=company['id'], module='standardization')
             else:
                 batch_errors += 1
 
@@ -1535,9 +1563,24 @@ def process_batch(engine, driver: Driver) -> Tuple[int, bool]:
 
                 logger.warning(f"Failed to standardize '{company['name']}': {result}")
 
+                # Record failure for watchdog
+                if _heartbeat_manager:
+                    _heartbeat_manager.record_job_failed(
+                        error=result[:200],
+                        module_name='standardization',
+                        company_id=company['id']
+                    )
+
         except Exception as e:
             batch_errors += 1
             logger.error(f"Error processing {company['id']}: {e}")
+            # Record exception for watchdog
+            if _heartbeat_manager:
+                _heartbeat_manager.record_job_failed(
+                    error=str(e)[:200],
+                    module_name='standardization',
+                    company_id=company.get('id')
+                )
 
         # Add human-like delay between requests (except after last item)
         if i < len(companies) - 1 and running:
@@ -1664,17 +1707,17 @@ def main():
     engine = get_engine()
 
     # Initialize HeartbeatManager for watchdog integration
-    heartbeat_manager = None
+    global _heartbeat_manager
     if HEARTBEAT_MANAGER_AVAILABLE:
         try:
             import socket as sock
-            heartbeat_manager = HeartbeatManager(
+            _heartbeat_manager = HeartbeatManager(
                 db_manager=get_db_manager(),
                 worker_name=f"standardization_{sock.gethostname()}",
                 worker_type='standardization_browser',
                 service_unit='washdb-standardization-browser'
             )
-            heartbeat_manager.start(config={
+            _heartbeat_manager.start(config={
                 'model': MODEL_NAME,
                 'headless': HEADLESS,
                 'batch_size': BATCH_SIZE,
@@ -1682,7 +1725,7 @@ def main():
             logger.info("HeartbeatManager started - watchdog integration enabled")
         except Exception as e:
             logger.warning(f"Failed to start HeartbeatManager: {e}")
-            heartbeat_manager = None
+            _heartbeat_manager = None
 
     # Get initial pending count
     pending = get_pending_count(engine)
@@ -1826,9 +1869,9 @@ def main():
             logger.info("Selenium browser stopped")
 
         # Stop HeartbeatManager
-        if heartbeat_manager:
+        if _heartbeat_manager:
             try:
-                heartbeat_manager.stop('stopped')
+                _heartbeat_manager.stop('stopped')
                 logger.info("HeartbeatManager stopped")
             except Exception as e:
                 logger.warning(f"Failed to stop HeartbeatManager: {e}")
