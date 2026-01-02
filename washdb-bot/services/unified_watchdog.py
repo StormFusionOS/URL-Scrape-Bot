@@ -118,8 +118,8 @@ class UnifiedWatchdog:
     }
 
     # Resource thresholds
-    CHROME_WARNING_THRESHOLD = 300  # Warning level
-    CHROME_CRITICAL_THRESHOLD = 720  # Force cleanup
+    CHROME_WARNING_THRESHOLD = 400  # Warning level (was 300)
+    CHROME_CRITICAL_THRESHOLD = 500  # Force cleanup (was 720)
     MEMORY_WARNING_PERCENT = 85
     MEMORY_CRITICAL_PERCENT = 95
 
@@ -182,6 +182,7 @@ class UnifiedWatchdog:
                 # 3. Pattern check (every 120s)
                 if (now - self._last_pattern_check).total_seconds() >= self.PATTERN_CHECK_INTERVAL:
                     self._check_error_patterns()
+                    self._check_failure_rates()  # Also check failure rates
                     self._last_pattern_check = now
 
                 # Notify systemd watchdog
@@ -362,6 +363,75 @@ class UnifiedWatchdog:
             logger.debug("Pattern check cycle completed")
         except Exception as e:
             logger.error(f"Pattern check failed: {e}")
+
+    def _check_failure_rates(self):
+        """Check for workers with high failure rates and trigger healing."""
+        try:
+            with self.db_manager.get_session() as session:
+                # Find workers with >50% failure rate and minimum 10 jobs processed
+                result = session.execute(
+                    text("""
+                        SELECT worker_name, worker_type, service_unit,
+                               jobs_completed, jobs_failed,
+                               CASE WHEN (jobs_completed + jobs_failed) > 0
+                                    THEN ROUND(jobs_failed::numeric / (jobs_completed + jobs_failed) * 100, 1)
+                                    ELSE 0 END as failure_rate_pct
+                        FROM job_heartbeats
+                        WHERE status = 'running'
+                          AND (jobs_completed + jobs_failed) >= 10
+                          AND jobs_failed::float / NULLIF(jobs_completed + jobs_failed, 0) > 0.5
+                    """)
+                )
+                high_failure_workers = result.fetchall()
+
+                for worker in high_failure_workers:
+                    worker_name = worker[0]
+                    worker_type = worker[1]
+                    service_unit = worker[2]
+                    completed = worker[3]
+                    failed = worker[4]
+                    failure_rate = worker[5]
+
+                    logger.warning(
+                        f"High failure rate detected: {worker_name} "
+                        f"({failure_rate}% - {failed}/{completed + failed} jobs failed)"
+                    )
+
+                    # Log event
+                    self._log_watchdog_event(
+                        event_type='high_failure_rate',
+                        severity='warning',
+                        target_service=service_unit,
+                        target_worker_type=worker_type,
+                        details={
+                            'worker_name': worker_name,
+                            'failure_rate': float(failure_rate),
+                            'jobs_completed': completed,
+                            'jobs_failed': failed
+                        }
+                    )
+
+                    # Log to SystemMonitor for pattern matching
+                    service_name = self.SERVICE_NAME_MAP.get(worker_type, ServiceName.SYSTEM)
+                    self.system_monitor.log_error(
+                        service=service_name,
+                        message=f"Worker {worker_name} has {failure_rate}% failure rate",
+                        severity=ErrorSeverity.WARNING,
+                        error_code="HIGH_FAILURE_RATE",
+                        context={
+                            'worker_name': worker_name,
+                            'failure_rate': float(failure_rate),
+                            'jobs_failed': failed
+                        }
+                    )
+
+                    # If failure rate > 80% and service_unit is set, trigger restart
+                    if failure_rate > 80 and service_unit:
+                        reason = f"Extreme failure rate ({failure_rate}%)"
+                        self._trigger_service_restart(service_unit, worker_type, reason)
+
+        except Exception as e:
+            logger.error(f"Failure rate check failed: {e}")
 
     def _trigger_service_restart(self, service_unit: str, worker_type: str, reason: str):
         """Trigger a service restart via SystemMonitor."""
