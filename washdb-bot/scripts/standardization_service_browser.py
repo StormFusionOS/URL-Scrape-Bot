@@ -917,14 +917,36 @@ def _call_llm_for_standardization(prompt: str, original_name: str) -> Tuple[Opti
             # Clean up common LLM artifacts
             result = result.strip('"\' ').strip()
             if result and len(result) > 1 and len(result) < 200:
+                # Block known bad patterns from model training artifacts
+                bad_patterns = [
+                    'proper business name',
+                    'ndbc handyman',  # Training data artifact
+                    'business name:',
+                    'domain:',
+                    'phone:',
+                    'address:',
+                ]
+                result_lower = result.lower()
+                if any(bp in result_lower for bp in bad_patterns):
+                    logger.warning(f"BLOCKED: LLM output contains training artifact: '{original_name}' -> '{result}'")
+                    return None, 0.0
+
                 # CRITICAL VALIDATION: Ensure result preserves original name structure
                 original_words = set(w.lower() for w in original_name.split() if len(w) > 2)
                 result_words = set(w.lower() for w in result.split() if len(w) > 2)
 
-                # At least one significant word from original MUST be in result
-                if original_words and not original_words.intersection(result_words):
-                    logger.warning(f"BLOCKED: LLM tried to replace name: '{original_name}' -> '{result}'")
-                    return None, 0.0
+                # Calculate overlap - need at least 50% of original words preserved
+                if original_words:
+                    overlap = len(original_words.intersection(result_words))
+                    overlap_ratio = overlap / len(original_words)
+
+                    # For short names (1-2 words), all must match
+                    # For longer names, at least 50% must match
+                    min_required = 1.0 if len(original_words) <= 2 else 0.5
+
+                    if overlap_ratio < min_required:
+                        logger.warning(f"BLOCKED: LLM tried to replace name: '{original_name}' -> '{result}' (overlap: {overlap_ratio:.0%})")
+                        return None, 0.0
 
                 # Quality check: Reject if spaces were merged (camelCase issue)
                 if ' ' in original_name and ' ' not in result and len(result) > 15:
@@ -938,6 +960,71 @@ def _call_llm_for_standardization(prompt: str, original_name: str) -> Tuple[Opti
     except Exception as e:
         logger.error(f"LLM error for '{original_name}': {e}")
         return None, 0.0
+
+
+def regex_fallback_standardize(original_name: str) -> Tuple[str, float]:
+    """
+    Simple regex-based standardization fallback when LLM fails.
+
+    This is a safe fallback that:
+    1. Converts to title case
+    2. Removes common legal suffixes (LLC, Inc, Corp, etc.)
+    3. Cleans up extra spaces and punctuation
+
+    Returns a lower confidence (0.6) since it's a simple transformation.
+    """
+    if not original_name or len(original_name) < 2:
+        return original_name, 0.0
+
+    name = original_name.strip()
+
+    # Remove legal suffixes (case insensitive)
+    legal_suffixes = [
+        r'\s*,?\s*LLC\.?$',
+        r'\s*,?\s*L\.L\.C\.?$',
+        r'\s*,?\s*Inc\.?$',
+        r'\s*,?\s*Incorporated$',
+        r'\s*,?\s*Corp\.?$',
+        r'\s*,?\s*Corporation$',
+        r'\s*,?\s*Co\.?$',
+        r'\s*,?\s*Company$',
+        r'\s*,?\s*Ltd\.?$',
+        r'\s*,?\s*Limited$',
+        r'\s*,?\s*P\.?C\.?$',
+        r'\s*,?\s*PLLC\.?$',
+    ]
+    for suffix in legal_suffixes:
+        name = re.sub(suffix, '', name, flags=re.IGNORECASE)
+
+    # Clean up extra whitespace
+    name = ' '.join(name.split())
+
+    # Convert to title case, but preserve acronyms and handle apostrophes
+    words = name.split()
+    result_words = []
+    for word in words:
+        # Keep acronyms as-is (all caps, 2-4 chars)
+        if word.isupper() and 2 <= len(word) <= 4:
+            result_words.append(word)
+        # Keep words with mixed case (like McDonald's)
+        elif any(c.isupper() for c in word[1:]):
+            result_words.append(word)
+        else:
+            # Handle words with apostrophes (e.g., "Adam's" -> "Adam's" not "Adam'S")
+            if "'" in word:
+                parts = word.split("'")
+                word = "'".join(p.title() if len(p) > 1 else p.lower() for p in parts)
+                result_words.append(word)
+            else:
+                result_words.append(word.title())
+
+    name = ' '.join(result_words)
+
+    # Clean up common punctuation issues
+    name = re.sub(r'\s+([,.])', r'\1', name)  # Remove space before comma/period
+    name = re.sub(r'([,.])\s*$', '', name)    # Remove trailing comma/period
+
+    return name.strip(), 0.6
 
 
 def standardize_business_name(original_name: str, website_context: Optional[str] = None) -> Tuple[Optional[str], float]:
@@ -1015,9 +1102,10 @@ Output ONLY the standardized name: [/INST]"""
 
     result, confidence = _call_llm_for_standardization(prompt, original_name)
 
-    # If LLM failed or was blocked, return None (don't fall back to anything unsafe)
+    # If LLM failed or was blocked, use regex fallback
     if not result:
-        return None, 0.0
+        logger.info(f"LLM failed for '{original_name}', using regex fallback")
+        return regex_fallback_standardize(original_name)
 
     return result, confidence
 
@@ -1267,6 +1355,11 @@ def process_company_with_browser(driver: Driver, company: dict) -> Tuple[bool, s
         page_data = extract_page_data(driver, website)
 
         if not page_data.success:
+            # Browser failed, but we can still do regex-based standardization
+            logger.info(f"Browser fetch failed for '{original_name}', using regex fallback")
+            std_name, confidence = regex_fallback_standardize(original_name)
+            if std_name:
+                return True, f"{std_name}|{confidence}|regex_fallback"
             return False, f"Browser fetch failed: {page_data.error}"
 
         # Extract business name from page FOR CONTEXT ONLY
@@ -1345,6 +1438,12 @@ def process_company_with_pool(pool: 'EnterpriseBrowserPool', company: dict) -> T
             error_lower = page_data.error.lower() if page_data.error else ""
             detected_captcha = "captcha" in error_lower or "recaptcha" in error_lower
             detected_block = "blocked" in error_lower or "forbidden" in error_lower
+
+            # Browser failed, but we can still do regex-based standardization
+            logger.info(f"Browser fetch failed for '{original_name}', using regex fallback")
+            std_name, confidence = regex_fallback_standardize(original_name)
+            if std_name:
+                return True, f"{std_name}|{confidence}|regex_fallback"
             return False, f"Browser fetch failed: {page_data.error}"
 
         # Extract business name from page FOR CONTEXT ONLY
