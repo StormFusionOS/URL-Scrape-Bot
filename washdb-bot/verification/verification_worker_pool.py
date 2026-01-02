@@ -22,6 +22,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from runner.logging_setup import get_logger
 from verification.verification_worker import run_worker
 
+# Import HeartbeatManager for watchdog integration
+try:
+    from services.heartbeat_manager import HeartbeatManager
+    from db.database_manager import get_db_manager
+    HEARTBEAT_MANAGER_AVAILABLE = True
+except ImportError as e:
+    HEARTBEAT_MANAGER_AVAILABLE = False
+    print(f"HeartbeatManager not available: {e}")
+
 # Configuration
 DEFAULT_NUM_WORKERS = 5
 PID_FILE = 'logs/verification_workers.pid'
@@ -54,6 +63,7 @@ class VerificationWorkerPoolManager:
         self.worker_pids: Dict[int, int] = {}  # worker_id -> PID
         self.logger = get_logger("verification_pool_manager")
         self.shutdown_requested = False
+        self.heartbeat_manager = None
 
         # Ensure logs directory exists
         Path('logs').mkdir(exist_ok=True)
@@ -61,6 +71,21 @@ class VerificationWorkerPoolManager:
         # Register signal handlers
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
+
+        # Initialize HeartbeatManager for watchdog integration
+        if HEARTBEAT_MANAGER_AVAILABLE:
+            try:
+                import socket
+                self.heartbeat_manager = HeartbeatManager(
+                    db_manager=get_db_manager(),
+                    worker_name=f"verification_pool_{socket.gethostname()}",
+                    worker_type='verification',
+                    service_unit='washdb-verification'
+                )
+                self.logger.info("HeartbeatManager initialized for watchdog integration")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize HeartbeatManager: {e}")
+                self.heartbeat_manager = None
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals."""
@@ -125,6 +150,17 @@ class VerificationWorkerPoolManager:
 
         self.pool_started_at = datetime.now().isoformat()
 
+        # Start HeartbeatManager
+        if self.heartbeat_manager:
+            try:
+                self.heartbeat_manager.start(config={
+                    'num_workers': self.num_workers,
+                    'startup_stagger': STARTUP_STAGGER_SECONDS,
+                })
+                self.logger.info("HeartbeatManager started - watchdog integration enabled")
+            except Exception as e:
+                self.logger.warning(f"Failed to start HeartbeatManager: {e}")
+
         for worker_id in range(self.num_workers):
             if self.shutdown_requested:
                 self.logger.warning("Shutdown requested during startup, aborting...")
@@ -168,10 +204,26 @@ class VerificationWorkerPoolManager:
 
         try:
             while not self.shutdown_requested:
+                # Count alive workers
+                alive_workers = sum(1 for p in self.workers if p.is_alive())
+                dead_workers = len(self.workers) - alive_workers
+
                 # Check worker health
                 for worker_id, process in enumerate(self.workers):
                     if not process.is_alive():
                         self.logger.warning(f"Worker {worker_id} (PID {process.pid}) has died!")
+                        # Record failure in heartbeat
+                        if self.heartbeat_manager:
+                            self.heartbeat_manager.record_job_failed(
+                                f"Worker {worker_id} died",
+                                module_name='worker_monitor'
+                            )
+
+                # Update heartbeat with current status
+                if self.heartbeat_manager:
+                    self.heartbeat_manager.set_current_work(
+                        module=f"monitoring_{alive_workers}_workers"
+                    )
 
                 # Update state file
                 self._update_state_file()
@@ -229,6 +281,14 @@ class VerificationWorkerPoolManager:
         self.logger.info("=" * 70)
         self.logger.info("All workers stopped")
         self.logger.info("=" * 70)
+
+        # Stop HeartbeatManager
+        if self.heartbeat_manager:
+            try:
+                self.heartbeat_manager.stop('stopped')
+                self.logger.info("HeartbeatManager stopped")
+            except Exception as e:
+                self.logger.warning(f"Failed to stop HeartbeatManager: {e}")
 
         # Clean up
         self._remove_pid_file()

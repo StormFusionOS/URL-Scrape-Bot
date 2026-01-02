@@ -1,0 +1,45 @@
+[Unit]
+Description=WashDB Unified Watchdog Service
+Documentation=file:///home/rivercityscrape/URL-Scrape-Bot/washdb-bot/.claude/plans/distributed-sniffing-mango.md
+After=network.target postgresql.service
+Wants=seo-job-worker.service washdb-verification.service washdb-standardization-browser.service
+
+[Service]
+Type=simple
+User=rivercityscrape
+Group=rivercityscrape
+
+# Environment
+EnvironmentFile=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/.env
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+Environment="PYTHONUNBUFFERED=1"
+Environment="DISPLAY=:99"
+
+# Main process
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python -m services.unified_watchdog
+
+# Restart policy - watchdog must always run
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# Watchdog for the watchdog (meta!)
+# If this service hangs, systemd will kill and restart it
+WatchdogSec=120
+NotifyAccess=main
+
+# Logging
+StandardOutput=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/watchdog.log
+StandardError=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/watchdog_error.log
+
+# Resource limits - watchdog is lightweight
+MemoryMax=512M
+CPUQuota=10%
+
+# Permissions for service restarts
+# The watchdog needs to restart other services via sudo systemctl
+# Ensure sudoers allows: rivercityscrape ALL=(ALL) NOPASSWD: /bin/systemctl restart *
+
+[Install]
+WantedBy=multi-user.target
