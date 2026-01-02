@@ -15,6 +15,7 @@ Architecture:
 - Individual worker logs for debugging
 - Browser pool integration for persistent browsers
 - HTML cache for eliminating redundant parsing
+- HeartbeatManager integration for watchdog monitoring
 """
 
 import asyncio
@@ -22,6 +23,7 @@ import multiprocessing
 import os
 import random
 import signal
+import socket
 import sys
 import time
 from datetime import datetime, timezone
@@ -29,6 +31,15 @@ from pathlib import Path
 from typing import List, Optional, Dict
 
 from runner.logging_setup import setup_logging
+
+# Import HeartbeatManager for watchdog integration
+try:
+    from services.heartbeat_manager import HeartbeatManager
+    from db.database_manager import get_db_manager
+    HEARTBEAT_MANAGER_AVAILABLE = True
+except ImportError as e:
+    HEARTBEAT_MANAGER_AVAILABLE = False
+    print(f"HeartbeatManager not available: {e}")
 from scrape_google.google_crawl_city_first import crawl_single_target
 from scrape_google.google_filter import GoogleFilter
 from db.models import GoogleTarget, Company
@@ -301,6 +312,24 @@ def start_workers(worker_count: int = 5, config: Optional[Dict] = None):
     logger.info(f"Configuration: {config}")
     logger.info("="*70)
 
+    # Initialize HeartbeatManager for watchdog integration
+    heartbeat_manager = None
+    if HEARTBEAT_MANAGER_AVAILABLE:
+        try:
+            heartbeat_manager = HeartbeatManager(
+                db_manager=get_db_manager(),
+                worker_name=f"google_worker_pool_{socket.gethostname()}",
+                worker_type='google_worker',
+                service_unit='google-state-workers'
+            )
+            heartbeat_manager.start(config={
+                'num_workers': worker_count,
+            })
+            logger.info("HeartbeatManager started - watchdog integration enabled")
+        except Exception as e:
+            logger.warning(f"Failed to initialize HeartbeatManager: {e}")
+            heartbeat_manager = None
+
     # Create shutdown event
     shutdown_event = multiprocessing.Event()
 
@@ -353,6 +382,14 @@ def start_workers(worker_count: int = 5, config: Optional[Dict] = None):
                 process.terminate()
 
     logger.info("All workers stopped")
+
+    # Stop HeartbeatManager
+    if heartbeat_manager:
+        try:
+            heartbeat_manager.stop('stopped')
+            logger.info("HeartbeatManager stopped")
+        except Exception as e:
+            logger.warning(f"Failed to stop HeartbeatManager: {e}")
 
 
 if __name__ == "__main__":

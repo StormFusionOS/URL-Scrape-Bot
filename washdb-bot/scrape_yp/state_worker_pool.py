@@ -13,19 +13,30 @@ Architecture:
 - Per-worker proxy pool (10 proxies each, 50 total)
 - PostgreSQL row-level locking for target coordination
 - Individual worker logs for debugging
+- HeartbeatManager integration for watchdog monitoring
 """
 
 import multiprocessing
 import os
 import random
 import signal
+import socket
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 from runner.logging_setup import setup_logging
+
+# Import HeartbeatManager for watchdog integration
+try:
+    from services.heartbeat_manager import HeartbeatManager
+    from db.database_manager import get_db_manager
+    HEARTBEAT_MANAGER_AVAILABLE = True
+except ImportError as e:
+    HEARTBEAT_MANAGER_AVAILABLE = False
+    print(f"HeartbeatManager not available: {e}")
 from scrape_yp.proxy_pool import WorkerProxyPool
 from scrape_yp.state_assignments_5worker import get_states_for_worker, get_proxy_assignments
 from scrape_yp.yp_crawl_city_first import crawl_single_target
@@ -285,6 +296,22 @@ def save_companies_to_db(results: list, session, logger) -> tuple[int, int]:
                 logger.warning(f"Skipping company without website: {result.get('name')}")
                 continue
 
+            # Build parse_metadata for traceability
+            parse_metadata = {
+                "profile_url": result.get("profile_url"),
+                "category_tags": result.get("category_tags", []),
+                "is_sponsored": result.get("is_sponsored", False),
+                "filter_score": result.get("filter_score"),
+                "filter_reason": result.get("filter_reason"),
+                "source_page_url": result.get("source_page_url"),
+                "name_quality_score": result.get("name_quality_score"),
+            }
+
+            # Convert services list to string if needed
+            services = result.get("services")
+            if isinstance(services, list):
+                services = ", ".join(services) if services else None
+
             # Check for existing company
             existing = session.query(Company).filter(Company.website == website).first()
 
@@ -298,12 +325,33 @@ def save_companies_to_db(results: list, session, logger) -> tuple[int, int]:
                     existing.email = result["email"]
                 if result.get("address"):
                     existing.address = result["address"]
-                if result.get("services"):
-                    existing.services = result["services"]
+                if services:
+                    existing.services = services
+                if result.get("description"):
+                    existing.description = result["description"]
+                if result.get("business_hours"):
+                    existing.business_hours = result["business_hours"]
+                if result.get("city"):
+                    existing.city = result["city"]
+                if result.get("state"):
+                    existing.state = result["state"]
+                if result.get("zip_code"):
+                    existing.zip_code = result["zip_code"]
                 if result.get("rating_yp"):
                     existing.rating_yp = result["rating_yp"]
                 if result.get("reviews_yp"):
                     existing.reviews_yp = result["reviews_yp"]
+                # Enhanced YP data
+                if result.get("years_in_business"):
+                    existing.years_in_business = result["years_in_business"]
+                if result.get("certifications"):
+                    existing.certifications = result["certifications"]
+                if result.get("social_links"):
+                    existing.social_links = result["social_links"]
+                if result.get("yp_photo_count"):
+                    existing.yp_photo_count = result["yp_photo_count"]
+                # Always update parse_metadata with latest info
+                existing.parse_metadata = parse_metadata
 
                 existing.last_updated = datetime.now()
                 updated_count += 1
@@ -317,10 +365,21 @@ def save_companies_to_db(results: list, session, logger) -> tuple[int, int]:
                     phone=result.get("phone"),
                     email=result.get("email"),
                     address=result.get("address"),
-                    services=result.get("services"),
+                    services=services,
+                    description=result.get("description"),
+                    business_hours=result.get("business_hours"),
+                    city=result.get("city"),
+                    state=result.get("state"),
+                    zip_code=result.get("zip_code"),
                     source=result.get("source", "YP"),
                     rating_yp=result.get("rating_yp"),
                     reviews_yp=result.get("reviews_yp"),
+                    # Enhanced YP data (for SEO modules)
+                    years_in_business=result.get("years_in_business"),
+                    certifications=result.get("certifications"),
+                    social_links=result.get("social_links"),
+                    yp_photo_count=result.get("yp_photo_count"),
+                    parse_metadata=parse_metadata,
                     active=True,
                 )
                 session.add(company)
@@ -353,6 +412,7 @@ class StateWorkerPoolManager:
     - Each worker uses 5 dedicated proxies
     - Graceful shutdown handling
     - Per-worker monitoring
+    - HeartbeatManager integration for watchdog monitoring
     """
 
     def __init__(self, config: dict):
@@ -376,6 +436,21 @@ class StateWorkerPoolManager:
         self.num_workers = config.get("num_workers", 10)
         self.workers: List[multiprocessing.Process] = []
         self.shutdown_event = multiprocessing.Event()
+        self.heartbeat_manager = None
+
+        # Initialize HeartbeatManager for watchdog integration
+        if HEARTBEAT_MANAGER_AVAILABLE:
+            try:
+                self.heartbeat_manager = HeartbeatManager(
+                    db_manager=get_db_manager(),
+                    worker_name=f"yp_worker_pool_{socket.gethostname()}",
+                    worker_type='yp_worker',
+                    service_unit='yp-state-workers'
+                )
+                logger.info("HeartbeatManager initialized for watchdog integration")
+            except Exception as e:
+                logger.warning(f"Failed to initialize HeartbeatManager: {e}")
+                self.heartbeat_manager = None
 
         # Validate configuration
         self._validate_config()
@@ -410,6 +485,17 @@ class StateWorkerPoolManager:
         logger.info("="*70)
         logger.info(f"STARTING {self.num_workers}-WORKER STATE-PARTITIONED POOL")
         logger.info("="*70)
+
+        # Start HeartbeatManager for watchdog integration
+        if self.heartbeat_manager:
+            try:
+                self.heartbeat_manager.start(config={
+                    'num_workers': self.num_workers,
+                    'proxy_file': self.config.get('proxy_file'),
+                })
+                logger.info("HeartbeatManager started - watchdog integration enabled")
+            except Exception as e:
+                logger.warning(f"Failed to start HeartbeatManager: {e}")
 
         for worker_id in range(self.num_workers):
             # Get state and proxy assignments
@@ -462,6 +548,14 @@ class StateWorkerPoolManager:
                 worker.kill()
 
         logger.info("All workers stopped")
+
+        # Stop HeartbeatManager
+        if self.heartbeat_manager:
+            try:
+                self.heartbeat_manager.stop('stopped')
+                logger.info("HeartbeatManager stopped")
+            except Exception as e:
+                logger.warning(f"Failed to stop HeartbeatManager: {e}")
 
     def wait(self):
         """Wait for all workers to complete."""
