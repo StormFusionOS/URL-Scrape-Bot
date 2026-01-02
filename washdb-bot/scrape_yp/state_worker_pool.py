@@ -23,6 +23,7 @@ import signal
 import socket
 import sys
 import time
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict
@@ -54,7 +55,9 @@ def worker_main(
     state_ids: List[str],
     proxy_indices: List[int],
     shutdown_event: multiprocessing.Event,
-    config: dict
+    config: dict,
+    shared_jobs_completed: multiprocessing.Value = None,
+    shared_jobs_failed: multiprocessing.Value = None
 ):
     """
     Main function for a single state worker process.
@@ -73,6 +76,8 @@ def worker_main(
         proxy_indices: List of assigned proxy indices (e.g., [0, 1, 2, 3, 4])
         shutdown_event: Multiprocessing event to signal shutdown
         config: Configuration dictionary
+        shared_jobs_completed: Shared counter for completed jobs (for HeartbeatManager)
+        shared_jobs_failed: Shared counter for failed jobs (for HeartbeatManager)
     """
     # Set up worker-specific logger
     worker_logger = setup_logging(f"worker_{worker_id}", log_file=f"logs/state_worker_{worker_id}.log")
@@ -169,9 +174,19 @@ def worker_main(
 
                     targets_processed += 1
 
+                    # Increment shared counter for HeartbeatManager
+                    if shared_jobs_completed is not None:
+                        with shared_jobs_completed.get_lock():
+                            shared_jobs_completed.value += 1
+
                 except Exception as e:
                     worker_logger.error(f"✗ Target {target_id} failed: {e}", exc_info=True)
                     mark_target_failed(target_id, str(e), worker_logger)
+
+                    # Increment shared counter for HeartbeatManager
+                    if shared_jobs_failed is not None:
+                        with shared_jobs_failed.get_lock():
+                            shared_jobs_failed.value += 1
 
                 finally:
                     session.close()
@@ -438,6 +453,13 @@ class StateWorkerPoolManager:
         self.shutdown_event = multiprocessing.Event()
         self.heartbeat_manager = None
 
+        # Shared counters for job tracking across all worker processes
+        self.shared_jobs_completed = multiprocessing.Value('i', 0)  # integer counter
+        self.shared_jobs_failed = multiprocessing.Value('i', 0)  # integer counter
+        self._last_synced_completed = 0
+        self._last_synced_failed = 0
+        self._heartbeat_sync_thread = None
+
         # Initialize HeartbeatManager for watchdog integration
         if HEARTBEAT_MANAGER_AVAILABLE:
             try:
@@ -480,6 +502,49 @@ class StateWorkerPoolManager:
 
         logger.info(f"Configuration validated: {proxy_count} proxies available for {self.num_workers} workers")
 
+    def _heartbeat_sync_loop(self):
+        """
+        Background thread that syncs shared counters to HeartbeatManager.
+
+        Runs every 10 seconds to update job completion counts.
+        """
+        while not self.shutdown_event.is_set():
+            try:
+                if self.heartbeat_manager:
+                    # Read current counter values
+                    with self.shared_jobs_completed.get_lock():
+                        current_completed = self.shared_jobs_completed.value
+                    with self.shared_jobs_failed.get_lock():
+                        current_failed = self.shared_jobs_failed.value
+
+                    # Calculate delta since last sync
+                    new_completed = current_completed - self._last_synced_completed
+                    new_failed = current_failed - self._last_synced_failed
+
+                    # Update HeartbeatManager with new completions/failures
+                    for _ in range(new_completed):
+                        self.heartbeat_manager.record_job_complete()
+                    for _ in range(new_failed):
+                        self.heartbeat_manager.record_job_failed(error="Target failed")
+
+                    # Update sync tracking
+                    self._last_synced_completed = current_completed
+                    self._last_synced_failed = current_failed
+
+                    if new_completed > 0 or new_failed > 0:
+                        logger.debug(f"Synced to HeartbeatManager: +{new_completed} ok, +{new_failed} fail")
+
+            except Exception as e:
+                logger.warning(f"Error in heartbeat sync: {e}")
+
+            # Sleep for 10 seconds (interruptible)
+            for _ in range(10):
+                if self.shutdown_event.is_set():
+                    break
+                time.sleep(1)
+
+        logger.info("Heartbeat sync thread stopped")
+
     def start(self):
         """Start all worker processes with staggered startup."""
         logger.info("="*70)
@@ -494,6 +559,15 @@ class StateWorkerPoolManager:
                     'proxy_file': self.config.get('proxy_file'),
                 })
                 logger.info("HeartbeatManager started - watchdog integration enabled")
+
+                # Start background sync thread to update job counts
+                self._heartbeat_sync_thread = threading.Thread(
+                    target=self._heartbeat_sync_loop,
+                    name="HeartbeatSyncThread",
+                    daemon=True
+                )
+                self._heartbeat_sync_thread.start()
+                logger.info("Heartbeat sync thread started")
             except Exception as e:
                 logger.warning(f"Failed to start HeartbeatManager: {e}")
 
@@ -504,10 +578,11 @@ class StateWorkerPoolManager:
 
             logger.info(f"Worker {worker_id}: States {state_ids}, Proxies {proxy_indices}")
 
-            # Create worker process
+            # Create worker process with shared counters
             worker = multiprocessing.Process(
                 target=worker_main,
-                args=(worker_id, state_ids, proxy_indices, self.shutdown_event, self.config),
+                args=(worker_id, state_ids, proxy_indices, self.shutdown_event, self.config,
+                      self.shared_jobs_completed, self.shared_jobs_failed),
                 name=f"StateWorker-{worker_id}"
             )
 

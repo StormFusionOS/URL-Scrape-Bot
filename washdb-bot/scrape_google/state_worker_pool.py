@@ -26,6 +26,7 @@ import signal
 import socket
 import sys
 import time
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Dict
@@ -62,7 +63,9 @@ async def async_worker_main(
     worker_id: int,
     state_ids: List[str],
     shutdown_event: multiprocessing.Event,
-    config: dict
+    config: dict,
+    shared_jobs_completed: multiprocessing.Value = None,
+    shared_jobs_failed: multiprocessing.Value = None
 ):
     """
     Async main function for a single state worker process.
@@ -79,6 +82,8 @@ async def async_worker_main(
         state_ids: List of assigned state codes (e.g., ["CA", "MT", "RI", "MS", "ND"])
         shutdown_event: Multiprocessing event to signal shutdown
         config: Configuration dictionary
+        shared_jobs_completed: Shared counter for completed jobs (for HeartbeatManager)
+        shared_jobs_failed: Shared counter for failed jobs (for HeartbeatManager)
     """
     # Set up worker-specific logger
     worker_logger = setup_logging(f"google_worker_{worker_id}", log_file=f"logs/google_state_worker_{worker_id}.log")
@@ -167,9 +172,19 @@ async def async_worker_main(
 
                     targets_processed += 1
 
+                    # Increment shared counter for HeartbeatManager
+                    if shared_jobs_completed is not None:
+                        with shared_jobs_completed.get_lock():
+                            shared_jobs_completed.value += 1
+
                 except Exception as e:
                     worker_logger.error(f"✗ Target {target_id} failed: {e}", exc_info=True)
                     mark_target_failed(target_id, str(e), worker_logger)
+
+                    # Increment shared counter for HeartbeatManager
+                    if shared_jobs_failed is not None:
+                        with shared_jobs_failed.get_lock():
+                            shared_jobs_failed.value += 1
 
                 finally:
                     session.close()
@@ -200,14 +215,24 @@ async def async_worker_main(
         worker_logger.info(f"Google Worker {worker_id} stopped")
 
 
-def worker_main(worker_id: int, state_ids: List[str], shutdown_event: multiprocessing.Event, config: dict):
+def worker_main(
+    worker_id: int,
+    state_ids: List[str],
+    shutdown_event: multiprocessing.Event,
+    config: dict,
+    shared_jobs_completed: multiprocessing.Value = None,
+    shared_jobs_failed: multiprocessing.Value = None
+):
     """
     Synchronous wrapper for async worker main.
 
     This allows us to run async code in a multiprocessing context.
     """
     # Run the async worker main
-    asyncio.run(async_worker_main(worker_id, state_ids, shutdown_event, config))
+    asyncio.run(async_worker_main(
+        worker_id, state_ids, shutdown_event, config,
+        shared_jobs_completed, shared_jobs_failed
+    ))
 
 
 def acquire_target_for_worker(state_ids: List[str], logger) -> Optional[int]:
@@ -312,6 +337,15 @@ def start_workers(worker_count: int = 5, config: Optional[Dict] = None):
     logger.info(f"Configuration: {config}")
     logger.info("="*70)
 
+    # Create shared counters for job tracking across all worker processes
+    shared_jobs_completed = multiprocessing.Value('i', 0)
+    shared_jobs_failed = multiprocessing.Value('i', 0)
+    last_synced_completed = 0
+    last_synced_failed = 0
+
+    # Create shutdown event (also used by sync thread)
+    shutdown_event = multiprocessing.Event()
+
     # Initialize HeartbeatManager for watchdog integration
     heartbeat_manager = None
     if HEARTBEAT_MANAGER_AVAILABLE:
@@ -330,8 +364,56 @@ def start_workers(worker_count: int = 5, config: Optional[Dict] = None):
             logger.warning(f"Failed to initialize HeartbeatManager: {e}")
             heartbeat_manager = None
 
-    # Create shutdown event
-    shutdown_event = multiprocessing.Event()
+    # Heartbeat sync thread function
+    def heartbeat_sync_loop():
+        nonlocal last_synced_completed, last_synced_failed
+        while not shutdown_event.is_set():
+            try:
+                if heartbeat_manager:
+                    # Read current counter values
+                    with shared_jobs_completed.get_lock():
+                        current_completed = shared_jobs_completed.value
+                    with shared_jobs_failed.get_lock():
+                        current_failed = shared_jobs_failed.value
+
+                    # Calculate delta since last sync
+                    new_completed = current_completed - last_synced_completed
+                    new_failed = current_failed - last_synced_failed
+
+                    # Update HeartbeatManager with new completions/failures
+                    for _ in range(new_completed):
+                        heartbeat_manager.record_job_complete()
+                    for _ in range(new_failed):
+                        heartbeat_manager.record_job_failed(error="Target failed")
+
+                    # Update sync tracking
+                    last_synced_completed = current_completed
+                    last_synced_failed = current_failed
+
+                    if new_completed > 0 or new_failed > 0:
+                        logger.debug(f"Synced to HeartbeatManager: +{new_completed} ok, +{new_failed} fail")
+
+            except Exception as e:
+                logger.warning(f"Error in heartbeat sync: {e}")
+
+            # Sleep for 10 seconds (interruptible)
+            for _ in range(10):
+                if shutdown_event.is_set():
+                    break
+                time.sleep(1)
+
+        logger.info("Heartbeat sync thread stopped")
+
+    # Start sync thread if HeartbeatManager is available
+    sync_thread = None
+    if heartbeat_manager:
+        sync_thread = threading.Thread(
+            target=heartbeat_sync_loop,
+            name="GoogleHeartbeatSyncThread",
+            daemon=True
+        )
+        sync_thread.start()
+        logger.info("Heartbeat sync thread started")
 
     # Signal handler for graceful shutdown
     def signal_handler(signum, frame):
@@ -351,7 +433,8 @@ def start_workers(worker_count: int = 5, config: Optional[Dict] = None):
 
         process = multiprocessing.Process(
             target=worker_main,
-            args=(worker_id, state_ids, shutdown_event, config),
+            args=(worker_id, state_ids, shutdown_event, config,
+                  shared_jobs_completed, shared_jobs_failed),
             name=f"google_worker_{worker_id}"
         )
 
