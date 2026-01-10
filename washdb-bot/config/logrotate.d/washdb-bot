@@ -1,0 +1,44 @@
+# Logrotate configuration for WashDB-Bot
+# Copy to /etc/logrotate.d/washdb-bot with sudo
+
+/mnt/work/projects/URL-Scrape-Bot/washdb-bot/logs/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    size 10M
+    create 644 rivercityscrape rivercityscrape
+    olddir /mnt/backup/log_archives/washdb-bot
+    sharedscripts
+    postrotate
+        # Signal processes to reopen log files if needed
+        true
+    endscript
+}
+
+/opt/ai-seo/logs/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    size 10M
+    create 644 rivercityscrape rivercityscrape
+    olddir /mnt/backup/log_archives/ai-seo
+    sharedscripts
+}
+
+/opt/ai-seo/logs/*/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    size 10M
+    create 644 rivercityscrape rivercityscrape
+    olddir /mnt/backup/log_archives/ai-seo
+}

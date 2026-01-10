@@ -345,6 +345,185 @@ def extract_services_offered(listing) -> List[str]:
     return unique_services
 
 
+def extract_years_in_business(listing) -> Optional[int]:
+    """
+    Extract 'Years in Business' from badges.
+
+    Looks for patterns like "20 Years in Business", "Established 2005", etc.
+
+    Args:
+        listing: BeautifulSoup element for a business listing
+
+    Returns:
+        Number of years as integer, or None
+    """
+    # Look for years badge
+    badge_selectors = [
+        "span.years-in-business",
+        "div.years-in-business",
+        "span[class*='years']",
+        "div[class*='years']",
+        "span.badge",
+        "div.badge",
+        "span.trust-badge",
+        "div.trust-badge",
+        "div.yp-badge",
+        "span.yp-badge",
+    ]
+
+    for selector in badge_selectors:
+        elements = listing.select(selector)
+        for elem in elements:
+            text = clean_text(elem.get_text()).lower()
+
+            # Pattern: "X Years in Business"
+            match = re.search(r'(\d+)\s*years?\s*(in\s*business)?', text)
+            if match:
+                try:
+                    return int(match.group(1))
+                except ValueError:
+                    continue
+
+            # Pattern: "Established YYYY"
+            match = re.search(r'established\s*(\d{4})', text)
+            if match:
+                try:
+                    from datetime import datetime
+                    year = int(match.group(1))
+                    return datetime.now().year - year
+                except ValueError:
+                    continue
+
+    return None
+
+
+def extract_certifications(listing) -> List[str]:
+    """
+    Extract certifications and accreditations.
+
+    Looks for BBB, licensed, insured, bonded, certified badges.
+
+    Args:
+        listing: BeautifulSoup element for a business listing
+
+    Returns:
+        List of certification strings
+    """
+    certifications = []
+
+    # Keywords to look for
+    cert_keywords = [
+        'bbb', 'better business', 'licensed', 'insured', 'bonded',
+        'certified', 'accredited', 'verified', 'screened',
+        'background check', 'guarantee', 'warranty'
+    ]
+
+    # Look for badge elements
+    badge_selectors = [
+        "span.badge",
+        "div.badge",
+        "span.certification",
+        "div.certification",
+        "span.accreditation",
+        "div.accreditation",
+        "span.trust-badge",
+        "div.trust-badge",
+        "img[alt*='BBB']",
+        "img[alt*='Certified']",
+        "img[alt*='Licensed']",
+    ]
+
+    for selector in badge_selectors:
+        elements = listing.select(selector)
+        for elem in elements:
+            # Get text or alt attribute
+            if elem.name == 'img':
+                text = elem.get('alt', '').lower()
+            else:
+                text = clean_text(elem.get_text()).lower()
+
+            for keyword in cert_keywords:
+                if keyword in text:
+                    # Add the full badge text, cleaned up
+                    full_text = elem.get('alt', '') if elem.name == 'img' else clean_text(elem.get_text())
+                    if full_text and full_text not in certifications:
+                        certifications.append(full_text)
+                    break
+
+    return certifications
+
+
+def extract_social_links(listing) -> Dict[str, str]:
+    """
+    Extract social media links.
+
+    Args:
+        listing: BeautifulSoup element for a business listing
+
+    Returns:
+        Dict mapping platform to URL (e.g., {'facebook': 'https://...'})
+    """
+    social = {}
+
+    social_patterns = [
+        ('facebook', r'facebook\.com'),
+        ('instagram', r'instagram\.com'),
+        ('twitter', r'(twitter\.com|x\.com)'),
+        ('linkedin', r'linkedin\.com'),
+        ('youtube', r'youtube\.com'),
+        ('pinterest', r'pinterest\.com'),
+        ('tiktok', r'tiktok\.com'),
+    ]
+
+    for link in listing.select('a[href]'):
+        href = link.get('href', '').lower()
+
+        for platform, pattern in social_patterns:
+            if platform not in social and re.search(pattern, href):
+                social[platform] = link.get('href')
+                break
+
+    return social
+
+
+def extract_photo_count(listing) -> Optional[int]:
+    """
+    Extract photo count from listing.
+
+    Args:
+        listing: BeautifulSoup element for a business listing
+
+    Returns:
+        Number of photos or None
+    """
+    # Look for photo gallery indicators
+    photo_selectors = [
+        "span.photo-count",
+        "div.photo-count",
+        "a.photos",
+        "span[class*='photo']",
+        "a[class*='photo']",
+    ]
+
+    for selector in photo_selectors:
+        elem = listing.select_one(selector)
+        if elem:
+            text = clean_text(elem.get_text())
+            match = re.search(r'(\d+)\s*photos?', text.lower())
+            if match:
+                try:
+                    return int(match.group(1))
+                except ValueError:
+                    pass
+
+    # Alternative: count actual photo thumbnails
+    thumbnails = listing.select("img.photo, img.thumbnail, div.photo-gallery img")
+    if thumbnails:
+        return len(thumbnails)
+
+    return None
+
+
 def parse_single_listing_enhanced(listing, source_page_url: Optional[str] = None) -> Dict:
     """
     Parse a single business listing with enhanced field extraction.
@@ -391,6 +570,11 @@ def parse_single_listing_enhanced(listing, source_page_url: Optional[str] = None
         "zip_code": None,
         "name_quality_score": 50,
         "name_length_flag": False,
+        # Enhanced discovery data (for SEO modules)
+        "years_in_business": None,
+        "certifications": [],
+        "social_links": {},
+        "yp_photo_count": None,
     }
 
     # Extract business name
@@ -531,6 +715,12 @@ def parse_single_listing_enhanced(listing, source_page_url: Optional[str] = None
             if email:
                 result["email"] = email
                 break
+
+    # Enhanced discovery data extraction (for SEO modules)
+    result["years_in_business"] = extract_years_in_business(listing)
+    result["certifications"] = extract_certifications(listing)
+    result["social_links"] = extract_social_links(listing)
+    result["yp_photo_count"] = extract_photo_count(listing)
 
     return result
 

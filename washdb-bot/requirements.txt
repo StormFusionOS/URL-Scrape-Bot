@@ -43,3 +43,5 @@ langchain-community>=0.0.10
 # ===== LLM/AI SERVICES =====
 # Anthropic Claude API for auto-tuning system
 anthropic>=0.39.0
+# Adding camoufox
+camoufox>=0.4.0

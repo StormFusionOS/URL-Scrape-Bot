@@ -355,19 +355,52 @@ def save_business_to_db(business_data: dict, session) -> Optional[int]:
         if website:
             existing = session.query(Company).filter_by(website=website).first()
             if existing:
+                # Update existing record with new Google data if missing
+                updated = False
+                if not existing.google_place_id and business_data.get('place_id'):
+                    existing.google_place_id = business_data.get('place_id')
+                    updated = True
+                if not existing.reviews_google and business_data.get('reviews_count'):
+                    existing.reviews_google = business_data.get('reviews_count')
+                    updated = True
+                if not existing.google_hours and business_data.get('hours'):
+                    existing.google_hours = business_data.get('hours')
+                    updated = True
+                if not existing.google_category and business_data.get('category'):
+                    existing.google_category = business_data.get('category')
+                    updated = True
+                if not existing.google_price_range and business_data.get('price_range'):
+                    existing.google_price_range = business_data.get('price_range')
+                    updated = True
+                if not existing.google_business_url and business_data.get('url'):
+                    existing.google_business_url = business_data.get('url')
+                    updated = True
+                if updated:
+                    session.commit()
                 logger.debug(f"Business already exists in DB: {business_data.get('name')} ({website})")
                 return existing.id
 
-        # Create new company record
+        # Create new company record with all available Google data
         company = Company(
             name=business_data.get('name', 'Unknown'),
             website=website,
             domain=business_data.get('domain'),
             phone=business_data.get('phone'),
             address=business_data.get('address'),
+            city=business_data.get('city'),
+            state=business_data.get('state'),
+            zip_code=business_data.get('zip_code'),
             source='Google',
             rating_google=business_data.get('rating'),
             reviews_google=business_data.get('reviews_count'),
+            # Enhanced Google data (previously discarded)
+            google_place_id=business_data.get('place_id'),
+            google_hours=business_data.get('hours'),
+            google_price_range=business_data.get('price_range'),
+            google_category=business_data.get('category'),
+            google_business_url=business_data.get('url'),
+            # Business hours as text (for display)
+            business_hours=_format_hours_text(business_data.get('hours')),
             active=True,
         )
 
@@ -380,6 +413,19 @@ def save_business_to_db(business_data: dict, session) -> Optional[int]:
     except Exception as e:
         logger.error(f"Failed to save business to database: {e}")
         session.rollback()
+        return None
+
+
+def _format_hours_text(hours_dict: Optional[dict]) -> Optional[str]:
+    """Convert hours dict to human-readable text."""
+    if not hours_dict:
+        return None
+    try:
+        parts = []
+        for day, hours in hours_dict.items():
+            parts.append(f"{day}: {hours}")
+        return "; ".join(parts)
+    except Exception:
         return None
 
 
@@ -524,7 +570,19 @@ async def crawl_single_target(
                         logger.warning(f"Failed to canonicalize URL '{business_data['website']}': {e}")
                         continue
                 else:
-                    logger.debug(f"Skipping business without website: {business_data.get('name')}")
+                    # No website - save as discovery citation instead of skipping
+                    if save_to_db:
+                        try:
+                            from db.discovery_citation_inserter import save_discovery_citation
+                            save_discovery_citation(
+                                source='google_maps',
+                                business_data=business_data,
+                                session=session,
+                                try_match=True
+                            )
+                            logger.debug(f"Saved no-website business as citation: {business_data.get('name')}")
+                        except Exception as e:
+                            logger.debug(f"Failed to save citation: {e}")
                     continue
 
                 # Apply quality filter

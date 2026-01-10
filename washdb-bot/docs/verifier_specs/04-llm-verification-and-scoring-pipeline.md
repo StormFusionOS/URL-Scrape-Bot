@@ -1,9 +1,15 @@
-# 04 – LLM Verification & Scoring Pipeline (llm_verifier + workers)
+# 04 – LLM Verification & Scoring Pipeline
 
-**Goal for Claude**  
+> **UPDATE (Dec 2024)**: The system now uses a **unified LLM** (`unified-washdb`) that handles
+> both verification and name standardization. See `verification/unified_llm.py` for the main
+> implementation. The separate `llm_verifier.py` and `trained_llm_verifier.py` are deprecated
+> and redirect to the unified module.
+
+**Goal for Claude**
 Upgrade how the LLM is used and how its output is combined with heuristics, using these files:
 
-- `scrape_site/llm_verifier.py`  (LLM logic)
+- `verification/unified_llm.py` (NEW - Unified LLM for verification + standardization)
+- `scrape_site/trained_llm_verifier.py` (DEPRECATED - redirects to unified_llm)
 - `scrape_site/service_verifier.py` (calls LLM and combines scores)
 - `verification/llm_service.py` + `verification/llm_queue.py` (GPU queue)
 - `verification/verification_worker.py` and `db/verify_company_urls.py` (DB updates)

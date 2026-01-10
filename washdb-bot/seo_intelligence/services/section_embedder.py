@@ -156,7 +156,9 @@ class SectionEmbedder:
         # Build points for Qdrant
         points = []
         for i, (section, embedding) in enumerate(zip(sections, embeddings)):
-            section_id = f"page_{page_id}_section_{i}"
+            # Generate unique integer ID: page_id * 10000 + section_index
+            # Supports up to 10000 sections per page
+            section_id = page_id * 10000 + i
 
             payload = {
                 "page_id": page_id,

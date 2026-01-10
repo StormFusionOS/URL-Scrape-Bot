@@ -43,15 +43,38 @@ from .proxy_manager import ProxyManager, get_proxy_manager
 from .las_calculator import LASCalculator, LASResult, LASComponents, get_las_calculator
 from .change_manager import ChangeManager, ChangeStatus, ChangeType, get_change_manager
 from .qdrant_manager import QdrantManager, get_qdrant_manager
-from .embedding_service import (
-    ContentEmbedder,
-    get_content_embedder,
-    TextChunker,
-    EmbeddingGenerator,
-    extract_main_content
-)
+
+# Lazy import for embedding_service to avoid loading heavy torch/transformers at startup
+# Use: from seo_intelligence.services.embedding_service import ContentEmbedder
+def _lazy_embedding_imports():
+    from .embedding_service import (
+        ContentEmbedder,
+        get_content_embedder,
+        TextChunker,
+        EmbeddingGenerator,
+        extract_main_content
+    )
+    return ContentEmbedder, get_content_embedder, TextChunker, EmbeddingGenerator, extract_main_content
+
+# Placeholder for backwards compatibility - will raise ImportError with helpful message
+class _LazyEmbeddingService:
+    def __getattr__(self, name):
+        raise ImportError(
+            f"embedding_service.{name} requires heavy dependencies. "
+            "Import directly: from seo_intelligence.services.embedding_service import {name}"
+        )
+
+ContentEmbedder = _LazyEmbeddingService()
+get_content_embedder = _LazyEmbeddingService()
+TextChunker = _LazyEmbeddingService()
+EmbeddingGenerator = _LazyEmbeddingService()
+extract_main_content = _LazyEmbeddingService()
+
+# section_embedder also depends on embedding_service, so make it lazy too
+SectionEmbedder = _LazyEmbeddingService()
+get_section_embedder = _LazyEmbeddingService()
+
 from .source_trust import SourceTrustConfig, SourceTrustService, get_source_trust
-from .section_embedder import SectionEmbedder, get_section_embedder
 from .nap_validator import NAPValidator, NAPValidationResult, get_nap_validator
 from .entity_matcher import EntityMatcher, MatchResult, get_entity_matcher
 from .url_canonicalizer import URLCanonicalizer, CanonicalURL, get_url_canonicalizer
@@ -168,6 +191,27 @@ from .google_coordinator import (
     GoogleCoordinator,
     get_google_coordinator,
     reset_google_coordinator,
+)
+from .serp_config import (
+    SERP_BACKEND,
+    SerpBackend,
+    use_enterprise_serp,
+    get_serp_backend,
+    ENTERPRISE_SERP_CONFIG,
+)
+from .enterprise_serp import (
+    EnterpriseSERP,
+    EnterpriseSerpConfig,
+    get_enterprise_serp,
+    start_enterprise_serp,
+    stop_enterprise_serp,
+    serp_search,
+)
+
+# Browser pool (imported from drivers module for convenience)
+from seo_intelligence.drivers.browser_pool import (
+    EnterpriseBrowserPool,
+    get_browser_pool,
 )
 
 __all__ = [
@@ -298,4 +342,19 @@ __all__ = [
     "GoogleCoordinator",
     "get_google_coordinator",
     "reset_google_coordinator",
+    # Phase 9: Enterprise SERP System
+    "SERP_BACKEND",
+    "SerpBackend",
+    "use_enterprise_serp",
+    "get_serp_backend",
+    "ENTERPRISE_SERP_CONFIG",
+    "EnterpriseSERP",
+    "EnterpriseSerpConfig",
+    "get_enterprise_serp",
+    "start_enterprise_serp",
+    "stop_enterprise_serp",
+    "serp_search",
+    # Browser Pool
+    "EnterpriseBrowserPool",
+    "get_browser_pool",
 ]

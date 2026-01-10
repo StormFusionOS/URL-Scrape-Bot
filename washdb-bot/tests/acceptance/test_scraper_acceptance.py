@@ -12,9 +12,7 @@ import pytest
 from sqlalchemy import text
 from datetime import datetime
 
-from seo_intelligence.scrapers.serp_scraper import SerpScraper
-from seo_intelligence.scrapers.competitor_crawler import CompetitorCrawler
-from seo_intelligence.scrapers.citation_crawler import CitationCrawler, BusinessInfo
+from seo_intelligence.scrapers import SerpScraper, CompetitorCrawler, CitationCrawler, BusinessInfo
 
 
 class TestSERPModule:

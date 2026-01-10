@@ -87,6 +87,13 @@ class Company(Base):
     services: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     service_area: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="Business description from YP or other sources")
+    business_hours: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="Business hours (e.g., Mon-Fri 8am-5pm)")
+
+    # Location Details (parsed from address)
+    city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    state: Mapped[Optional[str]] = mapped_column(String(2), nullable=True, index=True)
+    zip_code: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, index=True)
 
     # Source and Ratings
     source: Mapped[Optional[str]] = mapped_column(
@@ -99,6 +106,45 @@ class Company(Base):
     reviews_yp: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     reviews_bing: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
+    # Enhanced Google Discovery Data (for SEO modules)
+    google_place_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, index=True,
+        comment="Google Maps Place ID for deduplication"
+    )
+    google_price_range: Mapped[Optional[str]] = mapped_column(
+        String(10), nullable=True,
+        comment="Google price range ($, $$, $$$, $$$$)"
+    )
+    google_business_url: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Direct URL to Google Business Profile"
+    )
+    google_hours: Mapped[Optional[dict]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), nullable=True,
+        comment="Business hours from Google as structured JSON"
+    )
+    google_category: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True,
+        comment="Primary business category from Google Maps"
+    )
+
+    # Enhanced YP Discovery Data
+    years_in_business: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Years in business from YP badge"
+    )
+    certifications: Mapped[Optional[dict]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), nullable=True,
+        comment="Certifications/accreditations (BBB, licensed, insured)"
+    )
+    social_links: Mapped[Optional[dict]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), nullable=True,
+        comment="Social media links (facebook, instagram, etc.)"
+    )
+    yp_photo_count: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Number of photos on YP listing"
+    )
 
     # Parse Metadata (for traceability and explainability)
     # Use JSON with PostgreSQL variant for cross-database compatibility (SQLite tests + PostgreSQL production)
@@ -170,6 +216,58 @@ class Company(Base):
     name_quality_score: Mapped[int] = mapped_column(
         Integer, default=50,
         comment="Quality score 0-100 based on length, specificity, location"
+    )
+
+    # SEO Job Tracking Flags
+    seo_initial_complete: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="True when all 9 SEO modules have run at least once"
+    )
+    seo_last_full_scrape: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True,
+        comment="Timestamp of last complete SEO scrape"
+    )
+    seo_next_refresh_due: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+        comment="When quarterly refresh should run (90 days after last scrape)"
+    )
+
+    # Individual SEO module completion flags
+    seo_technical_audit_done: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="TechnicalAuditor module completed"
+    )
+    seo_core_vitals_done: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="CoreWebVitals module completed"
+    )
+    seo_backlinks_done: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="BacklinkCrawler module completed"
+    )
+    seo_citations_done: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="CitationCrawler module completed"
+    )
+    seo_competitors_done: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="CompetitorCrawler module completed"
+    )
+    seo_serp_done: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="SerpScraper module completed"
+    )
+    seo_autocomplete_done: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="AutocompleteScraper module completed"
+    )
+    seo_keyword_intel_done: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="KeywordIntelligence module completed"
+    )
+    seo_competitive_analysis_done: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="CompetitiveAnalysis module completed"
     )
 
     def __repr__(self) -> str:
@@ -1566,3 +1664,332 @@ class DomainBrowserSettings(Base):
         return f"<DomainBrowserSettings(domain='{self.domain}', mode='{mode}', detections={self.detection_count})>"
 
 
+class SEOJobTracking(Base):
+    """
+    SEO job tracking table for detailed job history and monitoring.
+
+    Tracks execution of each SEO module for each company, including
+    status, timing, results, and error information for debugging.
+
+    Attributes:
+        tracking_id: Primary key
+        company_id: Foreign key to companies table
+        module_name: Name of SEO module ('technical_audit', 'core_vitals', etc.)
+        run_type: Type of run ('initial', 'quarterly', 'deep_refresh', 'retry')
+        status: Job status ('pending', 'running', 'completed', 'failed', 'skipped')
+        started_at: When job started
+        completed_at: When job completed
+        duration_seconds: How long job took
+        records_created: Number of new records created
+        records_updated: Number of existing records updated
+        error_message: Error message if failed
+        error_traceback: Full error traceback if failed
+        retry_count: Number of retry attempts
+        metadata: Module-specific results summary (JSONB)
+        created_at: Record creation timestamp
+        updated_at: Last update timestamp
+    """
+
+    __tablename__ = "seo_job_tracking"
+
+    # Primary Key
+    tracking_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Foreign Key to Company (references companies.id)
+    company_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("companies.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Links to companies.id"
+    )
+
+    # Job Identification
+    module_name: Mapped[str] = mapped_column(
+        String(50), nullable=False, index=True,
+        comment="SEO module: technical_audit, core_vitals, backlinks, citations, competitors, serp, autocomplete, keyword_intel, competitive_analysis"
+    )
+    run_type: Mapped[str] = mapped_column(
+        String(20), nullable=False, index=True,
+        comment="initial, quarterly, deep_refresh, retry"
+    )
+
+    # Status Tracking
+    status: Mapped[str] = mapped_column(
+        String(20), default='pending', index=True,
+        comment="pending, running, completed, failed, skipped"
+    )
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    duration_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # Results
+    records_created: Mapped[int] = mapped_column(Integer, default=0)
+    records_updated: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Error Tracking
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_traceback: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Metadata (use job_metadata to avoid SQLAlchemy reserved name)
+    job_metadata: Mapped[Optional[dict]] = mapped_column(
+        "metadata",  # Column name in database is still 'metadata'
+        JSON().with_variant(JSONB, "postgresql"),
+        nullable=True,
+        comment="Module-specific results summary"
+    )
+
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def __repr__(self) -> str:
+        """String representation of SEOJobTracking."""
+        return f"<SEOJobTracking(id={self.tracking_id}, company_id={self.company_id}, module='{self.module_name}', status='{self.status}')>"
+
+
+class KeywordCompanyTracking(Base):
+    """
+    Keyword-company tracking table for per-company keyword assignments.
+
+    Tracks which keywords are assigned to which companies for SEO monitoring,
+    including position tracking, analysis data, and history.
+
+    Attributes:
+        tracking_id: Primary key
+        company_id: Foreign key to companies table
+        keyword_text: The keyword being tracked
+        source: How keyword was discovered ('service_seed', 'location_variant', etc.)
+        assignment_tier: Priority tier (1-4)
+        status: Tracking status ('tracking', 'paused', 'archived', 'not_ranking')
+        initial_position: First position we found
+        current_position: Latest position
+        best_position: Best position ever achieved
+        worst_position: Worst position recorded
+        position_trend: Trend direction ('rising', 'falling', 'stable', 'new', 'lost')
+        opportunity_score: Opportunity score from KeywordIntelligence
+        difficulty_score: Difficulty score from KeywordIntelligence
+        volume_tier: Volume tier ('very_low' to 'very_high')
+        search_intent: Search intent classification
+        assigned_at: When keyword was assigned
+        reason: Why this keyword was added
+        metadata: Additional data (JSONB)
+    """
+
+    __tablename__ = "keyword_company_tracking"
+
+    # Primary Key
+    tracking_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Foreign Key to Company
+    company_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("companies.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Links to companies table"
+    )
+
+    # Keyword Data
+    keyword_text: Mapped[str] = mapped_column(
+        String(500), nullable=False, index=True,
+        comment="The keyword being tracked"
+    )
+    source: Mapped[str] = mapped_column(
+        String(50), nullable=False, index=True,
+        comment="service_seed, location_variant, competitor_gap, autocomplete"
+    )
+    assignment_tier: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Priority tier 1-4 (1=service seeds, 4=long-tail)"
+    )
+    status: Mapped[str] = mapped_column(
+        String(50), default='tracking', index=True,
+        comment="tracking, paused, archived, not_ranking"
+    )
+
+    # Position Tracking
+    initial_position: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="First position we found"
+    )
+    current_position: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Latest position"
+    )
+    best_position: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Best position ever achieved"
+    )
+    worst_position: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Worst position recorded"
+    )
+    position_trend: Mapped[Optional[str]] = mapped_column(
+        String(20), nullable=True, index=True,
+        comment="rising, falling, stable, new, lost"
+    )
+
+    # Timestamps
+    first_ranked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True,
+        comment="When we first found this keyword ranking"
+    )
+    last_checked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+        comment="Last SERP check"
+    )
+    last_position_change: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True,
+        comment="When position last changed"
+    )
+
+    # Analysis Data
+    analysis_count: Mapped[int] = mapped_column(Integer, default=0)
+    opportunity_score: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment="Opportunity score from KeywordIntelligence"
+    )
+    difficulty_score: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment="Difficulty score from KeywordIntelligence"
+    )
+    volume_tier: Mapped[Optional[str]] = mapped_column(
+        String(20), nullable=True,
+        comment="very_low, low, medium, high, very_high"
+    )
+    search_intent: Mapped[Optional[str]] = mapped_column(
+        String(30), nullable=True,
+        comment="informational, transactional, navigational, local"
+    )
+
+    # Assignment Metadata
+    assigned_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+    reason: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Why this keyword was added"
+    )
+    extra_data: Mapped[Optional[dict]] = mapped_column(
+        "metadata",  # Column name in database is still 'metadata'
+        JSON().with_variant(JSONB, "postgresql"),
+        nullable=True,
+        comment="Additional data (related questions, competitors ranking, etc)"
+    )
+
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    # Unique constraint on company + keyword
+    __table_args__ = (
+        Index('idx_kct_company_keyword', 'company_id', 'keyword_text', unique=True),
+    )
+
+    def __repr__(self) -> str:
+        """String representation of KeywordCompanyTracking."""
+        return f"<KeywordCompanyTracking(id={self.tracking_id}, company_id={self.company_id}, keyword='{self.keyword_text[:30]}...', status='{self.status}')>"
+
+
+class DiscoveryCitation(Base):
+    """
+    Citation discovered from directories for businesses without websites.
+
+    Used for NAP (Name, Address, Phone) validation and completeness tracking.
+    Captures businesses found on Google Maps, YP, Yelp that don't have websites
+    but can be matched to companies in our database by phone/address.
+
+    Attributes:
+        id: Primary key
+        source: Directory source ('google_maps', 'yellowpages', 'yelp')
+        business_name: Name from directory
+        phone: Phone number for matching
+        address: Full address
+        city, state, zip: Parsed location
+        place_id: Google place_id for deduplication
+        profile_url: Link back to directory listing
+        category: Business category
+        rating: Star rating
+        reviews_count: Number of reviews
+        hours: Business hours as JSON
+        price_range: Price level
+        discovered_at: When discovered
+        matched_company_id: FK to companies if matched
+        matched_at: When match was made
+        match_confidence: Confidence score of match
+        match_method: How match was made ('phone', 'name_fuzzy', 'address')
+    """
+
+    __tablename__ = "discovery_citations"
+
+    # Primary Key
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Source tracking
+    source: Mapped[str] = mapped_column(
+        String(50), nullable=False, index=True,
+        comment="Directory source: google_maps, yellowpages, yelp"
+    )
+
+    # Business information
+    business_name: Mapped[str] = mapped_column(
+        String(500), nullable=False,
+        comment="Business name from directory"
+    )
+    phone: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True, index=True,
+        comment="Phone number for matching"
+    )
+    address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    state: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+    zip: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+
+    # Source-specific identifiers
+    place_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, index=True,
+        comment="Google place_id for deduplication"
+    )
+    profile_url: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Link back to directory listing"
+    )
+
+    # Business details
+    category: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    rating: Mapped[Optional[float]] = mapped_column(Numeric(2, 1), nullable=True)
+    reviews_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    hours: Mapped[Optional[dict]] = mapped_column(
+        JSON().with_variant(JSONB, "postgresql"), nullable=True
+    )
+    price_range: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+
+    # Timestamps
+    discovered_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+
+    # Matching to companies
+    matched_company_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("companies.id"), nullable=True, index=True
+    )
+    matched_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    match_confidence: Mapped[Optional[float]] = mapped_column(Numeric(3, 2), nullable=True)
+    match_method: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True,
+        comment="How match was made: phone, name_fuzzy, address"
+    )
+
+    def __repr__(self) -> str:
+        """String representation of DiscoveryCitation."""
+        return f"<DiscoveryCitation(id={self.id}, source='{self.source}', name='{self.business_name[:30]}...', matched={self.matched_company_id is not None})>"

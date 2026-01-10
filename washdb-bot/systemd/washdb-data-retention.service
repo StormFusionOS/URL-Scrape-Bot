@@ -1,0 +1,15 @@
+[Unit]
+Description=WashDB Data Retention Cleanup
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=rivercityscrape
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+EnvironmentFile=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/.env
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python scripts/data_retention_cleanup.py
+StandardOutput=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/data_retention.log
+StandardError=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/data_retention.log
+
+[Install]
+WantedBy=multi-user.target

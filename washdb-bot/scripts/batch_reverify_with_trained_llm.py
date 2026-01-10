@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Batch re-verification using the trained Mistral LLM.
+Batch re-verification using the unified LLM.
 
-Runs the trained verification-mistral-proper model on all companies
+Runs the unified-washdb model on all companies
 in the database and updates their llm_verified flag.
 
 Features:
@@ -64,7 +64,7 @@ Respond with ONLY a JSON object:
 
         # Ollama settings
         self.ollama_url = "http://localhost:11434/api/generate"
-        self.model = os.getenv("OLLAMA_MODEL", "verification-mistral-proper")
+        self.model = os.getenv("OLLAMA_MODEL", "unified-washdb-v2")
 
         # Progress tracking
         self.processed = 0
@@ -190,26 +190,26 @@ Respond with ONLY a JSON object:
             result = response.json()
             response_text = result.get("response", "").strip()
 
-            # Parse JSON from response
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}') + 1
+            # Parse JSON from response using robust extraction
+            parsed = self._extract_json(response_text)
 
-            if json_start >= 0 and json_end > json_start:
-                json_str = response_text[json_start:json_end]
-                parsed = json.loads(json_str)
-
+            if parsed:
                 return {
                     'success': True,
                     'legitimate': parsed.get('legitimate', False),
-                    'confidence': parsed.get('confidence', 0.5),
+                    'confidence': float(parsed.get('confidence', 0.5)),
                     'services': parsed.get('services', []),
-                    'reasoning': parsed.get('reasoning', ''),
+                    'reasoning': str(parsed.get('reasoning', ''))[:200],
                     'raw': response_text[:200]
                 }
             else:
+                # Fallback: try to infer from text
+                fallback = self._fallback_parse(response_text)
+                if fallback:
+                    return fallback
                 return {
                     'success': False,
-                    'error': 'No JSON in response',
+                    'error': 'No valid JSON in response',
                     'raw': response_text[:200]
                 }
 
@@ -219,6 +219,123 @@ Respond with ONLY a JSON object:
             return {'success': False, 'error': f'JSON parse error: {e}'}
         except Exception as e:
             return {'success': False, 'error': str(e)}
+
+    def _extract_json(self, text: str) -> dict:
+        """Extract first valid JSON object from text with robust parsing."""
+        import re
+
+        # Clean up common artifacts
+        text = text.replace('<|im_start|>', ' ').replace('<|im_end|>', ' ')
+        text = re.sub(r'\s+', ' ', text)
+
+        # Try to find JSON with balanced braces
+        brace_count = 0
+        json_start = -1
+
+        for i, char in enumerate(text):
+            if char == '{':
+                if brace_count == 0:
+                    json_start = i
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+                if brace_count == 0 and json_start >= 0:
+                    json_str = text[json_start:i+1]
+                    try:
+                        return json.loads(json_str)
+                    except json.JSONDecodeError:
+                        # Try to fix common issues
+                        json_str = self._fix_json(json_str)
+                        try:
+                            return json.loads(json_str)
+                        except:
+                            json_start = -1  # Reset and try next
+
+        return None
+
+    def _fix_json(self, json_str: str) -> str:
+        """Fix common JSON issues."""
+        import re
+        # Fix unquoted true/false
+        json_str = re.sub(r':\s*true\b', ': true', json_str)
+        json_str = re.sub(r':\s*false\b', ': false', json_str)
+        # Fix trailing commas
+        json_str = re.sub(r',\s*}', '}', json_str)
+        json_str = re.sub(r',\s*]', ']', json_str)
+        return json_str
+
+    def _fallback_parse(self, text: str) -> dict:
+        """Fallback parsing when JSON extraction fails."""
+        text_lower = text.lower()
+
+        # Dead website / error page patterns (memorized from training data)
+        dead_site_phrases = [
+            'website is no longer available',
+            'domain has expired',
+            'page not found',
+            'this site is under construction',
+            'coming soon',
+            'placeholder',
+            'contact your customer service',
+            'webstarts.com',
+            'yext knowledge tags',
+            'this message will not appear',
+            'link to the website',
+            'appears to be a website link',
+            'actual business name is not provided'
+        ]
+        if any(phrase in text_lower for phrase in dead_site_phrases):
+            return {
+                'success': True,
+                'legitimate': False,
+                'confidence': 0.4,
+                'services': [],
+                'reasoning': 'Dead or unavailable website',
+                'raw': text[:200]
+            }
+
+        # Negative indicators
+        if any(phrase in text_lower for phrase in [
+            'not a valid', 'not legitimate', 'does not provide',
+            'not an exterior', 'no evidence', 'not offer',
+            'not a business', 'no information', 'insufficient data'
+        ]):
+            return {
+                'success': True,
+                'legitimate': False,
+                'confidence': 0.5,
+                'services': [],
+                'reasoning': 'Inferred from text: negative indicators found',
+                'raw': text[:200]
+            }
+
+        # Positive indicators
+        if any(phrase in text_lower for phrase in [
+            'legitimate', 'provides pressure', 'offers exterior',
+            'pressure washing service', 'cleaning service',
+            'power wash', 'window clean', 'soft wash'
+        ]) and 'not' not in text_lower[:100]:
+            return {
+                'success': True,
+                'legitimate': True,
+                'confidence': 0.6,
+                'services': [],
+                'reasoning': 'Inferred from text: positive indicators found',
+                'raw': text[:200]
+            }
+
+        # Catch-all for unparseable responses
+        if len(text.strip()) > 0:
+            return {
+                'success': True,
+                'legitimate': False,
+                'confidence': 0.3,
+                'services': [],
+                'reasoning': 'Unable to parse model response',
+                'raw': text[:200]
+            }
+
+        return None
 
     def update_company(self, company_id: int, result: dict):
         """Update company with classification result."""
@@ -407,7 +524,7 @@ def main():
     try:
         resp = requests.get("http://localhost:11434/api/tags", timeout=5)
         models = [m['name'] for m in resp.json().get('models', [])]
-        expected_model = os.getenv("OLLAMA_MODEL", "verification-mistral-proper")
+        expected_model = os.getenv("OLLAMA_MODEL", "unified-washdb-v2")
         if not any(expected_model in m for m in models):
             logger.error(f"Model {expected_model} not found in Ollama. Available: {models}")
             sys.exit(1)

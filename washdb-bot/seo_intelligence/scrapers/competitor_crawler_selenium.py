@@ -633,9 +633,12 @@ class CompetitorCrawlerSelenium(BaseSeleniumScraper):
         metrics: PageMetrics,
         html: str,
         status_code: int = 200,
-    ) -> int:
+    ) -> Optional[int]:
         """
-        Save competitor page to database.
+        Save competitor page to database with content-hash deduplication.
+
+        If the content hash matches an existing record for this URL,
+        skip the insert and just update timestamps (saves storage + compute).
 
         Args:
             session: Database session
@@ -645,10 +648,37 @@ class CompetitorCrawlerSelenium(BaseSeleniumScraper):
             status_code: HTTP status code
 
         Returns:
-            int: Page ID
+            int: Page ID (existing or new), or None if skipped
         """
         # Calculate content hash
         content_hash = self.hasher.hash_content(html, normalize=True)
+
+        # Check for existing page with same content hash (deduplication)
+        existing = session.execute(
+            text("""
+                SELECT page_id, content_hash
+                FROM competitor_pages
+                WHERE competitor_id = :competitor_id AND url = :url
+                ORDER BY crawled_at DESC
+                LIMIT 1
+            """),
+            {"competitor_id": competitor_id, "url": metrics.url}
+        ).fetchone()
+
+        if existing and existing[1] == content_hash:
+            # Content unchanged - just update timestamp, skip insert + embedding
+            session.execute(
+                text("""
+                    UPDATE competitor_pages
+                    SET last_verified_at = NOW(),
+                        crawl_age_bucket = 'fresh'
+                    WHERE page_id = :page_id
+                """),
+                {"page_id": existing[0]}
+            )
+            session.commit()
+            logger.debug(f"Content unchanged for {metrics.url}, skipped insert (page_id={existing[0]})")
+            return existing[0]
 
         # Prepare data
         h1_tags = metrics.h1_tags[:5]  # Store first 5 H1s
@@ -725,19 +755,24 @@ class CompetitorCrawlerSelenium(BaseSeleniumScraper):
                             vector=embeddings[0]
                         )
 
-                        # Update database with embedding metadata
+                        # Update database with embedding metadata and main_text for re-embedding
                         session.execute(
                             text("""
                                 UPDATE competitor_pages
                                 SET embedding_version = :version,
                                     embedded_at = NOW(),
-                                    embedding_chunk_count = :chunk_count
+                                    embedding_chunk_count = :chunk_count,
+                                    main_text = :main_text,
+                                    last_verified_at = NOW(),
+                                    crawl_age_bucket = 'fresh',
+                                    data_confidence = 1.0
                                 WHERE page_id = :page_id
                             """),
                             {
                                 "version": os.getenv("EMBEDDING_VERSION", "v1.0"),
                                 "chunk_count": len(chunks),
-                                "page_id": page_id
+                                "page_id": page_id,
+                                "main_text": main_text[:50000] if main_text else None  # Truncate to 50k chars
                             }
                         )
                         session.commit()

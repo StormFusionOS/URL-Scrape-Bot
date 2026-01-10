@@ -176,15 +176,27 @@ class CompetitorParser:
         return headings
 
     def _extract_schema(self, soup: BeautifulSoup) -> List[Dict]:
-        """Extract schema.org JSON-LD markup."""
+        """Extract schema.org JSON-LD markup.
+
+        Uses get_text() instead of string property to handle multi-node scripts.
+        Supports @graph arrays commonly used in modern schema markup.
+        """
         schemas = []
 
         for script in soup.find_all('script', type='application/ld+json'):
             try:
-                content = script.string
+                # Use get_text() instead of .string - handles multi-node scripts
+                content = script.get_text(strip=True)
                 if content:
                     data = json.loads(content)
-                    if isinstance(data, list):
+                    # Handle @graph arrays (common in Google-style schema)
+                    if isinstance(data, dict) and '@graph' in data:
+                        graph_items = data['@graph']
+                        if isinstance(graph_items, list):
+                            schemas.extend(graph_items)
+                        else:
+                            schemas.append(graph_items)
+                    elif isinstance(data, list):
                         schemas.extend(data)
                     else:
                         schemas.append(data)

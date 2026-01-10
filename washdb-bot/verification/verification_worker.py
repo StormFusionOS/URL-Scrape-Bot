@@ -230,10 +230,9 @@ class PrefetchBuffer:
                     parse_metadata, active, created_at, last_updated
                 FROM companies
                 WHERE website IS NOT NULL
-                  AND (
-                      parse_metadata->'verification' IS NULL
-                      OR parse_metadata->'verification'->>'status' IS NULL
-                  )
+                  -- Only pick up companies that are truly unverified
+                  AND verified IS NULL
+                  AND llm_verified IS NULL
                 ORDER BY created_at DESC
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
@@ -327,10 +326,9 @@ def acquire_company_for_verification(session, worker_id: int, logger) -> Optiona
                 parse_metadata, active, created_at, last_updated
             FROM companies
             WHERE website IS NOT NULL
-              AND (
-                  parse_metadata->'verification' IS NULL
-                  OR parse_metadata->'verification'->>'status' IS NULL
-              )
+              -- Only pick up companies that are truly unverified
+              AND verified IS NULL
+              AND llm_verified IS NULL
             ORDER BY created_at DESC
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -738,12 +736,22 @@ def update_company_verification(
 
         # Determine verified status for standardized column
         # verified = true if passed, false if failed, null if unknown/needs_review
+        # llm_verified is set to mark that LLM verification was attempted
         verified_value = None
+        llm_verified_value = None
+        provider_status = 'pending'  # Default status
         if final_status == 'passed':
             verified_value = True
+            llm_verified_value = True
+            provider_status = 'provider'  # Confirmed service provider
         elif final_status == 'failed':
             verified_value = False
-        # Leave as None for 'unknown' status
+            llm_verified_value = False
+            provider_status = 'non_provider'  # NOT a service provider
+        else:
+            # Needs review - set llm_verified to False to prevent re-processing
+            llm_verified_value = False
+            provider_status = 'unknown'  # Needs review
 
         # Build the UPDATE query with name standardization fields
         query = text("""
@@ -755,6 +763,9 @@ def update_company_verification(
                     CAST(:verification_json AS jsonb)
                 ),
                 verified = :verified,
+                llm_verified = :llm_verified,
+                llm_verified_at = NOW(),
+                provider_status = :provider_status,
                 verification_type = 'llm',
                 name_quality_score = COALESCE(:name_quality, name_quality_score),
                 name_length_flag = COALESCE(:name_flag, name_length_flag),
@@ -773,6 +784,8 @@ def update_company_verification(
             'company_id': company_id,
             'verification_json': verification_json,
             'verified': verified_value,
+            'llm_verified': llm_verified_value,
+            'provider_status': provider_status,
             'name_quality': name_quality,
             'name_flag': name_flag,
             'std_name': standardized_name,

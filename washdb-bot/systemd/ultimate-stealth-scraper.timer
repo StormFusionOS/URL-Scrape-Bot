@@ -1,0 +1,15 @@
+[Unit]
+Description=Run Ultimate Stealth Scraper every 30 minutes for blocked sites
+
+[Timer]
+# Run 30 minutes after boot
+OnBootSec=30min
+# Then every 30 minutes
+OnUnitActiveSec=30min
+# Randomize by up to 5 minutes to avoid patterns
+RandomizedDelaySec=300
+# Make timer persistent across reboots
+Persistent=true
+
+[Install]
+WantedBy=timers.target

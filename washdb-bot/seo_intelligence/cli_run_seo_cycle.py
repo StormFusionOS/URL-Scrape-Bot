@@ -158,13 +158,17 @@ class SEOOrchestrator:
             return {"status": "dry_run", "records_processed": 0}
 
         try:
-            # Import and run SERP scraper
-            # from seo_intelligence.scrapers.serp_scraper import SERPScraper
-            # scraper = SERPScraper()
-            # results = scraper.scrape_serps(company_id=company_id)
+            from seo_intelligence.jobs.seo_module_jobs import SerpJob
 
-            logger.info("SERP tracking executed")
-            return {"status": "success", "records_processed": 0}
+            job = SerpJob()
+            if company_id:
+                result = job.run_for_company(company_id, run_type='initial')
+            else:
+                # Run for all eligible companies
+                result = {"status": "skipped", "reason": "no_company_id - use job orchestrator for batch processing"}
+
+            logger.info(f"SERP tracking executed: {result}")
+            return {"status": "success", "records_processed": result.get('records_created', 0)}
 
         except Exception as e:
             logger.error(f"SERP tracking failed: {e}", exc_info=True)
@@ -177,13 +181,16 @@ class SEOOrchestrator:
             return {"status": "dry_run", "records_processed": 0}
 
         try:
-            # Import and run competitor crawler
-            # from seo_intelligence.scrapers.competitor_crawler import CompetitorCrawler
-            # crawler = CompetitorCrawler()
-            # results = crawler.crawl_competitors(company_id=company_id)
+            from seo_intelligence.jobs.seo_module_jobs import CompetitorCrawlerJob
 
-            logger.info("Competitor analysis executed")
-            return {"status": "success", "records_processed": 0}
+            job = CompetitorCrawlerJob()
+            if company_id:
+                result = job.run_for_company(company_id, run_type='initial')
+            else:
+                result = {"status": "skipped", "reason": "no_company_id - use job orchestrator for batch processing"}
+
+            logger.info(f"Competitor analysis executed: {result}")
+            return {"status": "success", "records_processed": result.get('records_created', 0)}
 
         except Exception as e:
             logger.error(f"Competitor analysis failed: {e}", exc_info=True)
@@ -196,13 +203,16 @@ class SEOOrchestrator:
             return {"status": "dry_run", "records_processed": 0}
 
         try:
-            # Import and run backlink crawler
-            # from seo_intelligence.scrapers.backlink_crawler import BacklinkCrawler
-            # crawler = BacklinkCrawler()
-            # results = crawler.discover_backlinks(company_id=company_id)
+            from seo_intelligence.jobs.seo_module_jobs import BacklinkCrawlerJob
 
-            logger.info("Backlinks discovery executed")
-            return {"status": "success", "records_processed": 0}
+            job = BacklinkCrawlerJob()
+            if company_id:
+                result = job.run_for_company(company_id, run_type='initial')
+            else:
+                result = {"status": "skipped", "reason": "no_company_id - use job orchestrator for batch processing"}
+
+            logger.info(f"Backlinks discovery executed: {result}")
+            return {"status": "success", "records_processed": result.get('records_created', 0)}
 
         except Exception as e:
             logger.error(f"Backlinks discovery failed: {e}", exc_info=True)
@@ -215,13 +225,16 @@ class SEOOrchestrator:
             return {"status": "dry_run", "records_processed": 0}
 
         try:
-            # Import and run citation crawler
-            # from seo_intelligence.scrapers.citation_crawler import CitationCrawler
-            # crawler = CitationCrawler()
-            # results = crawler.crawl_citations(company_id=company_id)
+            from seo_intelligence.jobs.seo_module_jobs import CitationCrawlerJob
 
-            logger.info("Citations crawling executed")
-            return {"status": "success", "records_processed": 0}
+            job = CitationCrawlerJob()
+            if company_id:
+                result = job.run_for_company(company_id, run_type='initial')
+            else:
+                result = {"status": "skipped", "reason": "no_company_id - use job orchestrator for batch processing"}
+
+            logger.info(f"Citations crawling executed: {result}")
+            return {"status": "success", "records_processed": result.get('records_created', 0)}
 
         except Exception as e:
             logger.error(f"Citations crawling failed: {e}", exc_info=True)
@@ -234,13 +247,16 @@ class SEOOrchestrator:
             return {"status": "dry_run", "records_processed": 0}
 
         try:
-            # Import and run technical auditor
-            # from seo_intelligence.scrapers.technical_auditor import TechnicalAuditor
-            # auditor = TechnicalAuditor()
-            # results = auditor.audit_pages(company_id=company_id)
+            from seo_intelligence.jobs.seo_module_jobs import TechnicalAuditorJob
 
-            logger.info("Technical audits executed")
-            return {"status": "success", "records_processed": 0}
+            job = TechnicalAuditorJob()
+            if company_id:
+                result = job.run_for_company(company_id, run_type='initial')
+            else:
+                result = {"status": "skipped", "reason": "no_company_id - use job orchestrator for batch processing"}
+
+            logger.info(f"Technical audits executed: {result}")
+            return {"status": "success", "records_processed": result.get('records_created', 0)}
 
         except Exception as e:
             logger.error(f"Technical audits failed: {e}", exc_info=True)

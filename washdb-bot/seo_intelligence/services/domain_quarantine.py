@@ -350,6 +350,37 @@ class DomainQuarantine:
         entry = self.get_quarantine_entry(domain)
         return entry.expires_at if entry else None
 
+    def get_quarantine_info(self, domain: str) -> Optional[Dict[str, Any]]:
+        """
+        Get quarantine information for a domain.
+
+        Args:
+            domain: Domain to query
+
+        Returns:
+            Dictionary with quarantine info, or None if not quarantined
+        """
+        domain = self._normalize_domain(domain)
+
+        with self._lock:
+            self._cleanup_expired_quarantines()
+            entry = self._quarantined.get(domain)
+
+            if not entry:
+                return None
+
+            remaining_seconds = (entry.expires_at - datetime.now()).total_seconds()
+            return {
+                'domain': domain,
+                'is_quarantined': True,
+                'reason': entry.reason.value,
+                'quarantined_at': entry.quarantined_at,
+                'expires_at': entry.expires_at,
+                'remaining_seconds': max(0, remaining_seconds),
+                'retry_attempt': entry.retry_attempt,
+                'metadata': entry.metadata
+            }
+
     def get_retry_attempt(self, domain: str) -> int:
         """
         Get current retry attempt count for a domain.

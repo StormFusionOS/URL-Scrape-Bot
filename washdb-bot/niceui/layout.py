@@ -113,19 +113,10 @@ class AppLayout:
                 {'name': 'Verification', 'icon': 'verified', 'page': 'verification'},
                 {'name': 'Standardization', 'icon': 'auto_fix_high', 'page': 'standardization'},
                 {'name': 'Scheduler', 'icon': 'schedule', 'page': 'scheduler'},
-                {'name': 'Status', 'icon': 'timeline', 'page': 'status'},
+                {'name': 'System Monitor', 'icon': 'monitor_heart', 'page': 'system_monitor'},
                 {'name': 'Settings', 'icon': 'settings', 'page': 'settings'},
             ]
             for item in nav_items:
-                self._create_nav_item(item['name'], item['icon'], item['page'])
-
-            # Testing section
-            ui.separator().classes('my-3')
-            ui.label('TESTING & QA').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
-            testing_items = [
-                {'name': 'Test Suite', 'icon': 'science', 'page': 'testing'},
-            ]
-            for item in testing_items:
                 self._create_nav_item(item['name'], item['icon'], item['page'])
 
             # SEO Intelligence section
@@ -133,10 +124,8 @@ class AppLayout:
             ui.label('SEO INTELLIGENCE').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
             seo_items = [
                 {'name': 'SEO Dashboard', 'icon': 'hub', 'page': 'seo_dashboard'},
-                {'name': 'Scraper Review', 'icon': 'analytics', 'page': 'scraper_review'},
                 {'name': 'Local Competitors', 'icon': 'groups', 'page': 'local_competitors'},
                 {'name': 'Database', 'icon': 'dns', 'page': 'seo_database'},
-                {'name': 'Dev Tools', 'icon': 'build', 'page': 'dev_tools'},
             ]
             for item in seo_items:
                 self._create_nav_item(item['name'], item['icon'], item['page'])
@@ -178,19 +167,10 @@ class AppLayout:
             {'name': 'Standardization', 'icon': 'auto_fix_high', 'page': 'standardization'},
             {'name': 'Scheduler', 'icon': 'schedule', 'page': 'scheduler'},
             {'name': 'Logs', 'icon': 'article', 'page': 'logs'},
-            {'name': 'Status', 'icon': 'timeline', 'page': 'status'},
+            {'name': 'System Monitor', 'icon': 'monitor_heart', 'page': 'system_monitor'},
             {'name': 'Settings', 'icon': 'settings', 'page': 'settings'},
         ]
         for item in nav_items:
-            self._create_nav_item(item['name'], item['icon'], item['page'])
-
-        # Testing section
-        ui.separator().classes('my-3')
-        ui.label('TESTING & QA').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
-        testing_items = [
-            {'name': 'Test Suite', 'icon': 'science', 'page': 'testing'},
-        ]
-        for item in testing_items:
             self._create_nav_item(item['name'], item['icon'], item['page'])
 
         # SEO Intelligence section
@@ -198,11 +178,8 @@ class AppLayout:
         ui.label('SEO INTELLIGENCE').classes('text-xs text-gray-400 font-bold mt-2 mb-1')
         seo_items = [
             {'name': 'SEO Dashboard', 'icon': 'hub', 'page': 'seo_dashboard'},
-            {'name': 'SEO Intel', 'icon': 'insights', 'page': 'seo_intelligence'},
-            {'name': 'Scraper Review', 'icon': 'analytics', 'page': 'scraper_review'},
             {'name': 'Local Competitors', 'icon': 'groups', 'page': 'local_competitors'},
             {'name': 'Database', 'icon': 'dns', 'page': 'seo_database'},
-            {'name': 'Dev Tools', 'icon': 'build', 'page': 'dev_tools'},
         ]
         for item in seo_items:
             self._create_nav_item(item['name'], item['icon'], item['page'])

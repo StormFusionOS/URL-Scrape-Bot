@@ -8,10 +8,16 @@ Each target represents a city × category combination to be scraped.
 
 Usage:
     python -m scrape_yp.generate_city_targets --states RI CA TX
+
+Auto-regeneration:
+    The check_and_regenerate_if_needed() function can be called at startup
+    to automatically regenerate targets when category configuration changes.
 """
 
 import argparse
 import csv
+import hashlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -230,6 +236,140 @@ def generate_summary_report(session, state_ids: list[str]):
     print("-" * 60)
     print(f"{'TOTAL':6s} {total_targets:>12,d}")
     print("=" * 60)
+
+
+CATEGORY_HASH_FILE = Path(project_root) / "data" / ".yp_category_hash.json"
+ALL_STATES = [
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"
+]
+
+
+def compute_category_hash() -> str:
+    """
+    Compute a hash of the category configuration files.
+
+    Returns:
+        SHA256 hash of combined category files
+    """
+    hasher = hashlib.sha256()
+
+    # Files that affect category configuration
+    config_files = [
+        Path(project_root) / "data" / "yp_category_slugs.csv",
+        Path(project_root) / "data" / "yp_category_allowlist.txt",
+        Path(project_root) / "data" / "yp_category_blocklist.txt",
+    ]
+
+    for file_path in config_files:
+        if file_path.exists():
+            with open(file_path, "rb") as f:
+                hasher.update(f.read())
+
+    return hasher.hexdigest()
+
+
+def get_stored_hash() -> dict:
+    """
+    Get the stored category hash and metadata.
+
+    Returns:
+        Dict with 'hash' and 'regenerated_at' keys, or empty dict if not found
+    """
+    if CATEGORY_HASH_FILE.exists():
+        try:
+            with open(CATEGORY_HASH_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_hash(hash_value: str):
+    """
+    Save the current category hash.
+
+    Args:
+        hash_value: SHA256 hash to save
+    """
+    from datetime import datetime
+
+    data = {
+        "hash": hash_value,
+        "regenerated_at": datetime.now().isoformat(),
+    }
+
+    CATEGORY_HASH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(CATEGORY_HASH_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def check_and_regenerate_if_needed(state_ids: list[str] = None, force: bool = False) -> bool:
+    """
+    Check if category configuration has changed and regenerate targets if needed.
+
+    This function should be called at YP scraper startup to ensure targets
+    are up-to-date with the latest category configuration.
+
+    Args:
+        state_ids: List of state codes to regenerate (default: all states)
+        force: Force regeneration even if hash hasn't changed
+
+    Returns:
+        True if targets were regenerated, False otherwise
+    """
+    if state_ids is None:
+        state_ids = ALL_STATES
+
+    current_hash = compute_category_hash()
+    stored = get_stored_hash()
+    stored_hash = stored.get("hash", "")
+
+    if not force and current_hash == stored_hash:
+        print(f"✓ Category configuration unchanged (hash: {current_hash[:12]}...)")
+        return False
+
+    print("=" * 60)
+    print("Category configuration changed - regenerating targets")
+    print("=" * 60)
+    if stored_hash:
+        print(f"  Old hash: {stored_hash[:12]}...")
+        print(f"  New hash: {current_hash[:12]}...")
+
+    # Create database engine
+    engine = create_engine(DATABASE_URL, echo=False)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    try:
+        # Generate targets with clear (to remove old categories)
+        generate_targets(
+            session,
+            state_ids,
+            clear_existing=True
+        )
+
+        # Save new hash
+        save_hash(current_hash)
+
+        # Generate summary report
+        generate_summary_report(session, state_ids)
+
+        print("\n✓ Target auto-regeneration complete!")
+        return True
+
+    except Exception as e:
+        print(f"\n✗ Auto-regeneration error: {e}")
+        import traceback
+        traceback.print_exc()
+        session.rollback()
+        return False
+
+    finally:
+        session.close()
 
 
 def main():

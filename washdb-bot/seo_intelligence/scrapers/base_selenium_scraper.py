@@ -24,6 +24,7 @@ Usage:
 import os
 import time
 import random
+import signal
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, Tuple
 from contextlib import contextmanager
@@ -47,6 +48,15 @@ from seo_intelligence.drivers import (
     get_driver_for_site,
     get_uc_driver,
     click_element_human_like,
+    # Browser escalation
+    get_escalation_manager,
+    should_use_camoufox,
+    report_captcha,
+    report_success,
+    BrowserTier,
+    CamoufoxDriver,
+    # Browser pool
+    get_browser_pool,
 )
 from seo_intelligence.models.artifacts import (
     PageArtifact,
@@ -77,12 +87,13 @@ class BaseSeleniumScraper(ABC):
         self,
         name: str,
         tier: str = "C",
-        headless: bool = True,
+        headless: bool = None,  # None means use env var
         respect_robots: bool = True,
-        use_proxy: bool = True,  # Enabled by default (unlike Playwright version)
+        use_proxy: bool = None,  # None means use env var
         max_retries: int = 3,
         page_timeout: int = 30,
         mobile_mode: bool = False,
+        enable_escalation: bool = True,  # Enable browser escalation on CAPTCHA
     ):
         """
         Initialize base Selenium scraper.
@@ -90,21 +101,35 @@ class BaseSeleniumScraper(ABC):
         Args:
             name: Scraper name for logging
             tier: Rate limit tier (A-G, default: C)
-            headless: Default browser mode
+            headless: Browser mode (None=use BROWSER_HEADLESS env var, default: false)
             respect_robots: Check robots.txt before crawling
-            use_proxy: Use proxy pool (recommended for SEO scraping)
+            use_proxy: Use proxy pool (None=use PROXY_ROTATION_ENABLED env var, default: true)
             max_retries: Maximum retry attempts on failure
             page_timeout: Page load timeout in seconds
             mobile_mode: Emulate mobile device (iPhone X viewport and user agent)
+            enable_escalation: Enable automatic browser escalation on CAPTCHA detection
         """
         self.name = name
         self.tier = tier
-        self.headless = headless
+
+        # Read headless from env if not explicitly set
+        if headless is None:
+            self.headless = os.getenv("BROWSER_HEADLESS", "false").lower() == "true"
+        else:
+            self.headless = headless
+
         self.respect_robots = respect_robots
-        self.use_proxy = use_proxy
+
+        # Read use_proxy from env if not explicitly set
+        if use_proxy is None:
+            self.use_proxy = os.getenv("PROXY_ROTATION_ENABLED", "true").lower() == "true"
+        else:
+            self.use_proxy = use_proxy
+
         self.max_retries = max_retries
         self.page_timeout = page_timeout
         self.mobile_mode = mobile_mode
+        self.enable_escalation = enable_escalation
 
         # Initialize logger
         self.logger = get_logger(name)
@@ -117,9 +142,14 @@ class BaseSeleniumScraper(ABC):
         self.content_hasher = get_content_hasher()
         self.domain_quarantine = get_domain_quarantine()
 
+        # Browser escalation manager (for CAPTCHA handling)
+        self.escalation_manager = get_escalation_manager() if enable_escalation else None
+
         # Current driver instance
         self._driver = None
+        self._camoufox_driver = None  # Camoufox fallback driver
         self._current_domain = None
+        self._using_camoufox = False  # Track if we're using Camoufox
 
         # Statistics
         self.stats = {
@@ -128,6 +158,9 @@ class BaseSeleniumScraper(ABC):
             "pages_failed": 0,
             "robots_blocked": 0,
             "rate_limited": 0,
+            "escalations": 0,          # Times we escalated browser
+            "camoufox_used": 0,        # Times Camoufox was used
+            "captchas_detected": 0,    # CAPTCHAs encountered
         }
 
         self.logger.info(f"{name} (Selenium) initialized (tier={tier}, headless={headless})")
@@ -285,6 +318,9 @@ class BaseSeleniumScraper(ABC):
         """
         Context manager for SeleniumBase browser session.
 
+        If browser pool is enabled, acquires a session from the pool.
+        Otherwise falls back to creating a fresh driver.
+
         Gets appropriate driver for the target site with:
         - Undetected Chrome mode (uc=True)
         - Proxy rotation from existing ProxyManager
@@ -302,10 +338,110 @@ class BaseSeleniumScraper(ABC):
         Yields:
             Configured SeleniumBase Driver
         """
+        # Try to use browser pool if enabled
+        pool = get_browser_pool()
+
+        if pool and pool.is_enabled():
+            # Use pool-based session
+            yield from self._browser_session_from_pool(site, pool)
+        else:
+            # Fallback to direct driver creation
+            yield from self._browser_session_direct(site)
+
+    def _browser_session_from_pool(self, site: str, pool):
+        """
+        Get browser session from the pool.
+
+        Args:
+            site: Target site name
+            pool: EnterpriseBrowserPool instance
+
+        Yields:
+            Driver from pool
+        """
+        lease = None
         driver = None
+        session_dirty = False
+        dirty_reason = None
+        detected_captcha = False
+        detected_block = False
 
         try:
-            self.logger.info(f"Starting Selenium session for {site}")
+            self.logger.info(f"Acquiring pool session for {site}")
+
+            # Acquire session from pool
+            lease = pool.acquire_session(
+                target_domain=site,
+                requester=self.name,
+                timeout_seconds=60,
+                lease_duration_seconds=300,
+            )
+
+            if lease is None:
+                self.logger.warning(f"Pool session unavailable for {site}, falling back to direct driver")
+                yield from self._browser_session_direct(site)
+                return
+
+            # Get driver from pool
+            driver = pool.get_driver(lease)
+
+            if driver is None:
+                self.logger.warning(f"Pool driver unavailable for {site}, falling back to direct driver")
+                pool.release_session(lease, dirty=True, dirty_reason="No driver")
+                yield from self._browser_session_direct(site)
+                return
+
+            self._driver = driver
+            self._current_domain = site
+            self._lease = lease
+
+            self.logger.info(f"Pool session acquired: {lease.lease_id[:8]}")
+
+            yield driver
+
+        except Exception as e:
+            self.logger.error(f"Pool session error: {e}")
+            error_str = str(e).lower()
+            session_dirty = True
+            dirty_reason = str(e)
+            detected_captcha = "captcha" in error_str
+            detected_block = "blocked" in error_str or "forbidden" in error_str
+            raise
+
+        finally:
+            # Release session back to pool
+            if lease:
+                pool.release_session(
+                    lease,
+                    dirty=session_dirty,
+                    dirty_reason=dirty_reason,
+                    detected_captcha=detected_captcha,
+                    detected_block=detected_block,
+                )
+                self.logger.debug(f"Pool session released: {lease.lease_id[:8]}")
+
+            self._driver = None
+            self._current_domain = None
+            self._lease = None
+
+    def _browser_session_direct(self, site: str):
+        """
+        Create direct browser session (fallback when pool unavailable).
+
+        Includes PID tracking for emergency cleanup if driver.quit() fails,
+        preventing Chrome process leaks.
+
+        Args:
+            site: Target site name
+
+        Yields:
+            Fresh driver
+        """
+        driver = None
+        chrome_pid = None
+
+        try:
+            self.logger.info(f"Starting direct Selenium session for {site}")
 
             # Get appropriate driver for site
             driver = get_driver_for_site(
@@ -321,6 +457,18 @@ class BaseSeleniumScraper(ABC):
                 self.logger.error(f"Failed to create driver for {site}")
                 raise RuntimeError(f"Could not create driver for {site}")
 
+            # Track Chrome PID for emergency cleanup
+            # SeleniumBase stores the browser process in driver.browser_pid or service.process
+            try:
+                if hasattr(driver, 'browser_pid'):
+                    chrome_pid = driver.browser_pid
+                elif hasattr(driver, 'service') and hasattr(driver.service, 'process'):
+                    chrome_pid = driver.service.process.pid
+                if chrome_pid:
+                    self.logger.debug(f"Tracking Chrome PID {chrome_pid} for emergency cleanup")
+            except Exception:
+                pass  # PID tracking is optional
+
             self._driver = driver
             self._current_domain = site
 
@@ -331,13 +479,24 @@ class BaseSeleniumScraper(ABC):
             raise
 
         finally:
-            # Cleanup
+            # Cleanup - try graceful quit first, then emergency kill
+            quit_success = False
+
             if driver:
                 try:
                     driver.quit()
-                    self.logger.debug("Driver closed")
+                    quit_success = True
+                    self.logger.debug("Driver closed successfully")
                 except Exception as e:
-                    self.logger.debug(f"Driver cleanup error: {e}")
+                    self.logger.warning(f"Driver quit() failed: {e}")
+
+            # Emergency cleanup: kill Chrome process if quit failed
+            if not quit_success and chrome_pid:
+                try:
+                    os.kill(chrome_pid, signal.SIGKILL)
+                    self.logger.info(f"Emergency killed Chrome PID {chrome_pid}")
+                except (ProcessLookupError, PermissionError, OSError) as e:
+                    self.logger.debug(f"Emergency kill failed (may already be dead): {e}")
 
             self._driver = None
             self._current_domain = None
@@ -350,6 +509,9 @@ class BaseSeleniumScraper(ABC):
         """
         Validate page response for CAPTCHA/block detection.
 
+        Uses regex pattern matching for high-confidence CAPTCHA detection
+        to avoid false positives from text mentions of "captcha".
+
         Args:
             driver: Selenium driver
             url: URL being validated
@@ -357,32 +519,54 @@ class BaseSeleniumScraper(ABC):
         Returns:
             Tuple of (is_valid, reason_code)
         """
-        try:
-            page_source = driver.page_source.lower()
+        import re
 
-            # CAPTCHA indicators
-            captcha_indicators = [
-                'captcha', 'recaptcha', 'g-recaptcha', 'hcaptcha',
-                'cf-challenge', 'please verify you are human',
-                'security check', 'unusual traffic',
+        try:
+            page_source = driver.page_source
+            page_lower = page_source.lower()
+
+            # High-confidence CAPTCHA patterns (element-based, not text mentions)
+            captcha_patterns = [
+                r'<iframe[^>]*(?:recaptcha|hcaptcha)',           # reCAPTCHA/hCaptcha iframe
+                r'<div[^>]*class=["\'][^"\']*(?:g-recaptcha|h-captcha)',  # CAPTCHA div class
+                r'cf-challenge-running',                          # Cloudflare challenge
+                r'challenge-platform',                            # Generic challenge platform
+                r'id=["\']captcha',                               # ID containing captcha
+                r'data-sitekey=',                                 # reCAPTCHA/hCaptcha sitekey
             ]
 
-            for indicator in captcha_indicators:
-                if indicator in page_source:
-                    self.logger.warning(f"CAPTCHA detected: {indicator}")
+            for pattern in captcha_patterns:
+                if re.search(pattern, page_lower):
+                    self.logger.warning(f"CAPTCHA detected via pattern: {pattern[:40]}")
                     return False, "CAPTCHA_DETECTED"
 
-            # Bot detection indicators
+            # Blocking text indicators - only flag if page is very short (no real content)
+            blocking_indicators = [
+                'verify you are human',
+                'security check required',
+                'please complete the security check',
+                'unusual traffic from your computer',
+            ]
+
+            if any(ind in page_lower for ind in blocking_indicators):
+                # Only flag if page is also very short (no real content)
+                if len(page_source) < 2000:
+                    self.logger.warning("CAPTCHA page detected (blocking text + short page)")
+                    return False, "CAPTCHA_DETECTED"
+
+            # Bot detection indicators - more specific patterns
             bot_indicators = [
-                'access denied', 'blocked', 'forbidden',
+                'access denied',
                 'your access to this site has been limited',
-                'enable javascript', 'please enable cookies',
+                '403 forbidden',
             ]
 
             for indicator in bot_indicators:
-                if indicator in page_source:
-                    self.logger.warning(f"Bot detection: {indicator}")
-                    return False, "BOT_DETECTED"
+                if indicator in page_lower:
+                    # Only flag if page lacks main content
+                    if len(page_source) < 3000:
+                        self.logger.warning(f"Bot detection: {indicator}")
+                        return False, "BOT_DETECTED"
 
             # Check for minimal content
             if len(page_source) < 500:
@@ -461,6 +645,27 @@ class BaseSeleniumScraper(ABC):
                     self.logger.warning(f"Page validation failed: {reason}")
 
                     if reason in ("CAPTCHA_DETECTED", "BOT_DETECTED"):
+                        self.stats["captchas_detected"] += 1
+
+                        # Try escalation before quarantine
+                        if self.enable_escalation and self.escalation_manager:
+                            self.escalation_manager.record_failure(domain, is_captcha=(reason == "CAPTCHA_DETECTED"))
+                            self.stats["escalations"] += 1
+
+                            # Check if we should try Camoufox
+                            if should_use_camoufox(domain) and not self._using_camoufox:
+                                self.logger.info(f"Escalating to Camoufox for {domain}")
+                                camoufox_result = self._fetch_with_camoufox(
+                                    url=url,
+                                    wait_for_selector=wait_for_selector,
+                                    extra_wait=extra_wait,
+                                )
+                                if camoufox_result:
+                                    self.stats["camoufox_used"] += 1
+                                    self.stats["pages_crawled"] += 1
+                                    return camoufox_result
+
+                        # Camoufox failed or not enabled, quarantine
                         self.domain_quarantine.quarantine_domain(
                             domain=domain,
                             reason=reason,
@@ -470,7 +675,10 @@ class BaseSeleniumScraper(ABC):
                     self.stats["pages_failed"] += 1
                     return None
 
-                # Success
+                # Success - report to escalation manager
+                if self.enable_escalation and self.escalation_manager:
+                    self.escalation_manager.record_success(domain)
+
                 self.domain_quarantine.reset_retry_attempts(domain)
                 self.stats["pages_crawled"] += 1
 
@@ -504,6 +712,85 @@ class BaseSeleniumScraper(ABC):
         self.stats["pages_failed"] += 1
         self.logger.error(f"Failed to fetch {url} after {self.max_retries} attempts")
         return None
+
+    def _fetch_with_camoufox(
+        self,
+        url: str,
+        wait_for_selector: Optional[str] = None,
+        extra_wait: float = 0,
+    ) -> Optional[str]:
+        """
+        Fetch a page using Camoufox (Firefox-based undetected browser).
+
+        This is used as a fallback when SeleniumBase UC gets CAPTCHA'd.
+
+        Args:
+            url: URL to fetch
+            wait_for_selector: CSS selector to wait for
+            extra_wait: Additional wait time
+
+        Returns:
+            Page HTML or None if failed
+        """
+        domain = urlparse(url).netloc
+
+        try:
+            self.logger.info(f"Attempting Camoufox fetch for {url}")
+            self._using_camoufox = True
+
+            # Get escalation state for this domain
+            state = self.escalation_manager.get_state(domain) if self.escalation_manager else None
+            new_fingerprint = state and state.current_tier == BrowserTier.CAMOUFOX_NEW_FP
+
+            # Create Camoufox driver
+            driver = CamoufoxDriver(
+                headless=self.headless,
+                humanize=True,
+                new_fingerprint=new_fingerprint,
+                page_timeout=self.page_timeout * 1000,  # Convert to ms
+            )
+
+            try:
+                # Fetch the page
+                artifact = driver.fetch_page(
+                    url=url,
+                    wait_for_selector=wait_for_selector,
+                    extra_wait=extra_wait,
+                )
+
+                if artifact is None:
+                    self.logger.warning("Camoufox fetch returned None")
+                    return None
+
+                # Check for CAPTCHA/block
+                if artifact.detected_captcha:
+                    self.logger.warning("Camoufox also got CAPTCHA'd")
+                    if self.escalation_manager:
+                        self.escalation_manager.record_failure(domain, is_captcha=True)
+                    return None
+
+                if artifact.detected_block:
+                    self.logger.warning("Camoufox got blocked")
+                    if self.escalation_manager:
+                        self.escalation_manager.record_failure(domain, is_captcha=False)
+                    return None
+
+                # Success!
+                self.logger.info(f"Camoufox successfully fetched {url} ({len(artifact.html)} chars)")
+                if self.escalation_manager:
+                    self.escalation_manager.record_success(domain)
+
+                return artifact.html
+
+            finally:
+                driver.close()
+
+        except Exception as e:
+            self.logger.error(f"Camoufox fetch error: {e}")
+            return None
+
+        finally:
+            self._using_camoufox = False
 
     def fetch_page_with_artifact(
         self,
@@ -821,7 +1108,7 @@ class BaseSeleniumScraper(ABC):
         Wait for an element with various conditions.
 
         Args:
-            driver: Selenium driver
+            driver: Selenium driver or CamoufoxSeleniumWrapper
             selector: Element selector
             by: Selector type (By.CSS_SELECTOR, By.XPATH, etc.)
             timeout: Wait timeout
@@ -831,6 +1118,21 @@ class BaseSeleniumScraper(ABC):
             Element if found, None otherwise
         """
         timeout = timeout or self.page_timeout
+
+        # Check if this is a Camoufox wrapper (Playwright-based)
+        if hasattr(driver, 'wait_for_element') and 'CamoufoxSeleniumWrapper' in type(driver).__name__:
+            # Use Playwright's native wait_for_selector
+            state_map = {
+                "presence": "attached",
+                "visible": "visible",
+                "clickable": "visible",  # Playwright doesn't have clickable, use visible
+            }
+            state = state_map.get(condition, "visible")
+            # Convert timeout to milliseconds for Playwright
+            timeout_ms = timeout * 1000 if timeout < 1000 else timeout
+            return driver.wait_for_element(selector, timeout=timeout_ms, state=state)
+
+        # Standard Selenium WebDriverWait
         wait = WebDriverWait(driver, timeout)
 
         conditions = {
@@ -854,6 +1156,9 @@ class BaseSeleniumScraper(ABC):
     ):
         """Find all matching elements."""
         try:
+            # Camoufox wrapper uses (by, value) format for find_elements
+            if 'CamoufoxSeleniumWrapper' in type(driver).__name__:
+                return driver.find_elements(str(by), selector)
             return driver.find_elements(by, selector)
         except Exception:
             return []

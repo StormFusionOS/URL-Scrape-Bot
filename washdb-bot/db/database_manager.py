@@ -179,6 +179,41 @@ class DatabaseManager:
 
         return result
 
+    @contextmanager
+    def get_connection(self, db_type: DatabaseType = 'washdb'):
+        """
+        Get raw database connection for backwards compatibility.
+
+        Args:
+            db_type: Which database to connect to ('washdb' or 'scraper')
+
+        Usage:
+            with db_manager.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM companies")
+
+        Yields:
+            Raw psycopg2 connection
+        """
+        if db_type == 'scraper':
+            if not self.ScraperSessionLocal:
+                raise RuntimeError("Scraper database not configured. Set SCRAPER_DATABASE_URL in .env")
+            session = self.ScraperSessionLocal()
+        else:
+            session = self.WashdbSessionLocal()
+
+        try:
+            # Get raw connection from session
+            connection = session.connection().connection
+            yield connection
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Database connection error ({db_type}): {e}")
+            raise
+        finally:
+            session.close()
+
     def close(self):
         """Close all database connections"""
         try:
@@ -217,23 +252,3 @@ def create_session() -> Session:
     db_manager = get_db_manager()
     # Return a raw session (not context managed)
     return db_manager.WashdbSessionLocal()
-
-    @contextmanager
-    def get_connection(self):
-        """
-        Get raw database connection (psycopg2).
-        For backwards compatibility with code expecting raw connections.
-        """
-        from sqlalchemy import text
-        session = self.WashdbSessionLocal()
-        try:
-            # Get raw connection from session
-            connection = session.connection().connection
-            yield connection
-            session.commit()
-        except Exception as e:
-            session.rollback()
-            logger.error(f"Database connection error: {e}")
-            raise
-        finally:
-            session.close()

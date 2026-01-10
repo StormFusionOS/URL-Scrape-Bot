@@ -247,6 +247,36 @@ class YPFilter:
 
         return False, ""
 
+    def _is_toll_free_number(self, phone: str) -> Tuple[bool, str]:
+        """
+        Check if phone number is a toll-free number.
+
+        Toll-free numbers (1-800, 1-888, 1-877, 1-866, 1-855, 1-844, 1-833)
+        typically indicate national chains, lead-gen services, or call centers
+        rather than local service businesses.
+
+        Args:
+            phone: Phone number string
+
+        Returns:
+            Tuple of (is_toll_free, reason)
+        """
+        if not phone:
+            return False, ""
+
+        # Normalize phone - remove all non-digits
+        digits = re.sub(r'\D', '', phone)
+
+        # Toll-free prefixes (after removing leading 1 for US numbers)
+        toll_free_prefixes = ['800', '888', '877', '866', '855', '844', '833']
+
+        # Check if starts with 1 + toll-free prefix or just toll-free prefix
+        for prefix in toll_free_prefixes:
+            if digits.startswith('1' + prefix) or digits.startswith(prefix):
+                return True, f"toll-free: {prefix}"
+
+        return False, ""
+
     def should_include(self, listing: Dict) -> Tuple[bool, str, float]:
         """
         Determine if a listing should be included based on filtering rules.
@@ -256,6 +286,8 @@ class YPFilter:
         2. Must NOT have any blocked category tags
         3. Must NOT have anti-keywords in name
         4. Special case for "Equipment & Services" category
+        5. Must NOT have e-commerce URL
+        6. Must have website
 
         Args:
             listing: Listing dict with keys: name, category_tags, description (optional)

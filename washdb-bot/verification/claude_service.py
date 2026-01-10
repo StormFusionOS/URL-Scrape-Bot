@@ -35,7 +35,8 @@ from dotenv import load_dotenv
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from db.database_manager import DatabaseManager
+from sqlalchemy import text
+from db.database_manager import get_db_manager
 from verification.claude_api_client import ClaudeAPIClient, ClaudeReviewResult
 from verification.claude_prompt_manager import PromptManager
 from verification.config_verifier import (
@@ -136,7 +137,7 @@ class ClaudeService:
 
     def __init__(self):
         """Initialize Claude service."""
-        self.db_manager = DatabaseManager()
+        self.db_manager = get_db_manager()
         self.api_client = ClaudeAPIClient()
         self.prompt_manager = PromptManager(db_manager=self.db_manager)
         self.stats = ServiceStats()
@@ -237,15 +238,15 @@ class ClaudeService:
                 SELECT id FROM claude_review_queue
                 WHERE status = 'pending'
                 ORDER BY priority ASC, queued_at ASC
-                LIMIT %(limit)s
+                LIMIT :limit
                 FOR UPDATE SKIP LOCKED
             )
             RETURNING id, company_id, priority, score
         """
 
-        with self.db_manager.get_connection() as conn:
-                        result = conn.execute(text(query), {'limit': limit})
-            queue_rows = cursor.fetchall()
+        with self.db_manager.get_session() as session:
+            result = session.execute(text(query), {'limit': limit})
+            queue_rows = result.fetchall()
             # commit handled by context manager
 
         if not queue_rows:
@@ -256,12 +257,12 @@ class ClaudeService:
         company_query = """
             SELECT id, name, website, parse_metadata
             FROM companies
-            WHERE id = ANY(%(ids)s)
+            WHERE id = ANY(:ids)
         """
 
-        with self.db_manager.get_connection() as conn:
-                        result = conn.execute(text(company_query), {'ids': company_ids})
-            company_rows = cursor.fetchall()
+        with self.db_manager.get_session() as session:
+            result = session.execute(text(company_query), {'ids': company_ids})
+            company_rows = result.fetchall()
 
         # Build company dicts
         companies = []
@@ -326,11 +327,11 @@ class ClaudeService:
         """
         Apply Claude's decision to company metadata.
 
-        Updates parse_metadata with Claude review and label.
+        Updates parse_metadata with Claude review, label, and standardized name.
         """
         company_id = company.get('id')
 
-        # Build claude_review metadata
+        # Build claude_review metadata (verification + standardization)
         claude_review = {
             'reviewed': True,
             'reviewed_at': datetime.now().isoformat(),
@@ -338,7 +339,12 @@ class ClaudeService:
             'confidence': result.confidence,
             'reasoning': result.reasoning,
             'prompt_version': result.raw_response.get('model', 'unknown'),
-            'overridden_by_human': False
+            'overridden_by_human': False,
+            # Standardization data (for training)
+            'standardized_name': result.standardized_name,
+            'standardization_confidence': result.standardization_confidence,
+            'standardization_source': result.standardization_source,
+            'standardization_reasoning': result.standardization_reasoning
         }
 
         # Determine label
@@ -349,33 +355,59 @@ class ClaudeService:
         else:
             label = None
 
-        # Update database
-        update_query = """
-            UPDATE companies
-            SET parse_metadata = jsonb_set(
-                jsonb_set(
-                    parse_metadata,
-                    '{verification,claude_review}',
-                    %(claude_review)s::jsonb
+        # Update database - include standardized_name column if we have one
+        if result.standardized_name and result.standardization_confidence >= 0.7:
+            update_query = """
+                UPDATE companies
+                SET parse_metadata = jsonb_set(
+                    jsonb_set(
+                        parse_metadata,
+                        '{verification,claude_review}',
+                        CAST(:claude_review AS jsonb)
+                    ),
+                    '{verification,labels,claude}',
+                    CAST(:label AS jsonb)
                 ),
-                '{verification,labels,claude}',
-                %(label)s::jsonb
-            )
-            WHERE id = %(company_id)s
-        """
+                standardized_name = :std_name,
+                standardized_name_source = 'claude',
+                standardized_name_confidence = :std_confidence
+                WHERE id = :company_id
+            """
+            params = {
+                'claude_review': json.dumps(claude_review),
+                'label': json.dumps(label) if label else 'null',
+                'company_id': company_id,
+                'std_name': result.standardized_name,
+                'std_confidence': result.standardization_confidence
+            }
+        else:
+            update_query = """
+                UPDATE companies
+                SET parse_metadata = jsonb_set(
+                    jsonb_set(
+                        parse_metadata,
+                        '{verification,claude_review}',
+                        CAST(:claude_review AS jsonb)
+                    ),
+                    '{verification,labels,claude}',
+                    CAST(:label AS jsonb)
+                )
+                WHERE id = :company_id
+            """
+            params = {
+                'claude_review': json.dumps(claude_review),
+                'label': json.dumps(label) if label else 'null',
+                'company_id': company_id
+            }
 
-        with self.db_manager.get_connection() as conn:
-                        result = conn.execute(text(
-                update_query,
-                {
-                    'claude_review': json.dumps(claude_review)),
-                    'label': json.dumps(label) if label else 'null',
-                    'company_id': company_id
-                }
-            )
+        with self.db_manager.get_session() as session:
+            session.execute(text(update_query), params)
             # commit handled by context manager
 
-        logger.debug(f"Applied decision to company {company_id}")
+        if result.standardized_name:
+            logger.debug(f"Applied decision + standardization to company {company_id}: '{result.standardized_name}'")
+        else:
+            logger.debug(f"Applied decision to company {company_id}")
 
     async def _log_audit(
         self,
@@ -383,10 +415,18 @@ class ClaudeService:
         result: ClaudeReviewResult,
         prompt_data: dict
     ):
-        """Log audit record to database."""
+        """Log audit record to database (verification + standardization for training)."""
         company_id = company.get('id')
         metadata = company.get('parse_metadata', {})
         verification = metadata.get('verification', {})
+
+        # Build standardization data for training export
+        standardization_data = {
+            'standardized_name': result.standardized_name,
+            'confidence': result.standardization_confidence,
+            'source': result.standardization_source,
+            'reasoning': result.standardization_reasoning
+        }
 
         insert_query = """
             INSERT INTO claude_review_audit (
@@ -401,6 +441,10 @@ class ClaudeService:
                 primary_services,
                 identified_red_flags,
                 is_provider,
+                standardized_name,
+                standardization_confidence,
+                standardization_source,
+                standardization_reasoning,
                 raw_response,
                 api_latency_ms,
                 tokens_input,
@@ -408,32 +452,36 @@ class ClaudeService:
                 cached_tokens,
                 cost_estimate
             ) VALUES (
-                %(company_id)s,
+                :company_id,
                 NOW(),
-                %(input_score)s,
-                %(input_metadata)s,
-                %(prompt_version)s,
-                %(decision)s,
-                %(confidence)s,
-                %(reasoning)s,
-                %(primary_services)s,
-                %(identified_red_flags)s,
-                %(is_provider)s,
-                %(raw_response)s,
-                %(api_latency_ms)s,
-                %(tokens_input)s,
-                %(tokens_output)s,
-                %(cached_tokens)s,
-                %(cost_estimate)s
+                :input_score,
+                :input_metadata,
+                :prompt_version,
+                :decision,
+                :confidence,
+                :reasoning,
+                :primary_services,
+                :identified_red_flags,
+                :is_provider,
+                :standardized_name,
+                :standardization_confidence,
+                :standardization_source,
+                :standardization_reasoning,
+                :raw_response,
+                :api_latency_ms,
+                :tokens_input,
+                :tokens_output,
+                :cached_tokens,
+                :cost_estimate
             )
         """
 
-        with self.db_manager.get_connection() as conn:
-                        result = conn.execute(text(
-                insert_query,
+        with self.db_manager.get_session() as session:
+            session.execute(
+                text(insert_query),
                 {
                     'company_id': company_id,
-                    'input_score': float(verification.get('final_score', 0.0))),
+                    'input_score': float(verification.get('final_score', 0.0)),
                     'input_metadata': json.dumps(verification),
                     'prompt_version': prompt_data['prompt_version'],
                     'decision': result.decision,
@@ -442,6 +490,10 @@ class ClaudeService:
                     'primary_services': result.primary_services,
                     'identified_red_flags': result.identified_red_flags,
                     'is_provider': result.is_provider,
+                    'standardized_name': result.standardized_name,
+                    'standardization_confidence': result.standardization_confidence,
+                    'standardization_source': result.standardization_source,
+                    'standardization_reasoning': result.standardization_reasoning,
                     'raw_response': json.dumps(result.raw_response),
                     'api_latency_ms': result.api_latency_ms,
                     'tokens_input': result.tokens_input,
@@ -458,12 +510,12 @@ class ClaudeService:
             UPDATE claude_review_queue
             SET status = 'completed',
                 processed_at = NOW()
-            WHERE company_id = %(company_id)s
+            WHERE company_id = :company_id
               AND status = 'processing'
         """
 
-        with self.db_manager.get_connection() as conn:
-                        result = conn.execute(text(update_query), {'company_id': company_id})
+        with self.db_manager.get_session() as session:
+            session.execute(text(update_query), {'company_id': company_id})
             # commit handled by context manager
 
     async def _handle_error(self, company: dict, error_message: str):
@@ -475,18 +527,18 @@ class ClaudeService:
         update_query = """
             UPDATE claude_review_queue
             SET status = 'failed',
-                error_message = %(error)s,
+                error_message = :error,
                 last_error_at = NOW(),
                 retry_count = retry_count + 1
-            WHERE company_id = %(company_id)s
+            WHERE company_id = :company_id
               AND status = 'processing'
         """
 
-        with self.db_manager.get_connection() as conn:
-                        result = conn.execute(text(
-                update_query,
+        with self.db_manager.get_session() as session:
+            session.execute(
+                text(update_query),
                 {'error': error_message, 'company_id': company_id}
-            ))
+            )
             # commit handled by context manager
 
     async def _check_safety_limits(self) -> bool:
@@ -500,9 +552,9 @@ class ClaudeService:
             WHERE reviewed_at >= CURRENT_DATE
         """
 
-        with self.db_manager.get_connection() as conn:
-                        result = conn.execute(text(query))
-            row = cursor.fetchone()
+        with self.db_manager.get_session() as session:
+            result = session.execute(text(query))
+            row = result.fetchone()
             review_count, total_cost = row
 
         # Check limits
@@ -530,31 +582,31 @@ class ClaudeService:
             ) VALUES (
                 date_trunc('hour', NOW()),
                 1,
-                %(tokens_input)s,
-                %(tokens_output)s,
-                %(cached_tokens)s,
-                %(cost_estimate)s,
+                :tokens_input,
+                :tokens_output,
+                :cached_tokens,
+                :cost_estimate,
                 NOW()
             )
             ON CONFLICT (hour_bucket) DO UPDATE SET
                 requests_made = claude_rate_limits.requests_made + 1,
-                tokens_input = claude_rate_limits.tokens_input + %(tokens_input)s,
-                tokens_output = claude_rate_limits.tokens_output + %(tokens_output)s,
-                cached_tokens = claude_rate_limits.cached_tokens + %(cached_tokens)s,
-                cost_estimate = claude_rate_limits.cost_estimate + %(cost_estimate)s,
+                tokens_input = claude_rate_limits.tokens_input + :tokens_input,
+                tokens_output = claude_rate_limits.tokens_output + :tokens_output,
+                cached_tokens = claude_rate_limits.cached_tokens + :cached_tokens,
+                cost_estimate = claude_rate_limits.cost_estimate + :cost_estimate,
                 updated_at = NOW()
         """
 
-        with self.db_manager.get_connection() as conn:
-                        result = conn.execute(text(
-                query,
+        with self.db_manager.get_session() as session:
+            session.execute(
+                text(query),
                 {
                     'tokens_input': result.tokens_input,
                     'tokens_output': result.tokens_output,
                     'cached_tokens': result.cached_tokens,
                     'cost_estimate': result.cost_estimate
                 }
-            ))
+            )
             # commit handled by context manager
 
     async def _run_socket_server(self):

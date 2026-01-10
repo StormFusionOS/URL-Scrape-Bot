@@ -33,11 +33,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 # Load environment
 load_dotenv()
 
-from seo_intelligence.scrapers.serp_scraper import SerpScraper
-from seo_intelligence.scrapers.citation_crawler import CitationCrawler
-from seo_intelligence.scrapers.backlink_crawler import BacklinkCrawler
-from seo_intelligence.scrapers.competitor_crawler import CompetitorCrawler
-from seo_intelligence.scrapers.technical_auditor import TechnicalAuditor
+from seo_intelligence.scrapers import (
+    SerpScraper,
+    CitationCrawler,
+    BacklinkCrawler,
+    CompetitorCrawler,
+    TechnicalAuditor,
+)
 from seo_intelligence.services.las_calculator import LASCalculator
 from seo_intelligence.services.nap_validator import NAPValidator
 
@@ -204,7 +206,7 @@ class TestCitationCrawler:
         print("✓ Citation crawler initialized successfully")
 
         # Check that citation directories are configured
-        from seo_intelligence.scrapers.citation_crawler import CITATION_DIRECTORIES
+        from seo_intelligence.scrapers.citation_crawler_selenium import CITATION_DIRECTORIES
         print(f"  - Citation directories configured: {len(CITATION_DIRECTORIES)}")
         for key, info in list(CITATION_DIRECTORIES.items())[:5]:
             print(f"    • {info['name']}")

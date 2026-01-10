@@ -1,0 +1,35 @@
+[Unit]
+Description=WashDB Name Standardization Service (Browser-Based)
+After=network.target postgresql.service ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=rivercityscrape
+Group=rivercityscrape
+
+# Load environment variables
+EnvironmentFile=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/.env
+EnvironmentFile=-/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/systemd/washdb-bot.env
+
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+Environment="DISPLAY=:99"
+Environment="PYTHONUNBUFFERED=1"
+Environment="OLLAMA_MODEL=unified-washdb"
+Environment="BROWSER_HEADLESS=false"
+
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python scripts/standardization_service_browser.py
+
+# Restart policy
+Restart=on-failure
+RestartSec=30
+
+# Logging
+StandardOutput=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/standardization_browser.log
+StandardError=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/standardization_browser_error.log
+
+# Resource limits - browser needs more memory
+MemoryMax=6G
+
+[Install]
+WantedBy=multi-user.target

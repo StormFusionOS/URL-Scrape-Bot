@@ -1,0 +1,31 @@
+[Unit]
+Description=WashDB Browser Watchdog - Auto-restart stale browser sessions
+After=network.target postgresql.service
+Wants=standardization-worker-pool.service seo-job-worker.service
+
+[Service]
+Type=simple
+# Run as root to allow systemctl restarts without sudo
+User=root
+Group=root
+
+EnvironmentFile=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/.env
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+Environment="PYTHONUNBUFFERED=1"
+
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python -m services.browser_watchdog --interval 15
+
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+StandardOutput=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/browser_watchdog.log
+StandardError=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/browser_watchdog_error.log
+
+# Resource limits - watchdog is lightweight
+MemoryMax=256M
+CPUQuota=5%
+
+[Install]
+WantedBy=multi-user.target

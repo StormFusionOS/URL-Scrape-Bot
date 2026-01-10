@@ -52,8 +52,8 @@ class SEOContinuousWorker(BaseModuleWorker):
         """Get or create technical auditor."""
         if self._auditor is None:
             try:
-                from seo_intelligence.scrapers.technical_auditor import TechnicalAuditor
-                self._auditor = TechnicalAuditor(headless=True)
+                from seo_intelligence.scrapers.technical_auditor_selenium import TechnicalAuditorSelenium
+                self._auditor = TechnicalAuditorSelenium(headless=True)
                 logger.info("SEO worker auditor initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize auditor: {e}")

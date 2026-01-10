@@ -14,7 +14,8 @@ import json
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
-from db.database_manager import DatabaseManager
+from sqlalchemy import text
+from db.database_manager import get_db_manager
 from verification.few_shot_selector import FewShotSelector
 from verification.config_verifier import (
     CLAUDE_NUM_FEW_SHOT_EXAMPLES,
@@ -42,9 +43,9 @@ class PromptManager:
     - Optimize for prompt caching (static vs dynamic content)
     """
 
-    def __init__(self, db_manager: Optional[DatabaseManager] = None):
+    def __init__(self, db_manager=None):
         """Initialize prompt manager."""
-        self.db_manager = db_manager or DatabaseManager()
+        self.db_manager = db_manager or get_db_manager()
         self.few_shot_selector = FewShotSelector(db_manager=self.db_manager)
 
         # Cache for current prompt version
@@ -109,16 +110,16 @@ class PromptManager:
             LIMIT 1
         """
 
-        with self.db_manager.get_connection() as conn:
-                        result = conn.execute(text(query))
-            row = cursor.fetchone()
+        with self.db_manager.get_session() as session:
+            result = session.execute(text(query))
+            row = result.fetchone()
 
-            if not row:
-                logger.error("No active prompt version found in database!")
-                # Return default prompt
-                return self._get_default_prompt()
+        if not row:
+            logger.error("No active prompt version found in database!")
+            # Return default prompt
+            return self._get_default_prompt()
 
-            version, prompt_text, examples_json = row
+        version, prompt_text, examples_json = row
 
         # Parse examples
         if examples_json and len(examples_json) > 0:
@@ -151,15 +152,11 @@ class PromptManager:
         """Return default prompt if database is empty."""
         logger.warning("Using default prompt (database had no active version)")
 
-        default_prompt = """You are a business verification specialist. Your task is to determine if a company is a legitimate service provider (e.g., pressure washing, window cleaning) or a non-provider (directory, equipment seller, training course, blog, lead generation agency).
+        default_prompt = """You are a business verification and name standardization specialist. You have TWO tasks:
 
-## Context
-You have access to:
-- Automated verification signals (scores, ML predictions, red flags)
-- Website content (services, about, homepage text)
-- Business info (name, contact, location)
+## TASK 1: VERIFICATION
+Determine if this company is a legitimate service provider (e.g., pressure washing, window cleaning) or a non-provider (directory, equipment seller, training course, blog, lead generation agency).
 
-## Decision Criteria
 APPROVE (legitimate provider) if:
 - Offers direct services to customers (residential or commercial)
 - Has clear contact info (phone, address, or service area)
@@ -176,21 +173,43 @@ DENY (non-provider) if:
 UNCLEAR if:
 - Insufficient information
 - Conflicting signals
-- Legitimate provider BUT also sells equipment/training
+
+## TASK 2: NAME STANDARDIZATION
+Extract the official business name from the website data. This is the name customers would search for on Google or find in citation directories (Yelp, BBB, etc.).
+
+Look for the name in order of reliability:
+1. JSON-LD schema "name" field
+2. og:site_name meta tag
+3. Title tag (remove suffixes like "| Home", "- Professional Services")
+4. H1 heading on homepage
+5. Copyright notice
+6. Domain name (last resort)
+
+NAME RULES:
+- Keep legal suffixes: LLC, Inc, Corp, Co.
+- Use Title Case properly
+- Remove taglines, slogans, phone numbers
+- Keep location if part of official name (e.g., "Window Genie of North Dallas")
+- Preserve brand formatting (e.g., "1-800-SWEEPER", "A&B Power Wash")
+- Use null if truly cannot determine
 
 ## Output Format
-Respond with JSON:
+Respond with JSON only:
 {
   "decision": "approve" | "deny" | "unclear",
-  "confidence": 0.85,  // 0.0-1.0
-  "reasoning": "Brief explanation of decision (2-3 sentences)",
+  "confidence": 0.85,
+  "reasoning": "Brief verification explanation (2-3 sentences)",
   "primary_services": ["pressure washing", "window cleaning"],
-  "red_flags": ["franchise"] | [],
-  "is_provider": true | false
+  "red_flags": [],
+  "is_provider": true | false,
+  "standardized_name": "Extracted Business Name LLC",
+  "standardization_confidence": 0.95,
+  "standardization_source": "title" | "json_ld" | "og_tag" | "h1" | "copyright" | "domain",
+  "standardization_reasoning": "Found in title tag, removed '| Home' suffix"
 }"""
 
         return {
-            'version': 'default',
+            'version': 'default_v2_unified',
             'system_prompt': default_prompt,
             'few_shot_examples': []
         }
@@ -238,6 +257,16 @@ Respond with JSON:
             'homepage': self._truncate_text(metadata.get('homepage_text', ''), 300)
         }
 
+        # Name extraction signals (for standardization)
+        name_signals = {
+            'page_title': metadata.get('title', ''),
+            'og_site_name': metadata.get('og_site_name', ''),
+            'json_ld_name': metadata.get('json_ld_name', ''),
+            'h1_text': metadata.get('h1_text', ''),
+            'copyright_text': self._truncate_text(metadata.get('copyright_text', ''), 200),
+            'current_db_name': name
+        }
+
         # Business info
         business_info = {
             'phone': metadata.get('phone', ''),
@@ -254,6 +283,7 @@ Respond with JSON:
             'domain': domain,
             'automated_signals': automated_signals,
             'website_content': website_content,
+            'name_signals': name_signals,
             'business_info': business_info
         }
 
@@ -297,17 +327,16 @@ def test_prompt_manager():
     pm = PromptManager()
 
     # Get a sample company
-    db_manager = DatabaseManager()
-    with db_manager.get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+    db_manager = get_db_manager()
+    with db_manager.get_session() as session:
+        result = session.execute(text("""
             SELECT id, name, website, parse_metadata
             FROM companies
             WHERE active = true
               AND parse_metadata IS NOT NULL
             LIMIT 1
-        """)
-        row = cursor.fetchone()
+        """))
+        row = result.fetchone()
 
     if not row:
         print("ERROR: No companies found in database")

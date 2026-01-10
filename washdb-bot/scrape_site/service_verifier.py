@@ -76,26 +76,17 @@ class ServiceVerifier:
         self.llm_verifier = None
 
         # Initialize LLM (primary classification method)
-        # Use trained model by default (single-shot), fall back to old model if needed
+        # Uses unified model for both verification and standardization
         if use_llm:
             try:
-                # Try trained model first (verification-mistral-proper)
-                from scrape_site.trained_llm_verifier import get_trained_llm_verifier
-                self.llm_verifier = get_trained_llm_verifier()
+                from verification.unified_llm import get_unified_llm
+                self.llm_verifier = get_unified_llm()
                 self.use_trained_model = True
-                logger.info("✓ TRAINED LLM verifier loaded (verification-mistral-proper)")
+                logger.info("✓ Unified LLM loaded (unified-washdb-v2)")
             except Exception as e:
-                logger.warning(f"Failed to load trained LLM verifier: {e}")
-                # Fall back to old multi-question verifier
-                try:
-                    from scrape_site.llm_verifier import get_llm_verifier
-                    self.llm_verifier = get_llm_verifier()
-                    self.use_trained_model = False
-                    logger.info("✓ LLM verifier loaded (Mistral 7B on GPU - fallback)")
-                except Exception as e2:
-                    logger.warning(f"Failed to load any LLM verifier: {e2}")
-                    self.use_llm = False
-                    self.use_trained_model = False
+                logger.warning(f"Failed to load unified LLM: {e}")
+                self.use_llm = False
+                self.use_trained_model = False
 
         # Extract service definitions
         self.services = {
@@ -198,6 +189,10 @@ class ServiceVerifier:
             return result
 
         company_name = company_data.get('name', '')
+
+        # Phase 1b: Check excluded service types (car wash, auto detailing, etc.)
+        if self._check_excluded_service_type(company_name, website, result):
+            return result
 
         # === PHASE 2: LLM-First Classification (Primary) ===
         llm_result = None
@@ -349,6 +344,42 @@ class ServiceVerifier:
         for indicator in ['shop', 'store', 'cart', 'ecommerce', 'online-store']:
             if indicator in domain:
                 result['negative_signals'].append(f'Ecommerce indicator in domain: {indicator}')
+
+        return False
+
+    def _check_excluded_service_type(self, company_name: str, website: str, result: Dict) -> bool:
+        """
+        Check if company is an excluded service type (car wash, auto detailing, etc.).
+        Returns True if excluded (should not be verified).
+        """
+        # Get excluded keywords from config
+        excluded_keywords = []
+        for category in ['auto_detailing', 'training_keywords', 'equipment_keywords', 'marketing_keywords']:
+            if category in self.neg_filters:
+                excluded_keywords.extend(self.neg_filters[category])
+
+        # Check company name
+        name_lower = (company_name or '').lower()
+        website_lower = (website or '').lower()
+
+        for keyword in excluded_keywords:
+            keyword_lower = keyword.lower()
+            if keyword_lower in name_lower:
+                result['status'] = 'failed'
+                result['score'] = 0.0
+                result['reason'] = f'Excluded service type in name: {keyword}'
+                result['negative_signals'].append(f'Excluded service: {keyword}')
+                logger.debug(f"Excluded company '{company_name}' - matched '{keyword}' in name")
+                return True
+
+            # Also check domain for car wash indicators
+            if keyword_lower in website_lower:
+                result['status'] = 'failed'
+                result['score'] = 0.0
+                result['reason'] = f'Excluded service type in website: {keyword}'
+                result['negative_signals'].append(f'Excluded service in URL: {keyword}')
+                logger.debug(f"Excluded company '{company_name}' - matched '{keyword}' in URL")
+                return True
 
         return False
 
@@ -606,8 +637,8 @@ class ServiceVerifier:
         """
         Get LLM classification for uncertain cases.
 
-        Uses the trained model (verification-mistral-proper) with actual page content
-        for single-shot classification, or falls back to the old multi-question model.
+        Uses the unified model (unified-washdb-v2) with actual page content
+        for single-shot classification.
 
         Args:
             company_data: Company data dict

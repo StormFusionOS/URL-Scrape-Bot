@@ -19,6 +19,7 @@ import signal
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Dict, Generator, List, Optional, Tuple
@@ -66,12 +67,17 @@ HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("BROWSER_POOL_HEARTBEAT_INTERVAL", "3
 WARMUP_FREQUENCY_SECONDS = int(os.getenv("BROWSER_POOL_WARMUP_FREQUENCY", "1800"))
 
 # Maximum time to wait for a session
-MAX_ACQUIRE_WAIT_SECONDS = 60
+MAX_ACQUIRE_WAIT_SECONDS = 360  # 6 minutes - allow full pool warmup
 
-# Chrome process limits
-MAX_CHROME_PROCESSES = 100  # Warn and clean orphans
-CRITICAL_CHROME_PROCESSES = 200  # Force full cleanup
-CHROME_CLEANUP_INTERVAL = 300  # Check every 5 minutes
+# Chrome process limits (lowered for better stability)
+MAX_CHROME_PROCESSES = 60  # Warn and clean orphans
+CRITICAL_CHROME_PROCESSES = 100  # Force full cleanup (raised - no nuclear option now)
+CHROME_CLEANUP_INTERVAL = 60  # Check every minute for faster response
+
+# Self-healing thresholds
+QUARANTINE_RECOVERY_THRESHOLD = 0.30  # Auto-recovery if >30% sessions quarantined
+MIN_HEALTHY_SESSIONS = 3  # Minimum warm sessions before triggering recovery
+ACQUISITION_TIMEOUT_RATE_THRESHOLD = 0.10  # Trigger cleanup if >10% timeouts
 
 
 class EnterpriseBrowserPool:
@@ -139,6 +145,13 @@ class EnterpriseBrowserPool:
         self._recovery_success_count = 0
         self._recovery_success_threshold = 10  # Exit recovery after N successful sessions
 
+        # Self-healing metrics (rolling window)
+        self._acquisition_attempts = 0
+        self._acquisition_timeouts = 0
+        self._last_health_check = datetime.now()
+        self._health_check_interval = 60  # Check health every 60 seconds
+        self._consecutive_timeouts = 0  # Track consecutive timeouts for immediate action
+
         # Driver creation functions (lazy import to avoid circular deps)
         self._driver_factories = {}
 
@@ -184,6 +197,58 @@ class EnterpriseBrowserPool:
     def is_enabled(self) -> bool:
         """Check if pool is enabled."""
         return self._enabled
+
+    def _safe_quit_driver(self, driver: Any, session_id: str = None) -> None:
+        """
+        Safely quit a driver and release its resources.
+
+        Args:
+            driver: Browser driver to quit
+            session_id: Optional session ID for process cleanup
+        """
+        if driver is None:
+            return
+
+        # Get driver PID before quitting (for force-kill if needed)
+        driver_pid = None
+        try:
+            if hasattr(driver, 'service') and hasattr(driver.service, 'process'):
+                driver_pid = driver.service.process.pid
+        except Exception:
+            pass
+
+        # Release debugging port if allocated
+        debug_port = getattr(driver, '_debug_port', None)
+        if debug_port:
+            try:
+                from .seleniumbase_drivers import _release_debugging_port
+                _release_debugging_port(debug_port)
+            except Exception as e:
+                logger.debug(f"Could not release port {debug_port}: {e}")
+
+        # Terminate session processes via ChromeProcessManager if we have session_id
+        if session_id:
+            try:
+                from .chrome_process_manager import get_chrome_process_manager
+                pm = get_chrome_process_manager()
+                pm.terminate_session_processes(session_id, graceful=True)
+            except Exception as e:
+                logger.debug(f"Could not terminate session processes: {e}")
+
+        # Quit the driver
+        try:
+            driver.quit()
+        except Exception as e:
+            logger.debug(f"Error quitting driver: {e}")
+            # If quit failed and we have PID, force kill
+            if driver_pid:
+                try:
+                    import os
+                    import signal
+                    os.kill(driver_pid, signal.SIGKILL)
+                    logger.debug(f"Force killed driver PID {driver_pid}")
+                except Exception:
+                    pass
 
     def _create_driver_with_stealth(
         self,
@@ -345,20 +410,87 @@ class EnterpriseBrowserPool:
                 except Exception:
                     pass
 
-            # Navigator language consistency
+            # Navigator language consistency - match locale to proxy country
             if proxy and hasattr(proxy, 'country_code'):
                 try:
-                    lang = "en-US" if proxy.country_code == "US" else "en-GB"
+                    # Map country codes to locale strings
+                    country_locale_map = {
+                        "US": "en-US",
+                        "CA": "en-CA",
+                        "GB": "en-GB",
+                        "UK": "en-GB",
+                        "AU": "en-AU",
+                        "NZ": "en-NZ",
+                        "IE": "en-IE",
+                        "DE": "de-DE",
+                        "FR": "fr-FR",
+                        "ES": "es-ES",
+                        "IT": "it-IT",
+                        "NL": "nl-NL",
+                        "BR": "pt-BR",
+                        "MX": "es-MX",
+                    }
+                    lang = country_locale_map.get(proxy.country_code, "en-US")
+                    # Build languages array with fallbacks
+                    base_lang = lang.split("-")[0]
+                    languages = [lang, base_lang] if base_lang != lang else [lang]
+                    if base_lang != "en":
+                        languages.append("en")
+                    languages_str = ", ".join(f"'{l}'" for l in languages)
+
                     driver.execute_script(f"""
                         Object.defineProperty(navigator, 'language', {{
                             get: function() {{ return '{lang}'; }}
                         }});
                         Object.defineProperty(navigator, 'languages', {{
-                            get: function() {{ return ['{lang}', 'en']; }}
+                            get: function() {{ return [{languages_str}]; }}
                         }});
                     """)
                 except Exception:
                     pass
+
+            # HTTP header randomization with Sec-Ch-Ua headers matching user agent
+            try:
+                user_agent = driver.execute_script("return navigator.userAgent")
+
+                # Extract Chrome version from user agent
+                import re
+                chrome_match = re.search(r'Chrome/(\d+)', user_agent)
+                chrome_version = chrome_match.group(1) if chrome_match else "120"
+
+                # Build realistic Sec-Ch-Ua header
+                sec_ch_ua = f'"Chromium";v="{chrome_version}", "Google Chrome";v="{chrome_version}", "Not-A.Brand";v="99"'
+
+                # Detect platform from user agent
+                if "Windows" in user_agent:
+                    platform = "Windows"
+                elif "Mac" in user_agent:
+                    platform = "macOS"
+                elif "Linux" in user_agent:
+                    platform = "Linux"
+                else:
+                    platform = "Windows"
+
+                # Set extra HTTP headers via CDP
+                headers = {
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                    'Accept-Language': lang if 'lang' in dir() else 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'none',
+                    'Sec-Fetch-User': '?1',
+                    'Upgrade-Insecure-Requests': '1',
+                    'Sec-Ch-Ua': sec_ch_ua,
+                    'Sec-Ch-Ua-Mobile': '?0',
+                    'Sec-Ch-Ua-Platform': f'"{platform}"',
+                }
+
+                driver.execute_cdp_cmd('Network.setExtraHTTPHeaders', {'headers': headers})
+                logger.debug(f"Set Sec-Ch-Ua headers for Chrome/{chrome_version} on {platform}")
+
+            except Exception as e:
+                logger.debug(f"Could not set extra HTTP headers: {e}")
 
             logger.debug(f"Applied extra stealth measures for proxy {proxy.host if proxy else 'unknown'}")
 
@@ -827,7 +959,11 @@ class EnterpriseBrowserPool:
                 url_success = False
                 try:
                     logger.debug(f"Session {session.session_id[:8]} [{i+1}/{len(warmup_urls)}] visiting: {url}")
-                    driver.get(url)
+
+                    # Use timeout-protected URL visit to prevent hangs
+                    if not self._visit_url_with_timeout(driver, url, timeout=30):
+                        reputation_tracker.record_failure(url, timeout=True, reason="timeout")
+                        continue
 
                     # Initial load wait
                     time.sleep(random.uniform(min_wait, max_wait))
@@ -914,6 +1050,130 @@ class EnterpriseBrowserPool:
             get_pool_metrics().record_warmup(success=False)
             return False
 
+    def _visit_url_with_timeout(self, driver: Any, url: str, timeout: int = 30) -> bool:
+        """
+        Visit a URL with a timeout to prevent hangs.
+
+        Uses shared executor to prevent thread exhaustion from creating
+        new ThreadPoolExecutor for each URL visit.
+
+        Args:
+            driver: Browser driver
+            url: URL to visit
+            timeout: Max seconds to wait
+
+        Returns:
+            True if page loaded successfully
+        """
+        try:
+            from seo_intelligence.utils.shared_executor import run_with_timeout
+            run_with_timeout(driver.get, timeout, url)
+            return True
+        except FuturesTimeoutError:
+            logger.warning(f"URL visit timed out after {timeout}s: {url}")
+            return False
+        except RuntimeError as e:
+            # Thread exhaustion - log as error, not just warning
+            logger.error(f"URL visit failed (thread exhaustion): {e}")
+            return False
+        except Exception as e:
+            logger.warning(f"URL visit error: {e}")
+            return False
+
+    def resurrect_dead_sessions(self) -> int:
+        """
+        Attempt to resurrect DEAD sessions by recreating their drivers.
+
+        This allows the pool to recover from failures without requiring
+        a full restart. Called by the self-healing coordinator.
+
+        Returns:
+            Number of sessions successfully resurrected
+        """
+        import threading
+        resurrected = 0
+
+        with self._pool_lock:
+            dead_sessions = [
+                s for s in self._sessions.values()
+                if s.state == SessionState.DEAD
+            ]
+
+        if not dead_sessions:
+            return 0
+
+        thread_count = threading.active_count()
+        logger.info(f"Attempting to resurrect {len(dead_sessions)} dead sessions (threads: {thread_count})")
+
+        # Check if thread exhaustion might prevent resurrection
+        if thread_count > 2500:
+            logger.warning(f"Thread count high ({thread_count}), resurrection may fail")
+
+        for session in dead_sessions:
+            try:
+                logger.debug(f"Resurrecting session {session.session_id[:8]}")
+
+                # Clean up old driver if any
+                if session.driver:
+                    self._safe_quit_driver(session.driver, session.session_id)
+                    session.driver = None
+
+                # Create new driver
+                try:
+                    driver, proxy = self._create_driver_with_stealth(
+                        session.browser_type,
+                        session.target_group
+                    )
+                except RuntimeError as e:
+                    # Thread exhaustion
+                    logger.error(f"Cannot create driver for {session.session_id[:8]}: {e}")
+                    driver, proxy = None, None
+                except Exception as e:
+                    logger.error(f"Driver creation failed for {session.session_id[:8]}: {e}")
+                    driver, proxy = None, None
+
+                if driver:
+                    session.driver = driver
+                    session.proxy = proxy
+                    session.state = SessionState.COLD
+                    session.created_at = datetime.now()
+                    session.navigation_count = 0
+                    session.consecutive_failures = 0
+                    session.captcha_count = 0
+
+                    # Register driver PID with ChromeProcessManager
+                    try:
+                        if hasattr(driver, 'service') and hasattr(driver.service, 'process'):
+                            from .chrome_process_manager import get_chrome_process_manager
+                            pm = get_chrome_process_manager()
+                            pm.register_process(
+                                driver.service.process.pid,
+                                session.session_id,
+                                getattr(driver, '_debug_port', None)
+                            )
+                    except Exception:
+                        pass
+
+                    # Warm the resurrected session
+                    if self._warm_session(session):
+                        resurrected += 1
+                        logger.info(f"Successfully resurrected session {session.session_id[:8]}")
+                    else:
+                        logger.warning(f"Resurrected session {session.session_id[:8]} but warmup failed")
+                        session.state = SessionState.QUARANTINED
+                else:
+                    logger.warning(
+                        f"Could not create driver for session {session.session_id[:8]} "
+                        f"(threads: {threading.active_count()})"
+                    )
+
+            except Exception as e:
+                logger.error(f"Failed to resurrect session {session.session_id[:8]}: {e}")
+
+        logger.info(f"Resurrected {resurrected}/{len(dead_sessions)} dead sessions")
+
+        return resurrected
+
     def _initialize_pool(self):
         """
         Initialize the pool with minimum sessions per target group.
@@ -960,24 +1220,45 @@ class EnterpriseBrowserPool:
         # Warm sessions concurrently to speed up initialization
         logger.info(f"Warming {len(sessions_to_warm)} sessions concurrently...")
 
-        def warm_session_wrapper(session):
-            try:
-                return self._warm_session(session)
-            except Exception as e:
-                logger.error(f"Warmup error for {session.session_id[:8]}: {e}")
-                return False
+        def warm_session_with_retry(session, max_retries: int = 3):
+            """Warm a session with retry logic for resilience."""
+            for attempt in range(max_retries):
+                try:
+                    # Reset session state if retrying
+                    if attempt > 0 and session.state == SessionState.QUARANTINED:
+                        session.state = SessionState.WARMING
+                        logger.info(f"Retry {attempt + 1}/{max_retries} for session {session.session_id[:8]}")
+                        # Brief pause between retries
+                        time.sleep(2 + attempt * 2)
+
+                    if self._warm_session(session):
+                        return True
+
+                    # Warmup failed but no exception - try again
+                    if attempt < max_retries - 1:
+                        logger.debug(f"Warmup attempt {attempt + 1} failed for {session.session_id[:8]}, retrying...")
+
+                except Exception as e:
+                    logger.warning(f"Warmup attempt {attempt + 1} error for {session.session_id[:8]}: {e}")
+                    if attempt == max_retries - 1:
+                        return False
+
+            return False
 
         # Limit concurrency to prevent resource exhaustion (browsers crash with too many)
         with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {executor.submit(warm_session_wrapper, s): s for s in sessions_to_warm}
+            futures = {executor.submit(warm_session_with_retry, s): s for s in sessions_to_warm}
             for future in as_completed(futures):
                 session = futures[future]
                 try:
-                    success = future.result(timeout=120)  # 2 min timeout per warmup
+                    success = future.result(timeout=300)  # 5 min timeout per warmup (includes retries)
                     if not success:
-                        logger.warning(f"Failed to warm session {session.session_id[:8]}")
+                        logger.warning(f"Failed to warm session {session.session_id[:8]} after all retries")
+                        # Mark as dead so it gets cleaned up and replaced
+                        session.state = SessionState.DEAD
                 except Exception as e:
                     logger.warning(f"Warmup timeout/error for {session.session_id[:8]}: {e}")
+                    session.state = SessionState.DEAD
 
         total = len(self._sessions)
         warm_count = len([s for s in self._sessions.values() if s.state == SessionState.IDLE_WARM])
@@ -1014,6 +1295,13 @@ class EnterpriseBrowserPool:
 
         target_group = get_target_group_for_domain(target_domain)
         start_time = time.time()
+
+        # Track acquisition attempt for self-healing metrics
+        self._acquisition_attempts += 1
+
+        # Exponential backoff intervals with jitter (avoid thundering herd)
+        backoff_intervals = [0.1, 0.5, 1.0, 2.0, 5.0, 5.0, 5.0]  # Max out at 5s
+        attempt = 0
 
         with self._session_available:
             while True:
@@ -1053,7 +1341,7 @@ class EnterpriseBrowserPool:
                     self._leases[lease.lease_id] = lease
                     self._total_leases_issued += 1
 
-                    # Record metrics
+                    # Record metrics (outside lock scope for better performance)
                     metrics = get_pool_metrics()
                     lease_metrics = metrics.record_lease_acquired(
                         lease_id=lease.lease_id,
@@ -1067,6 +1355,9 @@ class EnterpriseBrowserPool:
                     # Store metrics reference in lease for release
                     lease._metrics = lease_metrics
 
+                    # Reset consecutive timeout counter on success
+                    self._consecutive_timeouts = 0
+
                     logger.info(
                         f"Leased session {session.session_id[:8]} to {requester} "
                         f"for {target_domain} (group: {target_group})"
@@ -1076,15 +1367,30 @@ class EnterpriseBrowserPool:
                 # Check timeout
                 elapsed = time.time() - start_time
                 if elapsed >= timeout_seconds:
+                    # Track timeout for self-healing
+                    self._acquisition_timeouts += 1
+                    self._consecutive_timeouts += 1
+
                     logger.warning(
                         f"Timeout waiting for session (domain={target_domain}, "
-                        f"group={target_group}, requester={requester})"
+                        f"group={target_group}, requester={requester}, "
+                        f"consecutive_timeouts={self._consecutive_timeouts})"
                     )
+
+                    # Trigger self-healing if needed
+                    self._check_and_trigger_self_healing()
+
                     return None
 
-                # Wait for session to become available
+                # Exponential backoff with jitter
+                backoff_idx = min(attempt, len(backoff_intervals) - 1)
+                base_wait = backoff_intervals[backoff_idx]
+                jitter = base_wait * 0.2 * (2 * (hash(requester + str(time.time())) % 100) / 100 - 1)
+                wait_time = max(0.05, base_wait + jitter)
+
                 remaining = timeout_seconds - elapsed
-                self._session_available.wait(timeout=min(remaining, 5.0))
+                self._session_available.wait(timeout=min(remaining, wait_time))
+                attempt += 1
 
     def _find_available_session(self, target_group: str) -> Optional[BrowserSession]:
         """Find an available session in the target group."""
@@ -1219,14 +1525,13 @@ class EnterpriseBrowserPool:
 
         # Close current driver
         if session.driver:
-            try:
-                session.driver.quit()
-            except Exception:
-                pass
+            self._safe_quit_driver(session.driver)
 
         # Create new driver with escalated type
         session.browser_type = next_type
-        session.driver = self._create_driver(next_type)
+        driver, proxy = self._create_driver_with_stealth(next_type, session.target_group)
+        session.driver = driver
+        session.proxy = proxy
 
         if session.driver is None:
             session.state = SessionState.DEAD
@@ -1648,10 +1953,7 @@ class EnterpriseBrowserPool:
 
                 # Close existing driver
                 if session.driver:
-                    try:
-                        session.driver.quit()
-                    except Exception:
-                        pass
+                    self._safe_quit_driver(session.driver)
                     session.driver = None
 
                 # Reset session stats
@@ -1777,9 +2079,147 @@ class EnterpriseBrowserPool:
             logger.debug(f"Chrome cleanup error: {e}")
         return killed
 
+    def _aggressive_chrome_cleanup(self) -> int:
+        """
+        Aggressively kill Chrome processes not belonging to active sessions.
+
+        This is more aggressive than _cleanup_orphan_chrome_processes - it kills
+        ALL Chrome processes older than 5 minutes that aren't tracked by sessions.
+        """
+        killed = 0
+        try:
+            # Get PIDs of Chrome processes owned by current user
+            result = subprocess.run(
+                ['pgrep', '-u', str(os.getuid()), '-f', 'chrom'],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                return 0
+
+            chrome_pids = set()
+            for pid_str in result.stdout.strip().split('\n'):
+                if pid_str:
+                    try:
+                        chrome_pids.add(int(pid_str))
+                    except ValueError:
+                        pass
+
+            if not chrome_pids:
+                return 0
+
+            # Get PIDs that belong to active sessions (check service_url ports)
+            active_pids = set()
+            with self._pool_lock:
+                for session in self._sessions.values():
+                    if session.driver:
+                        try:
+                            # Try to get the browser PID from driver
+                            service_url = getattr(session.driver, 'service', None)
+                            if service_url and hasattr(service_url, 'process'):
+                                proc = service_url.process
+                                if proc and proc.pid:
+                                    active_pids.add(proc.pid)
+                                    # Also protect children
+                                    try:
+                                        children = subprocess.run(
+                                            ['pgrep', '-P', str(proc.pid)],
+                                            capture_output=True,
+                                            text=True
+                                        )
+                                        for child_pid in children.stdout.strip().split('\n'):
+                                            if child_pid:
+                                                active_pids.add(int(child_pid))
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+
+            # Kill Chrome processes that are stale (not active, older than 5 min)
+            stale_threshold = time.time() - 300  # 5 minutes
+
+            for pid in chrome_pids:
+                if pid in active_pids:
+                    continue  # Skip active session PIDs
+
+                try:
+                    # Check process age
+                    stat_file = f'/proc/{pid}/stat'
+                    if os.path.exists(stat_file):
+                        # Get process start time
+                        with open(stat_file, 'r') as f:
+                            stat = f.read().split()
+                            # starttime is field 22 (0-indexed: 21)
+                            if len(stat) > 21:
+                                starttime = int(stat[21])
+                                # Convert to seconds since boot
+                                with open('/proc/uptime', 'r') as u:
+                                    uptime = float(u.read().split()[0])
+                                clk_tck = os.sysconf('SC_CLK_TCK')
+                                process_age = uptime - (starttime / clk_tck)
+
+                                # Kill if older than threshold
+                                if process_age > 300:  # 5 minutes old
+                                    os.kill(pid, signal.SIGKILL)
+                                    killed += 1
+                                    continue
+
+                        # Also kill if zombie or stopped
+                        with open(f'/proc/{pid}/status', 'r') as f:
+                            status = f.read()
+                            if 'State:\tZ' in status or 'State:\tT' in status:
+                                os.kill(pid, signal.SIGKILL)
+                                killed += 1
+
+                except (FileNotFoundError, PermissionError, ValueError, ProcessLookupError, OSError):
+                    pass
+
+            logger.info(f"Aggressive cleanup: killed {killed} stale Chrome processes")
+
+        except Exception as e:
+            logger.error(f"Error in aggressive Chrome cleanup: {e}")
+
+        return killed
+
+    def _targeted_chrome_cleanup(self) -> int:
+        """
+        Targeted cleanup: Use ChromeProcessManager to clean orphaned processes.
+
+        Does NOT kill all Chrome - only orphans and stale processes.
+        This replaces the old nuclear option which killed everything.
+        """
+        try:
+            from .chrome_process_manager import get_chrome_process_manager
+
+            logger.info("Executing targeted Chrome cleanup via ChromeProcessManager")
+
+            pm = get_chrome_process_manager()
+
+            # Refresh tracking to remove dead processes
+            pm.refresh_tracked_processes()
+
+            # Clean up orphaned processes (not belonging to active sessions)
+            killed = pm.cleanup_orphaned_processes()
+
+            remaining = self._get_chrome_process_count()
+            logger.info(f"Targeted cleanup complete: killed {killed}, {remaining} remaining")
+
+            return killed
+
+        except Exception as e:
+            logger.error(f"Error in targeted Chrome cleanup: {e}")
+            return 0
+
     def check_and_cleanup_chrome(self) -> Tuple[int, int]:
         """
         Check Chrome process count and clean up if needed.
+
+        Escalation levels:
+        1. MAX_CHROME_PROCESSES (60): Kill orphans only
+        2. CRITICAL_CHROME_PROCESSES (100): Aggressive + targeted cleanup
+
+        NO nuclear option - we never kill all Chrome processes.
+        This prevents destabilizing the pool.
 
         Returns:
             Tuple of (process_count, killed_count)
@@ -1788,18 +2228,44 @@ class EnterpriseBrowserPool:
         killed = 0
 
         if chrome_count >= CRITICAL_CHROME_PROCESSES:
-            logger.warning(f"CRITICAL: {chrome_count} Chrome processes - killing all orphans")
+            logger.warning(f"CRITICAL: {chrome_count} Chrome processes - starting cleanup")
+
+            # Level 1: Try orphan cleanup first
             killed = self._cleanup_orphan_chrome_processes()
-            # If still too high, log for external intervention
             remaining = self._get_chrome_process_count()
+
             if remaining >= CRITICAL_CHROME_PROCESSES:
-                logger.error(f"Still {remaining} Chrome processes after cleanup - may need worker restart")
+                # Level 2: Aggressive cleanup - kill stale processes
+                logger.warning(f"Still {remaining} after orphan cleanup - escalating to aggressive")
+                killed += self._aggressive_chrome_cleanup()
+                remaining = self._get_chrome_process_count()
+
+                if remaining >= CRITICAL_CHROME_PROCESSES:
+                    # Level 3: Targeted cleanup via ChromeProcessManager (NOT nuclear!)
+                    logger.warning(f"Still {remaining} after aggressive - using targeted cleanup")
+                    killed += self._targeted_chrome_cleanup()
+
+                    # Note: We do NOT invalidate all sessions anymore
+                    # Targeted cleanup only kills orphans, not active sessions
+
+            remaining = self._get_chrome_process_count()
+            if remaining >= MAX_CHROME_PROCESSES:
+                logger.warning(f"Chrome count still elevated: {remaining} processes remain")
+            else:
+                logger.info(f"Chrome cleanup successful: {remaining} processes remain")
+
         elif chrome_count >= MAX_CHROME_PROCESSES:
-            logger.warning(f"High Chrome count: {chrome_count} - cleaning orphans")
+            logger.info(f"Elevated Chrome count: {chrome_count} - cleaning orphans")
             killed = self._cleanup_orphan_chrome_processes()
 
+            # If orphan cleanup wasn't enough, try targeted
+            remaining = self._get_chrome_process_count()
+            if remaining >= MAX_CHROME_PROCESSES:
+                logger.info(f"Still {remaining} after orphan cleanup - using targeted cleanup")
+                killed += self._targeted_chrome_cleanup()
+
         if killed > 0:
-            logger.info(f"Cleaned up {killed} orphaned Chrome processes")
+            logger.info(f"Chrome cleanup: killed {killed} processes total")
 
         self._last_chrome_cleanup = datetime.now()
         return chrome_count, killed
@@ -1858,6 +2324,159 @@ class EnterpriseBrowserPool:
 
     # ========== Recovery Mode Methods ==========
 
+    def _check_and_trigger_self_healing(self):
+        """
+        Check pool health and trigger self-healing if needed.
+
+        Called after acquisition timeouts to automatically recover from:
+        - High timeout rates (>10%)
+        - Too many quarantined sessions (>30%)
+        - Too few healthy sessions (<3)
+        - Consecutive timeouts (>3 in a row)
+        """
+        try:
+            # Check if enough time has passed since last health check
+            now = datetime.now()
+            if (now - self._last_health_check).total_seconds() < self._health_check_interval:
+                # But still act on consecutive timeouts
+                if self._consecutive_timeouts >= 3:
+                    logger.warning(f"3+ consecutive timeouts - triggering immediate recovery")
+                    self._trigger_recovery_action("consecutive_timeouts")
+                return
+
+            self._last_health_check = now
+
+            with self._pool_lock:
+                total_sessions = len(self._sessions)
+                if total_sessions == 0:
+                    logger.warning("No sessions in pool - reinitializing")
+                    self._trigger_recovery_action("empty_pool")
+                    return
+
+                # Count session states
+                healthy_count = sum(1 for s in self._sessions.values()
+                                   if s.state == SessionState.IDLE_WARM)
+                quarantined_count = sum(1 for s in self._sessions.values()
+                                       if s.state == SessionState.QUARANTINED)
+                dead_count = sum(1 for s in self._sessions.values()
+                                if s.state == SessionState.DEAD)
+
+                # Check quarantine rate
+                quarantine_rate = quarantined_count / total_sessions
+                if quarantine_rate >= QUARANTINE_RECOVERY_THRESHOLD:
+                    logger.warning(
+                        f"High quarantine rate: {quarantine_rate:.1%} ({quarantined_count}/{total_sessions}) "
+                        f"- triggering recovery"
+                    )
+                    self._trigger_recovery_action("high_quarantine_rate")
+                    return
+
+                # Check minimum healthy sessions
+                if healthy_count < MIN_HEALTHY_SESSIONS:
+                    logger.warning(
+                        f"Too few healthy sessions: {healthy_count} (min: {MIN_HEALTHY_SESSIONS}) "
+                        f"- triggering recovery"
+                    )
+                    self._trigger_recovery_action("low_healthy_count")
+                    return
+
+                # Check timeout rate
+                if self._acquisition_attempts >= 10:
+                    timeout_rate = self._acquisition_timeouts / self._acquisition_attempts
+                    if timeout_rate >= ACQUISITION_TIMEOUT_RATE_THRESHOLD:
+                        logger.warning(
+                            f"High timeout rate: {timeout_rate:.1%} "
+                            f"({self._acquisition_timeouts}/{self._acquisition_attempts}) "
+                            f"- triggering recovery"
+                        )
+                        self._trigger_recovery_action("high_timeout_rate")
+
+                        # Reset counters after triggering
+                        self._acquisition_attempts = 0
+                        self._acquisition_timeouts = 0
+                        return
+
+                # Clean up dead sessions proactively
+                if dead_count > 0:
+                    logger.info(f"Found {dead_count} dead sessions - cleaning up")
+                    for session in list(self._sessions.values()):
+                        if session.state == SessionState.DEAD:
+                            self.invalidate_session(session.session_id, reason="dead_session_cleanup")
+
+        except Exception as e:
+            logger.error(f"Error in self-healing check: {e}")
+
+    def _trigger_recovery_action(self, reason: str):
+        """
+        Execute recovery actions based on the trigger reason.
+
+        Args:
+            reason: What triggered the recovery
+        """
+        logger.info(f"Triggering recovery action: {reason}")
+
+        try:
+            # Enter recovery mode if not already
+            if not self._recovery_mode:
+                self.enter_recovery_mode()
+
+            # Perform coordinated cleanup for serious issues
+            if reason in ("consecutive_timeouts", "high_quarantine_rate", "empty_pool"):
+                # Run cleanup in background thread to avoid blocking
+                cleanup_thread = threading.Thread(
+                    target=self._background_recovery_cleanup,
+                    args=(reason,),
+                    name="BrowserPool-RecoveryCleanup",
+                    daemon=True,
+                )
+                cleanup_thread.start()
+
+            # For less serious issues, just ensure warmup is prioritized
+            elif reason in ("low_healthy_count", "high_timeout_rate"):
+                # Wake up warmer thread
+                with self._session_available:
+                    self._session_available.notify_all()
+
+        except Exception as e:
+            logger.error(f"Error in recovery action: {e}")
+
+    def _background_recovery_cleanup(self, reason: str):
+        """
+        Background thread for recovery cleanup operations.
+
+        Args:
+            reason: What triggered the recovery
+        """
+        try:
+            logger.info(f"Starting background recovery cleanup for: {reason}")
+
+            # Cleanup orphan Chrome processes
+            self.check_and_cleanup_chrome()
+
+            # If pool is empty or very depleted, reinitialize
+            with self._pool_lock:
+                healthy_count = sum(1 for s in self._sessions.values()
+                                   if s.state == SessionState.IDLE_WARM)
+
+            if healthy_count < 2:
+                logger.info("Very few healthy sessions - attempting to create new sessions")
+                # Create a few new sessions
+                target_groups = ["search_engines", "directories", "general"]
+                for i in range(min(3, POOL_MAX_SESSIONS - len(self._sessions))):
+                    try:
+                        target_group = target_groups[i % 3]
+                        session = self._create_session(target_group)
+                        if session:
+                            self._warm_session(session)
+                            logger.info(f"Created recovery session {session.session_id[:8]} for {target_group}")
+                    except Exception as e:
+                        logger.warning(f"Failed to create recovery session: {e}")
+
+            logger.info(f"Background recovery cleanup completed for: {reason}")
+
+        except Exception as e:
+            logger.error(f"Error in background recovery cleanup: {e}")
+
     def enter_recovery_mode(self):
         """
         Enter recovery mode - use extended warmup for new sessions.
@@ -1902,39 +2521,64 @@ class EnterpriseBrowserPool:
 
     # ========== Session Health Check Methods ==========
 
-    def is_session_alive(self, session: 'BrowserSession') -> bool:
+    def is_session_alive(self, session: 'BrowserSession', timeout_seconds: float = 5.0) -> bool:
         """
-        Check if a session's Chrome process is still running.
+        Check if a session's Chrome process is still running and responsive.
 
         Args:
             session: The browser session to check
+            timeout_seconds: Maximum time to wait for response (default: 5s)
 
         Returns:
-            True if Chrome process is alive, False otherwise
+            True if Chrome process is alive and responsive, False otherwise
         """
         if not session or not session.driver:
             return False
 
         try:
-            # Try to get the Chrome PID from the driver
+            # First, quick PID check (doesn't guarantee responsiveness)
+            pid = None
             if hasattr(session.driver, 'service') and hasattr(session.driver.service, 'process'):
                 pid = session.driver.service.process.pid
-                # Check if process exists
-                os.kill(pid, 0)  # Signal 0 just checks existence
-                return True
             elif hasattr(session.driver, 'browser_pid'):
                 pid = session.driver.browser_pid
-                os.kill(pid, 0)
-                return True
-            else:
-                # Try a simple command to verify driver is responsive
-                session.driver.current_url
-                return True
-        except (ProcessLookupError, OSError):
-            # Process doesn't exist
-            return False
-        except Exception:
-            # Driver not responsive
+
+            if pid:
+                try:
+                    os.kill(pid, 0)  # Signal 0 just checks existence
+                except (ProcessLookupError, OSError):
+                    return False
+
+            # Now check actual responsiveness with timeout
+            # Use a thread to avoid hanging indefinitely
+            result = [False]
+            exception = [None]
+
+            def check_driver():
+                try:
+                    # Try to get current_url - this verifies WebDriver connection
+                    _ = session.driver.current_url
+                    result[0] = True
+                except Exception as e:
+                    exception[0] = e
+
+            check_thread = threading.Thread(target=check_driver, daemon=True)
+            check_thread.start()
+            check_thread.join(timeout=timeout_seconds)
+
+            if check_thread.is_alive():
+                # Thread is still running - driver is unresponsive
+                logger.warning(f"Session {session.session_id[:8]} health check timed out after {timeout_seconds}s")
+                return False
+
+            if exception[0]:
+                logger.debug(f"Session {session.session_id[:8]} health check failed: {exception[0]}")
+                return False
+
+            return result[0]
+
+        except Exception as e:
+            logger.debug(f"Session health check error: {e}")
             return False
 
     def invalidate_session(self, session_id: str, reason: str = "manual"):
@@ -1952,10 +2596,7 @@ class EnterpriseBrowserPool:
 
                 # Try to close the driver
                 if session.driver:
-                    try:
-                        session.driver.quit()
-                    except Exception:
-                        pass
+                    self._safe_quit_driver(session.driver)
 
                 # Remove from pool
                 del self._sessions[session_id]
@@ -1982,10 +2623,7 @@ class EnterpriseBrowserPool:
 
             for session in list(self._sessions.values()):
                 if session.driver:
-                    try:
-                        session.driver.quit()
-                    except Exception:
-                        pass
+                    self._safe_quit_driver(session.driver)
 
             self._sessions.clear()
             self._leases.clear()
@@ -2155,10 +2793,7 @@ class EnterpriseBrowserPool:
         with self._pool_lock:
             for session in self._sessions.values():
                 if session.driver:
-                    try:
-                        session.driver.quit()
-                    except Exception:
-                        pass
+                    self._safe_quit_driver(session.driver)
 
             self._sessions.clear()
             self._leases.clear()

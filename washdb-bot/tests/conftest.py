@@ -104,7 +104,7 @@ def change_manager():
 @pytest.fixture(scope="function")
 def test_business_info():
     """Provide sample business info for testing."""
-    from seo_intelligence.scrapers.citation_crawler import BusinessInfo
+    from seo_intelligence.scrapers import BusinessInfo
 
     return BusinessInfo(
         name="Test Pressure Washing Co",

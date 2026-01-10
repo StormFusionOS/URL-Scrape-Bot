@@ -34,6 +34,7 @@ from nicegui import ui
 from niceui.widgets.live_log_viewer import LiveLogViewer
 from niceui.widgets.serp_monitor import get_serp_monitor
 from niceui.widgets.citation_monitor import citation_monitor_widget
+from niceui.services.job_monitoring import JobMonitoringService
 
 # Database imports for SEO insights
 try:
@@ -42,6 +43,9 @@ try:
     DB_AVAILABLE = True
 except ImportError:
     DB_AVAILABLE = False
+
+# Job monitoring service singleton
+_job_monitor: Optional[JobMonitoringService] = None
 
 
 # Project paths
@@ -77,6 +81,16 @@ def get_db_engine():
         if database_url:
             _db_engine = create_engine(database_url, echo=False)
     return _db_engine
+
+
+def get_job_monitor() -> Optional[JobMonitoringService]:
+    """Get or create job monitoring service."""
+    global _job_monitor
+    if _job_monitor is None:
+        engine = get_db_engine()
+        if engine:
+            _job_monitor = JobMonitoringService(engine)
+    return _job_monitor
 
 
 def query_backlink_stats() -> Dict[str, Any]:
@@ -572,6 +586,7 @@ class SEODashboard:
         """Render the dashboard."""
         with ui.column().classes('w-full max-w-7xl mx-auto p-4 gap-4'):
             self._render_header()
+            self._render_orchestrator_monitor()
             self._render_module_controls()
             self._render_seo_insights()
             self._render_serp_monitor()
@@ -584,9 +599,13 @@ class SEODashboard:
         # Start insights update timer (every 30 seconds)
         self.insights_timer = ui.timer(30.0, self._update_insights)
 
+        # Start orchestrator monitor timer (every 5 seconds)
+        self.orchestrator_timer = ui.timer(5.0, self._update_orchestrator_status)
+
         # Initial status update
         self._update_status()
         self._update_insights()
+        self._update_orchestrator_status()
 
     def _render_header(self):
         """Render header with global controls."""
@@ -619,6 +638,193 @@ class SEODashboard:
                     icon='delete_sweep',
                     on_click=self._on_clear_logs
                 ).props('outline dense')
+
+    def _render_orchestrator_monitor(self):
+        """Render the SEO Job Orchestrator monitoring section."""
+        with ui.card().classes('w-full'):
+            with ui.row().classes('w-full items-center mb-2'):
+                ui.icon('monitor_heart', size='md').classes('text-green-400')
+                ui.label('SEO Job Orchestrator').classes('text-xl font-bold ml-2')
+                ui.space()
+                # Live indicator
+                with ui.row().classes('items-center gap-2'):
+                    self.orchestrator_live_dot = ui.element('div').classes(
+                        'w-3 h-3 rounded-full bg-gray-500'
+                    )
+                    self.orchestrator_live_label = ui.label('Offline').classes('text-sm text-gray-400')
+
+            # Worker cards container
+            self.orchestrator_workers_container = ui.column().classes('w-full gap-2')
+
+            ui.separator().classes('my-3')
+
+            # Queue stats row
+            with ui.row().classes('w-full gap-4'):
+                with ui.column().classes('items-center flex-1'):
+                    self.queue_eligible = ui.label('0').classes('text-2xl font-bold text-blue-400')
+                    ui.label('Eligible').classes('text-xs text-gray-400')
+
+                with ui.column().classes('items-center flex-1'):
+                    self.queue_pending = ui.label('0').classes('text-2xl font-bold text-orange-400')
+                    ui.label('Pending').classes('text-xs text-gray-400')
+
+                with ui.column().classes('items-center flex-1'):
+                    self.queue_completed = ui.label('0').classes('text-2xl font-bold text-green-400')
+                    ui.label('Completed').classes('text-xs text-gray-400')
+
+                with ui.column().classes('items-center flex-1'):
+                    self.queue_refresh = ui.label('0').classes('text-2xl font-bold text-purple-400')
+                    ui.label('Due Refresh').classes('text-xs text-gray-400')
+
+                with ui.column().classes('items-center flex-1'):
+                    self.queue_percent = ui.label('0%').classes('text-2xl font-bold text-cyan-400')
+                    ui.label('Complete').classes('text-xs text-gray-400')
+
+            # Progress bar
+            self.queue_progress = ui.linear_progress(value=0).classes('w-full mt-2')
+
+            ui.separator().classes('my-3')
+
+            # Keyword stats row
+            ui.label('Keyword Tracking').classes('text-sm font-semibold text-gray-300 mb-2')
+            with ui.row().classes('w-full gap-4'):
+                with ui.column().classes('items-center flex-1'):
+                    self.kw_total = ui.label('0').classes('text-lg font-bold text-blue-300')
+                    ui.label('Total Keywords').classes('text-xs text-gray-500')
+
+                with ui.column().classes('items-center flex-1'):
+                    self.kw_companies = ui.label('0').classes('text-lg font-bold text-purple-300')
+                    ui.label('Companies').classes('text-xs text-gray-500')
+
+                with ui.column().classes('items-center flex-1'):
+                    self.kw_t1 = ui.label('0').classes('text-lg font-bold text-gray-300')
+                    ui.label('T1 Seeds').classes('text-xs text-gray-500')
+
+                with ui.column().classes('items-center flex-1'):
+                    self.kw_t2 = ui.label('0').classes('text-lg font-bold text-gray-300')
+                    ui.label('T2 Location').classes('text-xs text-gray-500')
+
+                with ui.column().classes('items-center flex-1'):
+                    self.kw_t3 = ui.label('0').classes('text-lg font-bold text-gray-300')
+                    ui.label('T3 Competitor').classes('text-xs text-gray-500')
+
+                with ui.column().classes('items-center flex-1'):
+                    self.kw_t4 = ui.label('0').classes('text-lg font-bold text-gray-300')
+                    ui.label('T4 Autocomplete').classes('text-xs text-gray-500')
+
+    def _update_orchestrator_status(self):
+        """Update the orchestrator monitoring display."""
+        monitor = get_job_monitor()
+        if not monitor:
+            return
+
+        try:
+            # Get worker status
+            workers = monitor.get_worker_status()
+
+            # Update live indicator
+            running_workers = [w for w in workers if w['status'] == 'running']
+            if running_workers:
+                self.orchestrator_live_dot.classes('w-3 h-3 rounded-full bg-green-500 animate-pulse', remove='bg-gray-500 bg-red-500 bg-orange-500')
+                self.orchestrator_live_label.set_text(f'{len(running_workers)} Running')
+                self.orchestrator_live_label.classes('text-green-400', remove='text-gray-400 text-red-400 text-orange-400')
+            elif any(w['status'] == 'stale' for w in workers):
+                self.orchestrator_live_dot.classes('w-3 h-3 rounded-full bg-orange-500', remove='bg-gray-500 bg-green-500 bg-red-500 animate-pulse')
+                self.orchestrator_live_label.set_text('Stale')
+                self.orchestrator_live_label.classes('text-orange-400', remove='text-gray-400 text-green-400 text-red-400')
+            else:
+                self.orchestrator_live_dot.classes('w-3 h-3 rounded-full bg-gray-500', remove='bg-green-500 bg-red-500 bg-orange-500 animate-pulse')
+                self.orchestrator_live_label.set_text('Offline')
+                self.orchestrator_live_label.classes('text-gray-400', remove='text-green-400 text-red-400 text-orange-400')
+
+            # Update worker cards
+            self.orchestrator_workers_container.clear()
+            with self.orchestrator_workers_container:
+                if not workers:
+                    ui.label('No workers registered. Start the orchestrator to begin processing.').classes('text-gray-500 text-sm')
+                else:
+                    for worker in workers:
+                        self._render_worker_card(worker, monitor)
+
+            # Get queue stats
+            queue_stats = monitor.get_seo_queue_stats()
+            self.queue_eligible.set_text(f"{queue_stats['eligible']:,}")
+            self.queue_pending.set_text(f"{queue_stats['pending_initial']:,}")
+            self.queue_completed.set_text(f"{queue_stats['completed_initial']:,}")
+            self.queue_refresh.set_text(f"{queue_stats['due_refresh']:,}")
+            self.queue_percent.set_text(f"{queue_stats['completion_percent']}%")
+            self.queue_progress.set_value(queue_stats['completion_percent'] / 100)
+
+            # Get keyword stats
+            kw_stats = monitor.get_keyword_stats()
+            self.kw_total.set_text(f"{kw_stats['total_keywords']:,}")
+            self.kw_companies.set_text(f"{kw_stats['companies_with_keywords']:,}")
+            self.kw_t1.set_text(f"{kw_stats['tier1']:,}")
+            self.kw_t2.set_text(f"{kw_stats['tier2']:,}")
+            self.kw_t3.set_text(f"{kw_stats['tier3']:,}")
+            self.kw_t4.set_text(f"{kw_stats['tier4']:,}")
+
+        except Exception as e:
+            print(f"Error updating orchestrator status: {e}")
+
+    def _render_worker_card(self, worker: Dict[str, Any], monitor: JobMonitoringService):
+        """Render a single worker status card."""
+        status = worker['status']
+        status_colors = {
+            'running': ('bg-green-900', 'text-green-400', 'border-green-600'),
+            'stopped': ('bg-gray-800', 'text-gray-400', 'border-gray-600'),
+            'failed': ('bg-red-900', 'text-red-400', 'border-red-600'),
+            'stale': ('bg-orange-900', 'text-orange-400', 'border-orange-600'),
+        }
+        bg, text_color, border = status_colors.get(status, ('bg-gray-800', 'text-gray-400', 'border-gray-600'))
+
+        with ui.card().classes(f'w-full {bg} border {border}'):
+            with ui.row().classes('w-full items-center gap-4'):
+                # Status indicator
+                if status == 'running':
+                    with ui.element('div').classes('relative'):
+                        ui.element('div').classes('w-3 h-3 rounded-full bg-green-500 animate-ping absolute')
+                        ui.element('div').classes('w-3 h-3 rounded-full bg-green-500 relative')
+                else:
+                    ui.element('div').classes(f'w-3 h-3 rounded-full {text_color.replace("text-", "bg-")}')
+
+                # Worker info
+                with ui.column().classes('flex-1 gap-0'):
+                    ui.label(worker['worker_name']).classes(f'font-semibold {text_color}')
+                    ui.label(f"{worker['hostname']} (PID: {worker['pid']})").classes('text-xs text-gray-500')
+
+                # Stats
+                with ui.row().classes('gap-4'):
+                    with ui.column().classes('items-center'):
+                        ui.label(str(worker['companies_processed'])).classes('font-bold text-purple-300')
+                        ui.label('Companies').classes('text-xs text-gray-500')
+
+                    with ui.column().classes('items-center'):
+                        ui.label(str(worker['jobs_completed'])).classes('font-bold text-green-300')
+                        ui.label('OK').classes('text-xs text-gray-500')
+
+                    with ui.column().classes('items-center'):
+                        ui.label(str(worker['jobs_failed'])).classes('font-bold text-red-300')
+                        ui.label('Failed').classes('text-xs text-gray-500')
+
+                    if worker.get('uptime_str'):
+                        with ui.column().classes('items-center'):
+                            ui.label(worker['uptime_str']).classes('font-bold text-blue-300')
+                            ui.label('Uptime').classes('text-xs text-gray-500')
+
+                # Status badge
+                ui.badge(status.upper(), color='green' if status == 'running' else 'grey').classes('text-xs')
+
+            # Current work
+            if worker.get('current_module') and status == 'running':
+                with ui.row().classes('mt-2 items-center gap-2'):
+                    ui.spinner('dots', size='xs').classes('text-blue-400')
+                    ui.label('Processing:').classes('text-xs text-gray-400')
+                    ui.badge(worker['current_module'], color='blue').classes('text-xs')
+                    if worker.get('current_company_id'):
+                        company = monitor.get_company_being_processed(worker['current_company_id'])
+                        if company:
+                            ui.label(f"→ {company.get('name', 'Unknown')}").classes('text-xs font-semibold text-white')
 
     def _render_module_controls(self):
         """Render individual module control cards."""

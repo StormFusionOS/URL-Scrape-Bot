@@ -19,7 +19,8 @@ from typing import List, Dict, Optional
 from dataclasses import dataclass
 import random
 
-from db.database_manager import DatabaseManager
+from sqlalchemy import text
+from db.database_manager import get_db_manager
 from verification.config_verifier import (
     CLAUDE_NUM_PROVIDER_EXAMPLES,
     CLAUDE_NUM_NON_PROVIDER_EXAMPLES,
@@ -58,9 +59,9 @@ class FewShotSelector:
     3. Tricky examples: Borderline cases where human corrected Claude
     """
 
-    def __init__(self, db_manager: Optional[DatabaseManager] = None):
+    def __init__(self, db_manager=None):
         """Initialize selector with database connection."""
-        self.db_manager = db_manager or DatabaseManager()
+        self.db_manager = db_manager or get_db_manager()
 
     def select_examples(
         self,
@@ -136,16 +137,16 @@ class FewShotSelector:
             WHERE c.verified = true
               AND (
                   c.parse_metadata->'verification'->'labels'->>'human' = 'provider'
-                  OR (c.parse_metadata->'verification'->>'final_score')::float >= %(min_conf)s
+                  OR (c.parse_metadata->'verification'->>'final_score')::float >= :min_conf
               )
               AND c.parse_metadata->'verification'->'llm_classification'->>'type' = 'provider'
               AND (c.parse_metadata ? 'services_text' OR c.parse_metadata ? 'about_text')
             ORDER BY RANDOM()
-            LIMIT %(limit)s
+            LIMIT :limit
         """
 
-        with self.db_manager.get_connection() as conn:
-            result = conn.execute(text(query), {'min_conf': min_confidence, 'limit': n * 2})
+        with self.db_manager.get_session() as session:
+            result = session.execute(text(query), {'min_conf': min_confidence, 'limit': n * 2})
             rows = result.fetchall()
 
         examples = []
@@ -181,16 +182,16 @@ class FewShotSelector:
             WHERE c.verified = false
               AND (
                   c.parse_metadata->'verification'->'labels'->>'human' IN ('non_provider', 'directory', 'agency', 'blog')
-                  OR (c.parse_metadata->'verification'->>'final_score')::float <= (1.0 - %(min_conf)s)
+                  OR (c.parse_metadata->'verification'->>'final_score')::float <= (1.0 - :min_conf)
               )
               AND c.parse_metadata->'verification'->'red_flags' IS NOT NULL
               AND jsonb_array_length(c.parse_metadata->'verification'->'red_flags') > 0
             ORDER BY RANDOM()
-            LIMIT %(limit)s
+            LIMIT :limit
         """
 
-        with self.db_manager.get_connection() as conn:
-            result = conn.execute(text(query), {'min_conf': min_confidence, 'limit': n * 2})
+        with self.db_manager.get_session() as session:
+            result = session.execute(text(query), {'min_conf': min_confidence, 'limit': n * 2})
             rows = result.fetchall()
 
         examples = []
@@ -224,11 +225,11 @@ class FewShotSelector:
               AND cra.decision != cra.human_decision  -- Claude was wrong
               AND (c.parse_metadata->'verification'->>'final_score')::float BETWEEN 0.4 AND 0.6
             ORDER BY cra.reviewed_at DESC
-            LIMIT %(limit)s
+            LIMIT :limit
         """
 
-        with self.db_manager.get_connection() as conn:
-            result = conn.execute(text(query), {'limit': n * 2})
+        with self.db_manager.get_session() as session:
+            result = session.execute(text(query), {'limit': n * 2})
             rows = result.fetchall()
 
         examples = []
@@ -263,11 +264,11 @@ class FewShotSelector:
                   OR c.parse_metadata->'verification'->'claude_review'->>'reviewed' = 'true'
               )
             ORDER BY RANDOM()
-            LIMIT %(limit)s
+            LIMIT :limit
         """
 
-        with self.db_manager.get_connection() as conn:
-            result = conn.execute(text(query), {'limit': n})
+        with self.db_manager.get_session() as session:
+            result = session.execute(text(query), {'limit': n})
             rows = result.fetchall()
 
         examples = []

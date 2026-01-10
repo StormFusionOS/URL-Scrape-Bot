@@ -32,7 +32,7 @@ from runner.logging_setup import get_logger
 
 # Configuration
 SOCKET_PATH = os.getenv("LLM_SERVICE_SOCKET", "/tmp/llm_service.sock")
-MODEL_NAME = os.getenv("OLLAMA_MODEL", "mistral:7b")
+MODEL_NAME = os.getenv("OLLAMA_MODEL", "unified-washdb")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 MAX_QUEUE_SIZE = 1000
 IDLE_SLEEP = 0.01  # Very short sleep when queue empty

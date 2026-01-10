@@ -28,7 +28,8 @@ from dotenv import load_dotenv
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from db.database_manager import DatabaseManager
+from sqlalchemy import text
+from db.database_manager import get_db_manager
 
 # Load environment
 load_dotenv()
@@ -43,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 def get_training_data_stats() -> dict:
     """Get statistics on available training data."""
-    db_manager = DatabaseManager()
+    db_manager = get_db_manager()
 
     query = """
         SELECT
@@ -70,10 +71,9 @@ def get_training_data_stats() -> dict:
         WHERE active = true
     """
 
-    with db_manager.get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(query)
-        row = cursor.fetchone()
+    with db_manager.get_session() as session:
+        result = session.execute(text(query))
+        row = result.fetchone()
 
     total, human, claude, labeled, providers, non_providers = row
 
@@ -253,9 +253,7 @@ def deploy_model(candidate_model: str, backup: bool = True) -> bool:
 
 
 def log_retraining_result(result: dict):
-    """Log retraining result to database."""
-    db_manager = DatabaseManager()
-
+    """Log retraining result to file."""
     # TODO: Create retraining_log table if needed
     # For now, just log to file
     log_file = "logs/ml_retraining.log"

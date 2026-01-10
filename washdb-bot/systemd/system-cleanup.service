@@ -1,0 +1,28 @@
+[Unit]
+Description=System-wide Cleanup (daily)
+Documentation=file:///home/rivercityscrape/SERVER_STORAGE_DOCUMENTATION.md
+After=network.target
+
+[Service]
+Type=oneshot
+User=rivercityscrape
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+EnvironmentFile=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/.env
+
+# Run comprehensive system cleanup
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python scripts/seo_health_check.py --system-cleanup --quiet
+
+# Logging
+StandardOutput=append:/opt/ai-seo/logs/system_cleanup.log
+StandardError=append:/opt/ai-seo/logs/system_cleanup.log
+
+# Timeouts
+TimeoutStartSec=600
+TimeoutSec=600
+
+# Resource limits
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

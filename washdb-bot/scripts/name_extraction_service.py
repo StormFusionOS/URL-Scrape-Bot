@@ -3,7 +3,7 @@
 Name Extraction Service - Extract real business names from websites
 
 Uses stealth browser with Cloudflare bypass to fetch pages and
-standardization-mistral7b LLM to extract the actual business name.
+unified-washdb LLM to extract the actual business name.
 
 Designed to fix truncated/broken names like "Pro" -> "Pro Power Wash LLC"
 """
@@ -36,9 +36,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# LLM configuration - Use standardization model for name extraction
+# LLM configuration - Use unified model for name extraction
 OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://localhost:11434/api/generate')
-MODEL_NAME = 'standardization-mistral7b'  # Fine-tuned for name standardization
+MODEL_NAME = os.getenv('OLLAMA_MODEL', 'unified-washdb-v2')  # Unified model for verification + standardization
 
 
 # System prompt for name extraction - designed for standardization model

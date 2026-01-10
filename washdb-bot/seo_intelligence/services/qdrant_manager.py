@@ -105,10 +105,9 @@ class QdrantManager:
             vector: Embedding vector
 
         Returns:
-            Deterministic point ID
+            Point ID (integer)
         """
-        point_id = f"page_{page_id}"
-
+        # Use integer ID directly - Qdrant requires int or UUID, not strings
         payload = {
             "page_id": page_id,
             "site_id": site_id,
@@ -119,7 +118,7 @@ class QdrantManager:
         }
 
         point = PointStruct(
-            id=point_id,
+            id=page_id,  # Use integer directly
             vector=vector,
             payload=payload
         )
@@ -129,7 +128,7 @@ class QdrantManager:
             points=[point]
         )
 
-        return point_id
+        return page_id
 
     def upsert_serp_snippet(
         self,
@@ -154,10 +153,9 @@ class QdrantManager:
             vector: Embedding vector
 
         Returns:
-            Deterministic point ID
+            Point ID (integer)
         """
-        point_id = f"serp_{result_id}"
-
+        # Use integer ID directly - Qdrant requires int or UUID, not strings
         payload = {
             "result_id": result_id,
             "query": query,
@@ -169,7 +167,7 @@ class QdrantManager:
         }
 
         point = PointStruct(
-            id=point_id,
+            id=result_id,  # Use integer directly
             vector=vector,
             payload=payload
         )
@@ -179,7 +177,7 @@ class QdrantManager:
             points=[point]
         )
 
-        return point_id
+        return result_id
 
     def search_similar_pages(
         self,
@@ -290,10 +288,9 @@ class QdrantManager:
 
     def delete_by_page_id(self, page_id: int):
         """Delete embedding for a specific page"""
-        point_id = f"page_{page_id}"
         self.client.delete(
             collection_name=self.COMPETITOR_PAGES,
-            points_selector=[point_id]
+            points_selector=[page_id]  # Use integer directly
         )
 
     def delete_by_site_id(self, site_id: int):
@@ -313,11 +310,12 @@ class QdrantManager:
     def get_collection_stats(self, collection_name: str) -> Dict[str, Any]:
         """Get statistics for a collection"""
         info = self.client.get_collection(collection_name)
+        # Handle different qdrant_client versions
         return {
-            "vectors_count": info.vectors_count,
-            "indexed_vectors_count": info.indexed_vectors_count,
+            "vectors_count": getattr(info, 'vectors_count', None) or info.points_count,
+            "indexed_vectors_count": getattr(info, 'indexed_vectors_count', 0),
             "points_count": info.points_count,
-            "status": info.status
+            "status": str(info.status)
         }
 
     def health_check(self) -> bool:

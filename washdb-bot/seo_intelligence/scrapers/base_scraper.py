@@ -17,10 +17,16 @@ import os
 import time
 import random
 import math
+import asyncio
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, List, Tuple
 from contextlib import contextmanager
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
+
+# Note: nest_asyncio is NOT sufficient to fix "Playwright Sync API inside asyncio loop"
+# because Playwright explicitly checks for a running loop. Instead, we run browser
+# operations in isolated threads when an asyncio loop is detected.
 
 from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeout
 from playwright_stealth import Stealth

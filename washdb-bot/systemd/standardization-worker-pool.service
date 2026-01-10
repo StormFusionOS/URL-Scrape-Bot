@@ -1,0 +1,32 @@
+[Unit]
+Description=WashDB Standardization Worker Pool
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=rivercityscrape
+Group=rivercityscrape
+
+EnvironmentFile=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/.env
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+Environment="PYTHONUNBUFFERED=1"
+Environment="DISPLAY=:99"
+
+# Run with 3 parallel workers
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python scripts/standardization_worker_pool.py --workers 3
+
+Restart=always
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+StandardOutput=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/standardization_pool.log
+StandardError=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/standardization_pool_error.log
+
+# Resource limits
+MemoryMax=4G
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target

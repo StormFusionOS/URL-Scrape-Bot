@@ -8,18 +8,22 @@ Wants=postgresql.service
 Type=simple
 User=rivercityscrape
 Group=rivercityscrape
-WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+
+# Load environment variables from config
+EnvironmentFile=/etc/washdb-bot/washdb-bot.env
+EnvironmentFile=${WASHDB_HOME}/.env
+
+WorkingDirectory=${WASHDB_HOME}
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/.env
-ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python scripts/yp_continuous.py
+ExecStart=${WASHDB_VENV}/bin/python scripts/yp_continuous.py
 
 # Restart configuration
 Restart=always
 RestartSec=30
 
 # Logging
-StandardOutput=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/yp_service.log
-StandardError=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/yp_service_error.log
+StandardOutput=append:${WASHDB_LOGS}/yp_service.log
+StandardError=append:${WASHDB_LOGS}/yp_service_error.log
 
 # Resource limits
 MemoryMax=4G
@@ -28,7 +32,7 @@ CPUQuota=50%
 # Security
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+ReadWritePaths=${WASHDB_HOME}
 PrivateTmp=true
 
 [Install]

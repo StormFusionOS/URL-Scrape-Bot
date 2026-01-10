@@ -104,6 +104,8 @@ class KeywordIntelligenceSelenium(BaseSeleniumScraper):
         tier: str = "D",  # Conservative for Google
         country: str = "us",
         language: str = "en",
+        headless: bool = False,  # Headed mode works better against Google detection
+        use_proxy: bool = True,  # Use residential proxies by default
     ):
         """
         Initialize keyword intelligence.
@@ -112,12 +114,14 @@ class KeywordIntelligenceSelenium(BaseSeleniumScraper):
             tier: Rate limit tier
             country: Country code for localized results
             language: Language code
+            headless: Run browser in headless mode
+            use_proxy: Use proxy pool
         """
         super().__init__(
             name="keyword_intelligence_selenium",
             tier=tier,
-            headless=True,
-            use_proxy=False,
+            headless=headless,
+            use_proxy=use_proxy,
             max_retries=3,
             page_timeout=30000,
         )
@@ -126,7 +130,13 @@ class KeywordIntelligenceSelenium(BaseSeleniumScraper):
         self.language = language
         self.logger = get_logger("keyword_intelligence_selenium")
 
+        # Configure GoogleCoordinator with our headless/proxy settings BEFORE creating scrapers
+        # This ensures the shared browser session uses our settings
+        from seo_intelligence.services import get_google_coordinator
+        get_google_coordinator(headless=headless, use_proxy=use_proxy)
+
         # Initialize components (SeleniumBase versions)
+        # These will use the GoogleCoordinator's shared browser with our settings
         self.autocomplete_scraper = get_autocomplete_scraper_selenium()
         self.serp_scraper = get_serp_scraper_selenium()
         self.volume_estimator = get_volume_estimator()

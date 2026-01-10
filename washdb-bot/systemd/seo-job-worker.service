@@ -1,0 +1,52 @@
+[Unit]
+Description=WashDB SEO Job Worker - Continuous SEO Analysis
+After=network.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=all
+User=rivercityscrape
+Group=rivercityscrape
+
+# Environment configuration
+EnvironmentFile=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/.env
+EnvironmentFile=-/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/systemd/washdb-bot.env
+Environment=DISPLAY=:99
+Environment=PYTHONUNBUFFERED=1
+
+# Working directory
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+
+# Start Xvfb virtual display for headed browser (if not running)
+ExecStartPre=/bin/bash -c 'pgrep -x Xvfb || /usr/bin/Xvfb :99 -screen 0 1920x1080x24 &'
+ExecStartPre=/bin/sleep 2
+
+# Main service - continuous SEO processing
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python -m seo_intelligence.jobs.seo_job_orchestrator --worker-name seo_worker_1
+
+# Logging
+StandardOutput=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/seo_jobs.log
+StandardError=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/seo_jobs_error.log
+
+# RESTART CONFIGURATION - Always restart
+Restart=always
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+# Watchdog - service must respond within 5 minutes or systemd restarts it
+WatchdogSec=300
+
+# Resource limits
+MemoryMax=3G
+CPUQuota=80%
+
+# Graceful shutdown timeout
+TimeoutStopSec=60
+
+# Kill remaining processes on stop
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

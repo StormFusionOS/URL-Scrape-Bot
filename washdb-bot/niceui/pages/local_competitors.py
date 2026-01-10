@@ -25,7 +25,7 @@ except ImportError:
     DB_AVAILABLE = False
 
 try:
-    from seo_intelligence.scrapers.competitor_crawler import get_competitor_crawler
+    from seo_intelligence.scrapers import get_competitor_crawler
     CRAWLER_AVAILABLE = True
 except ImportError:
     CRAWLER_AVAILABLE = False

@@ -98,6 +98,8 @@ class AutocompleteScraperSelenium(BaseSeleniumScraper):
         country: str = "us",
         language: str = "en",
         max_suggestions_per_query: int = 10,
+        headless: bool = False,  # Headed mode works better against Google detection
+        use_proxy: bool = True,  # Use residential proxies by default
     ):
         """
         Initialize autocomplete scraper.
@@ -107,12 +109,14 @@ class AutocompleteScraperSelenium(BaseSeleniumScraper):
             country: Country code for localized suggestions
             language: Language code
             max_suggestions_per_query: Max suggestions to keep per query
+            headless: Run browser in headless mode
+            use_proxy: Use proxy pool
         """
         super().__init__(
             name="autocomplete_scraper_selenium",
             tier=tier,
-            headless=True,
-            use_proxy=False,
+            headless=headless,
+            use_proxy=use_proxy,
             max_retries=3,
             page_timeout=15000,
         )
@@ -379,6 +383,11 @@ class AutocompleteScraperSelenium(BaseSeleniumScraper):
             return suggestions
 
         except Exception as e:
+            error_msg = str(e).lower()
+            # Re-raise browser closure errors so caller can handle them
+            if "browser has been closed" in error_msg or "target page" in error_msg or "context or browser" in error_msg:
+                self.logger.error(f"Error fetching suggestions for '{seed_query}': {e}")
+                raise  # Let caller decide how to handle browser closure
             self.logger.error(f"Error fetching suggestions for '{seed_query}': {e}")
             return []
 
@@ -446,6 +455,7 @@ class AutocompleteScraperSelenium(BaseSeleniumScraper):
         include_questions: bool = True,
         include_modifiers: bool = True,
         max_expansions: int = 100,
+        use_coordinator: bool = True,
     ) -> List[AutocompleteSuggestion]:
         """
         Expand a seed keyword using multiple strategies.
@@ -461,64 +471,159 @@ class AutocompleteScraperSelenium(BaseSeleniumScraper):
             include_questions: Add question prefix expansions
             include_modifiers: Add intent modifier expansions
             max_expansions: Maximum total suggestions to return
+            use_coordinator: If True, use GoogleCoordinator's shared browser
 
         Returns:
             list: All expanded suggestions (deduplicated)
         """
         seed_keyword = seed_keyword.strip().lower()
         all_suggestions: Dict[str, AutocompleteSuggestion] = {}
-        domain = "www.google.com"
 
         self.logger.info(f"Expanding keyword: {seed_keyword}")
 
-        # Use site="google" for human-like search box interaction (same as SerpScraperSelenium)
+        # Use GoogleCoordinator for shared browser (prevents CAPTCHA from multiple sessions)
+        if use_coordinator:
+            try:
+                coordinator = get_google_coordinator()
+
+                def fetch_expansions(driver):
+                    result_suggestions = {}
+
+                    # 1. Get base suggestions
+                    base_suggestions = self._fetch_suggestions(driver, "", seed_keyword, "related")
+                    for s in base_suggestions:
+                        result_suggestions[s.keyword] = s
+
+                    # 2. Alphabet expansion (keyword + a, keyword + b, ...)
+                    if include_alphabet and len(result_suggestions) < max_expansions:
+                        for letter in self.ALPHABET:
+                            if len(result_suggestions) >= max_expansions:
+                                break
+                            query = f"{seed_keyword} {letter}"
+                            suggestions = self._fetch_suggestions(driver, "", query, "alphabet")
+                            for s in suggestions:
+                                if s.keyword not in result_suggestions:
+                                    result_suggestions[s.keyword] = s
+
+                    # 3. Question prefix expansion
+                    if include_questions and len(result_suggestions) < max_expansions:
+                        for prefix in self.QUESTION_PREFIXES[:10]:  # Limit prefixes
+                            if len(result_suggestions) >= max_expansions:
+                                break
+                            query = f"{prefix} {seed_keyword}"
+                            suggestions = self._fetch_suggestions(driver, "", query, "question")
+                            for s in suggestions:
+                                if s.keyword not in result_suggestions:
+                                    result_suggestions[s.keyword] = s
+
+                    # 4. Intent modifier expansion
+                    if include_modifiers and len(result_suggestions) < max_expansions:
+                        for modifier in self.INTENT_MODIFIERS[:8]:  # Limit modifiers
+                            if len(result_suggestions) >= max_expansions:
+                                break
+                            query = f"{seed_keyword} {modifier}"
+                            suggestions = self._fetch_suggestions(driver, "", query, "intent")
+                            for s in suggestions:
+                                if s.keyword not in result_suggestions:
+                                    result_suggestions[s.keyword] = s
+
+                    return result_suggestions
+
+                all_suggestions = coordinator.execute("autocomplete_expand", fetch_expansions, priority=5)
+                if all_suggestions is None:
+                    all_suggestions = {}
+
+                # Update stats
+                self.keyword_stats["unique_keywords"] = len(all_suggestions)
+                self.logger.info(f"Expanded '{seed_keyword}' to {len(all_suggestions)} unique keywords")
+                return list(all_suggestions.values())
+
+            except Exception as e:
+                self.logger.warning(f"Coordinator failed for expand, falling back to direct: {e}")
+
+        # Fallback: direct mode (creates own browser - may trigger CAPTCHA)
+        domain = "www.google.com"
         with self.browser_session(site="google") as driver:
             # 1. Get base suggestions
             with self._rate_limit_and_concurrency(domain):
                 base_suggestions = self.get_suggestions(
-                    seed_keyword, driver, "related"
+                    seed_keyword, driver, "related", use_coordinator=False
                 )
                 for s in base_suggestions:
                     all_suggestions[s.keyword] = s
+
+            # Track consecutive failures to detect browser closure
+            consecutive_failures = 0
+            max_consecutive_failures = 3  # Stop if browser seems dead
 
             # 2. Alphabet expansion (keyword + a, keyword + b, ...)
             if include_alphabet and len(all_suggestions) < max_expansions:
                 for letter in self.ALPHABET:
                     if len(all_suggestions) >= max_expansions:
                         break
+                    if consecutive_failures >= max_consecutive_failures:
+                        self.logger.warning(f"Stopping alphabet expansion - {consecutive_failures} consecutive failures (browser may be closed)")
+                        break
 
                     query = f"{seed_keyword} {letter}"
-                    with self._rate_limit_and_concurrency(domain):
-                        suggestions = self.get_suggestions(query, driver, "alphabet")
-                        for s in suggestions:
-                            if s.keyword not in all_suggestions:
-                                all_suggestions[s.keyword] = s
+                    try:
+                        with self._rate_limit_and_concurrency(domain):
+                            suggestions = self.get_suggestions(query, driver, "alphabet", use_coordinator=False)
+                            for s in suggestions:
+                                if s.keyword not in all_suggestions:
+                                    all_suggestions[s.keyword] = s
+                            consecutive_failures = 0  # Reset on success
+                    except Exception as e:
+                        consecutive_failures += 1
+                        self.logger.debug(f"Alphabet expansion failed for '{query}': {e}")
+
+            # Reset for question expansion
+            consecutive_failures = 0
 
             # 3. Question prefix expansion
             if include_questions and len(all_suggestions) < max_expansions:
                 for prefix in self.QUESTION_PREFIXES[:10]:  # Limit prefixes
                     if len(all_suggestions) >= max_expansions:
                         break
+                    if consecutive_failures >= max_consecutive_failures:
+                        self.logger.warning(f"Stopping question expansion - {consecutive_failures} consecutive failures (browser may be closed)")
+                        break
 
                     query = f"{prefix} {seed_keyword}"
-                    with self._rate_limit_and_concurrency(domain):
-                        suggestions = self.get_suggestions(query, driver, "question")
-                        for s in suggestions:
-                            if s.keyword not in all_suggestions:
-                                all_suggestions[s.keyword] = s
+                    try:
+                        with self._rate_limit_and_concurrency(domain):
+                            suggestions = self.get_suggestions(query, driver, "question", use_coordinator=False)
+                            for s in suggestions:
+                                if s.keyword not in all_suggestions:
+                                    all_suggestions[s.keyword] = s
+                            consecutive_failures = 0  # Reset on success
+                    except Exception as e:
+                        consecutive_failures += 1
+                        self.logger.debug(f"Question expansion failed for '{query}': {e}")
+
+            # Reset for modifier expansion
+            consecutive_failures = 0
 
             # 4. Intent modifier expansion
             if include_modifiers and len(all_suggestions) < max_expansions:
                 for modifier in self.INTENT_MODIFIERS[:8]:  # Limit modifiers
                     if len(all_suggestions) >= max_expansions:
                         break
+                    if consecutive_failures >= max_consecutive_failures:
+                        self.logger.warning(f"Stopping modifier expansion - {consecutive_failures} consecutive failures (browser may be closed)")
+                        break
 
                     query = f"{seed_keyword} {modifier}"
-                    with self._rate_limit_and_concurrency(domain):
-                        suggestions = self.get_suggestions(query, driver, "intent")
-                        for s in suggestions:
-                            if s.keyword not in all_suggestions:
-                                all_suggestions[s.keyword] = s
+                    try:
+                        with self._rate_limit_and_concurrency(domain):
+                            suggestions = self.get_suggestions(query, driver, "intent", use_coordinator=False)
+                            for s in suggestions:
+                                if s.keyword not in all_suggestions:
+                                    all_suggestions[s.keyword] = s
+                            consecutive_failures = 0  # Reset on success
+                    except Exception as e:
+                        consecutive_failures += 1
+                        self.logger.debug(f"Modifier expansion failed for '{query}': {e}")
 
         # Update stats
         self.keyword_stats["unique_keywords"] = len(all_suggestions)
@@ -532,6 +637,7 @@ class AutocompleteScraperSelenium(BaseSeleniumScraper):
     def get_related_questions(
         self,
         keyword: str,
+        use_coordinator: bool = True,
     ) -> List[AutocompleteSuggestion]:
         """
         Get question-based suggestions for a keyword.
@@ -540,21 +646,49 @@ class AutocompleteScraperSelenium(BaseSeleniumScraper):
 
         Args:
             keyword: Target keyword
+            use_coordinator: If True, use GoogleCoordinator's shared browser
 
         Returns:
             list: Question-based suggestions
         """
         keyword = keyword.strip().lower()
         questions: Dict[str, AutocompleteSuggestion] = {}
-        domain = "www.google.com"
 
-        # Use site="google" for human-like search box interaction (same as SerpScraperSelenium)
+        # Use GoogleCoordinator for shared browser (prevents CAPTCHA from multiple sessions)
+        if use_coordinator:
+            try:
+                coordinator = get_google_coordinator()
+
+                def fetch_questions(driver):
+                    result_questions = {}
+                    for prefix in self.QUESTION_PREFIXES:
+                        query = f"{prefix} {keyword}"
+                        suggestions = self._fetch_suggestions(driver, "", query, "question")
+
+                        for s in suggestions:
+                            # Only keep actual questions
+                            if any(s.keyword.startswith(p) for p in ["what", "how", "why", "when", "where", "who", "can", "is", "does", "will", "should"]):
+                                result_questions[s.keyword] = s
+                    return result_questions
+
+                questions = coordinator.execute("autocomplete_questions", fetch_questions, priority=5)
+                if questions is None:
+                    questions = {}
+
+                self.logger.info(f"Found {len(questions)} questions for: {keyword}")
+                return list(questions.values())
+
+            except Exception as e:
+                self.logger.warning(f"Coordinator failed for questions, falling back to direct: {e}")
+
+        # Fallback: direct mode (creates own browser - may trigger CAPTCHA)
+        domain = "www.google.com"
         with self.browser_session(site="google") as driver:
             for prefix in self.QUESTION_PREFIXES:
                 query = f"{prefix} {keyword}"
 
                 with self._rate_limit_and_concurrency(domain):
-                    suggestions = self.get_suggestions(query, driver, "question")
+                    suggestions = self.get_suggestions(query, driver, "question", use_coordinator=False)
 
                     for s in suggestions:
                         # Only keep actual questions

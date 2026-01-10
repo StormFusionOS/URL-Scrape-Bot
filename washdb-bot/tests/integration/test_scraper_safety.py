@@ -62,7 +62,7 @@ class TestRobotsTxtCompliance:
     def test_scraper_respects_robots(self, robots_checker, domain_quarantine):
         """Test that BaseScraper respects robots.txt blocks."""
         # Use a concrete scraper (CompetitorCrawler) to test base functionality
-        from seo_intelligence.scrapers.competitor_crawler import CompetitorCrawler
+        from seo_intelligence.scrapers import CompetitorCrawler
 
         scraper = CompetitorCrawler()
 
@@ -407,7 +407,7 @@ class TestEthicalCrawling:
         This is a meta-test that verifies the scraper architecture.
         """
         # Use a concrete scraper (CompetitorCrawler) to test base functionality
-        from seo_intelligence.scrapers.competitor_crawler import CompetitorCrawler
+        from seo_intelligence.scrapers import CompetitorCrawler
 
         scraper = CompetitorCrawler()
 
@@ -428,7 +428,7 @@ class TestEthicalCrawling:
     def test_user_agent_transparency(self):
         """Test scraper uses identifiable user agent."""
         # Use a concrete scraper
-        from seo_intelligence.scrapers.competitor_crawler import CompetitorCrawler
+        from seo_intelligence.scrapers import CompetitorCrawler
 
         scraper = CompetitorCrawler()
 
@@ -445,7 +445,7 @@ class TestEthicalCrawling:
     def test_rate_limiter_exists(self):
         """Test rate limiter is properly configured."""
         # Use a concrete scraper
-        from seo_intelligence.scrapers.competitor_crawler import CompetitorCrawler
+        from seo_intelligence.scrapers import CompetitorCrawler
 
         scraper = CompetitorCrawler()
 

@@ -36,16 +36,21 @@ logger = logging.getLogger(__name__)
 
 # Config
 OLLAMA_URL = 'http://localhost:11434/api/generate'
-MODEL = 'verification-mistral-proper'
+MODEL = os.getenv('OLLAMA_MODEL', 'unified-washdb-v2')
 NUM_WORKERS = 4  # Concurrent workers
 BATCH_SIZE = 500  # Companies to fetch per batch
 PROGRESS_INTERVAL = 100  # Log progress every N completions
 
-SYSTEM_PROMPT = '''You are verifying if a business offers exterior cleaning services.
-Target services: Pressure washing, Window cleaning, Soft washing, Roof cleaning, Gutter cleaning, Solar panel cleaning, Fleet/truck washing, Wood restoration/deck cleaning.
-Based on the company name and website content, determine if this is a legitimate service provider.
-Respond with ONLY a JSON object:
-{"legitimate": true/false, "confidence": 0.0-1.0, "services": [], "reasoning": "brief explanation"}'''
+SYSTEM_PROMPT = '''You MUST respond with ONLY a valid JSON object. No other text.
+
+Verify if this business offers exterior cleaning services (pressure washing, window cleaning, soft washing, roof cleaning, gutter cleaning, solar panel cleaning, fleet washing, deck cleaning).
+
+ALWAYS respond in this exact JSON format:
+{"legitimate": true, "confidence": 0.9, "services": ["pressure washing"], "reasoning": "explanation"}
+
+If uncertain or insufficient data, use: {"legitimate": false, "confidence": 0.3, "services": [], "reasoning": "insufficient data"}
+
+Output ONLY the JSON object, nothing else.'''
 
 
 class ParallelBatchVerifier:
@@ -115,20 +120,22 @@ About: {about_text[:200] if about_text else 'N/A'}"""
 
             response_text = resp.json().get('response', '')
 
-            # Parse JSON from response
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}') + 1
-            if json_start >= 0 and json_end > json_start:
-                parsed = json.loads(response_text[json_start:json_end])
+            # Parse JSON from response using robust extraction
+            parsed = self._extract_json(response_text)
+            if parsed:
                 return {
                     'success': True,
                     'legitimate': parsed.get('legitimate', False),
-                    'confidence': parsed.get('confidence', 0.5),
+                    'confidence': float(parsed.get('confidence', 0.5)),
                     'services': parsed.get('services', []),
-                    'reasoning': parsed.get('reasoning', '')[:200]
+                    'reasoning': str(parsed.get('reasoning', ''))[:200]
                 }
             else:
-                return {'success': False, 'error': 'No JSON in response'}
+                # Fallback parsing
+                fallback = self._fallback_parse(response_text)
+                if fallback:
+                    return fallback
+                return {'success': False, 'error': 'No valid JSON in response'}
 
         except json.JSONDecodeError as e:
             return {'success': False, 'error': f'JSON parse error: {str(e)[:50]}'}
@@ -136,6 +143,123 @@ About: {about_text[:200] if about_text else 'N/A'}"""
             return {'success': False, 'error': 'Timeout'}
         except Exception as e:
             return {'success': False, 'error': str(e)[:50]}
+
+    def _extract_json(self, text: str) -> dict:
+        """Extract first valid JSON object from text with robust parsing."""
+        import re
+
+        # Clean up common artifacts
+        text = text.replace('<|im_start|>', ' ').replace('<|im_end|>', ' ')
+        text = re.sub(r'\s+', ' ', text)
+
+        # Try to find JSON with balanced braces
+        brace_count = 0
+        json_start = -1
+
+        for i, char in enumerate(text):
+            if char == '{':
+                if brace_count == 0:
+                    json_start = i
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+                if brace_count == 0 and json_start >= 0:
+                    json_str = text[json_start:i+1]
+                    try:
+                        return json.loads(json_str)
+                    except json.JSONDecodeError:
+                        # Try to fix common issues
+                        json_str = re.sub(r',\s*}', '}', json_str)
+                        json_str = re.sub(r',\s*]', ']', json_str)
+                        try:
+                            return json.loads(json_str)
+                        except:
+                            json_start = -1
+        return None
+
+    def _fallback_parse(self, text: str) -> dict:
+        """Fallback parsing when JSON extraction fails."""
+        text_lower = text.lower()
+
+        # Dead website / error page patterns (memorized from training data)
+        dead_site_phrases = [
+            'website is no longer available',
+            'domain has expired',
+            'page not found',
+            'this site is under construction',
+            'coming soon',
+            'placeholder',
+            'contact your customer service',
+            'webstarts.com',
+            'yext knowledge tags',
+            'this message will not appear',
+            'link to the website',
+            'appears to be a website link',
+            'actual business name is not provided'
+        ]
+        if any(phrase in text_lower for phrase in dead_site_phrases):
+            return {
+                'success': True,
+                'legitimate': False,
+                'confidence': 0.4,
+                'services': [],
+                'reasoning': 'Dead or unavailable website'
+            }
+
+        # Negative indicators - not a legitimate service
+        negative_phrases = [
+            'not a valid', 'not legitimate', 'does not provide',
+            'not an exterior', 'no evidence', 'not offer',
+            'not a business', 'no information', 'insufficient data',
+            'cannot determine', 'unable to verify', 'n/a',
+            'not a company', 'does not appear', 'no services'
+        ]
+        if any(phrase in text_lower for phrase in negative_phrases):
+            return {
+                'success': True,
+                'legitimate': False,
+                'confidence': 0.5,
+                'services': [],
+                'reasoning': 'Inferred from text: negative/uncertain indicators'
+            }
+
+        # Positive indicators - is a legitimate service
+        positive_phrases = [
+            'legitimate', 'provides pressure', 'offers exterior',
+            'pressure washing service', 'cleaning service',
+            'power wash', 'window clean', 'soft wash', 'roof clean',
+            'gutter clean', 'exterior clean'
+        ]
+        if any(phrase in text_lower for phrase in positive_phrases) and 'not' not in text_lower[:100]:
+            return {
+                'success': True,
+                'legitimate': True,
+                'confidence': 0.6,
+                'services': [],
+                'reasoning': 'Inferred from text: positive indicators'
+            }
+
+        # If text is very short or empty, treat as insufficient data
+        if len(text.strip()) < 50:
+            return {
+                'success': True,
+                'legitimate': False,
+                'confidence': 0.3,
+                'services': [],
+                'reasoning': 'Insufficient response from model'
+            }
+
+        # Catch-all: if we got text but couldn't parse it, mark as uncertain
+        if len(text.strip()) > 0:
+            return {
+                'success': True,
+                'legitimate': False,
+                'confidence': 0.3,
+                'services': [],
+                'reasoning': 'Unable to parse model response'
+            }
+
+        return None
 
     def update_company(self, company_id: int, result: dict):
         """Update company with classification result."""

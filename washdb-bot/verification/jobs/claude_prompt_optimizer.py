@@ -27,7 +27,8 @@ from dotenv import load_dotenv
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from db.database_manager import DatabaseManager
+from sqlalchemy import text
+from db.database_manager import get_db_manager
 from verification.few_shot_selector import FewShotSelector
 from verification.config_verifier import (
     CLAUDE_NUM_FEW_SHOT_EXAMPLES,
@@ -54,7 +55,7 @@ def analyze_prompt_performance(days: int = 7) -> dict:
     Returns:
         Dictionary with performance metrics
     """
-    db_manager = DatabaseManager()
+    db_manager = get_db_manager()
 
     query = """
         SELECT
@@ -73,15 +74,14 @@ def analyze_prompt_performance(days: int = 7) -> dict:
             SUM(cost_estimate) as total_cost,
             AVG(CASE WHEN cached_tokens > 0 THEN 1.0 ELSE 0.0 END) as cache_hit_rate
         FROM claude_review_audit
-        WHERE reviewed_at >= NOW() - INTERVAL '%(days)s days'
+        WHERE reviewed_at >= NOW() - INTERVAL :days DAY
         GROUP BY prompt_version
         ORDER BY prompt_version DESC
     """
 
-    with db_manager.get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(query, {'days': days})
-        rows = cursor.fetchall()
+    with db_manager.get_session() as session:
+        result = session.execute(text(query), {'days': days})
+        rows = result.fetchall()
 
     if not rows:
         logger.warning(f"No reviews found in last {days} days")
@@ -120,7 +120,7 @@ def get_misclassifications(limit: int = 20) -> list:
     Returns:
         List of company IDs with misclassifications
     """
-    db_manager = DatabaseManager()
+    db_manager = get_db_manager()
 
     query = """
         SELECT
@@ -133,13 +133,12 @@ def get_misclassifications(limit: int = 20) -> list:
         WHERE human_reviewed = true
           AND decision != human_decision
         ORDER BY reviewed_at DESC
-        LIMIT %(limit)s
+        LIMIT :limit
     """
 
-    with db_manager.get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(query, {'limit': limit})
-        rows = cursor.fetchall()
+    with db_manager.get_session() as session:
+        result = session.execute(text(query), {'limit': limit})
+        rows = result.fetchall()
 
     misclassifications = []
     for company_id, claude_dec, human_dec, confidence, reasoning in rows:
@@ -179,7 +178,7 @@ def create_optimized_examples(misclassifications: list) -> list:
 
 def get_current_prompt_text() -> str:
     """Get the current active prompt text."""
-    db_manager = DatabaseManager()
+    db_manager = get_db_manager()
 
     query = """
         SELECT prompt_text
@@ -188,10 +187,9 @@ def get_current_prompt_text() -> str:
         LIMIT 1
     """
 
-    with db_manager.get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(query)
-        row = cursor.fetchone()
+    with db_manager.get_session() as session:
+        result = session.execute(text(query))
+        row = result.fetchone()
 
     if row:
         return row[0]
@@ -238,7 +236,7 @@ Respond with JSON:
 
 def get_next_version_number() -> str:
     """Get next version number."""
-    db_manager = DatabaseManager()
+    db_manager = get_db_manager()
 
     query = """
         SELECT version
@@ -247,10 +245,9 @@ def get_next_version_number() -> str:
         LIMIT 1
     """
 
-    with db_manager.get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(query)
-        row = cursor.fetchone()
+    with db_manager.get_session() as session:
+        result = session.execute(text(query))
+        row = result.fetchone()
 
     if not row:
         return 'v1.1'
@@ -290,20 +287,20 @@ def deploy_prompt_version(
         logger.info(f"DRY RUN - Would deploy version {version} with {len(examples)} examples")
         return True
 
-    db_manager = DatabaseManager()
+    db_manager = get_db_manager()
 
     try:
-        with db_manager.get_connection() as conn:
-                        # Deactivate current version
-            result = conn.execute(text("""
+        with db_manager.get_session() as session:
+            # Deactivate current version
+            session.execute(text("""
                 UPDATE claude_prompt_versions
                 SET is_active = false,
-                    deprecated_at = NOW())
+                    deprecated_at = NOW()
                 WHERE is_active = true
-            """)
+            """))
 
             # Insert new version
-            result = conn.execute(text("""
+            session.execute(text("""
                 INSERT INTO claude_prompt_versions (
                     version,
                     prompt_text,
@@ -311,15 +308,15 @@ def deploy_prompt_version(
                     deployed_at,
                     is_active,
                     notes
-                )) VALUES (
-                    %(version)s,
-                    %(prompt_text)s,
-                    %(examples)s,
+                ) VALUES (
+                    :version,
+                    :prompt_text,
+                    :examples,
                     NOW(),
                     true,
-                    %(notes)s
+                    :notes
                 )
-            """, {
+            """), {
                 'version': version,
                 'prompt_text': prompt_text,
                 'examples': json.dumps(examples),

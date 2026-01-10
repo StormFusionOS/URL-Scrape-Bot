@@ -41,26 +41,32 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ClaudeReviewResult:
-    """Result from Claude API review."""
-    # Decision
+    """Result from Claude API review (verification + standardization)."""
+    # Verification Decision
     decision: str  # approve, deny, unclear
     confidence: float
     reasoning: str
     is_provider: bool
 
-    # Extracted data
+    # Extracted verification data
     primary_services: List[str]
     identified_red_flags: List[str]
 
+    # Name Standardization (NEW)
+    standardized_name: Optional[str] = None
+    standardization_confidence: float = 0.0
+    standardization_source: Optional[str] = None  # json_ld, og_tag, title, h1, copyright, domain
+    standardization_reasoning: Optional[str] = None
+
     # API metrics
-    api_latency_ms: int
-    tokens_input: int
-    tokens_output: int
-    cached_tokens: int
-    cost_estimate: float
+    api_latency_ms: int = 0
+    tokens_input: int = 0
+    tokens_output: int = 0
+    cached_tokens: int = 0
+    cost_estimate: float = 0.0
 
     # Metadata
-    raw_response: dict
+    raw_response: dict = None
     success: bool = True
     error_message: Optional[str] = None
 
@@ -134,13 +140,13 @@ class RateLimiter:
 # ==============================================================================
 
 class CostCalculator:
-    """Calculate API costs for Claude 3.5 Sonnet."""
+    """Calculate API costs for Claude 3.5 Haiku."""
 
-    # Pricing per million tokens (as of Dec 2025)
-    COST_INPUT = 3.00  # $3 per 1M input tokens
-    COST_OUTPUT = 15.00  # $15 per 1M output tokens
-    COST_CACHE_WRITE = 3.75  # $3.75 per 1M cache write tokens
-    COST_CACHE_READ = 0.30  # $0.30 per 1M cache read tokens
+    # Pricing per million tokens (as of Jan 2026) - Haiku pricing
+    COST_INPUT = 0.80  # $0.80 per 1M input tokens
+    COST_OUTPUT = 4.00  # $4 per 1M output tokens
+    COST_CACHE_WRITE = 1.00  # $1 per 1M cache write tokens
+    COST_CACHE_READ = 0.08  # $0.08 per 1M cache read tokens
 
     @classmethod
     def calculate(
@@ -206,7 +212,11 @@ class ClaudeAPIClient:
         if not self.api_key:
             raise ValueError("ANTHROPIC_API_KEY not found in environment")
 
-        self.client = Anthropic(api_key=self.api_key)
+        # Enable prompt caching via beta header
+        self.client = Anthropic(
+            api_key=self.api_key,
+            default_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
+        )
         self.rate_limiter = RateLimiter(requests_per_minute=50)
         self.model = CLAUDE_MODEL
         self.max_tokens = CLAUDE_MAX_TOKENS
@@ -381,15 +391,48 @@ class ClaudeAPIClient:
 
         text = content_blocks[0].text
 
-        # Parse JSON response
+        # Parse JSON response - handle various formats Claude might return
         try:
-            # Handle potential markdown code blocks
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0].strip()
+            json_text = text.strip()
 
-            parsed = json.loads(text)
+            # Handle markdown code blocks
+            if "```json" in json_text:
+                json_text = json_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in json_text:
+                json_text = json_text.split("```")[1].split("```")[0].strip()
+
+            # Extract the first complete JSON object by finding balanced braces
+            first_brace = json_text.find("{")
+            if first_brace != -1:
+                # Find the matching closing brace
+                brace_count = 0
+                in_string = False
+                escape_next = False
+                end_pos = first_brace
+
+                for i, char in enumerate(json_text[first_brace:], start=first_brace):
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if char == '\\':
+                        escape_next = True
+                        continue
+                    if char == '"' and not escape_next:
+                        in_string = not in_string
+                        continue
+                    if in_string:
+                        continue
+                    if char == '{':
+                        brace_count += 1
+                    elif char == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            end_pos = i
+                            break
+
+                json_text = json_text[first_brace:end_pos + 1]
+
+            parsed = json.loads(json_text)
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse JSON: {text[:200]}")
             raise ValueError(f"Invalid JSON response: {e}")
@@ -412,14 +455,21 @@ class ClaudeAPIClient:
         # Calculate latency
         latency_ms = int((time.time() - start_time) * 1000)
 
-        # Build result
+        # Build result (verification + standardization)
         return ClaudeReviewResult(
+            # Verification fields
             decision=parsed.get('decision', 'unclear'),
             confidence=float(parsed.get('confidence', 0.5)),
             reasoning=parsed.get('reasoning', ''),
             is_provider=bool(parsed.get('is_provider', False)),
             primary_services=parsed.get('primary_services', []),
             identified_red_flags=parsed.get('red_flags', []),
+            # Standardization fields (NEW)
+            standardized_name=parsed.get('standardized_name'),
+            standardization_confidence=float(parsed.get('standardization_confidence', 0.0)),
+            standardization_source=parsed.get('standardization_source'),
+            standardization_reasoning=parsed.get('standardization_reasoning'),
+            # API metrics
             api_latency_ms=latency_ms,
             tokens_input=input_tokens,
             tokens_output=output_tokens,

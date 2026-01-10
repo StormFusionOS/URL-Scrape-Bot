@@ -121,94 +121,80 @@ class CamoufoxDriver:
         if self._browser is None or self._is_closed:
             import asyncio
 
-            # Patch asyncio.get_running_loop BEFORE importing/using Camoufox
-            # This bypasses Playwright's sync API check which fails when
-            # nest_asyncio is applied globally (e.g., in the SEO orchestrator)
-            original_get_running_loop = asyncio.get_running_loop
+            # nest_asyncio is applied at module load (line 24) to allow nested event loops.
+            # This lets Playwright's sync API work even when there's already an event loop.
+            # We do NOT patch asyncio.get_running_loop - Playwright needs it to work normally.
 
-            def patched_get_running_loop():
-                raise RuntimeError("no running event loop")
-
-            asyncio.get_running_loop = patched_get_running_loop
-            logger.debug("Patched asyncio.get_running_loop for Camoufox")
-
+            # Create a fresh event loop for this thread if needed
             try:
-                # Clear any existing asyncio event loop in this thread
-                try:
-                    loop = asyncio.get_event_loop()
-                    if not loop.is_running():
-                        loop.close()
-                except RuntimeError:
-                    pass
-
-                # Create fresh event loop
+                loop = asyncio.get_event_loop()
+                if loop.is_closed():
+                    asyncio.set_event_loop(asyncio.new_event_loop())
+                    logger.debug("Created new event loop (previous was closed)")
+            except RuntimeError:
+                # No event loop in this thread
                 asyncio.set_event_loop(asyncio.new_event_loop())
-                logger.debug("Reset asyncio event loop for Camoufox")
+                logger.debug("Created new event loop for thread")
 
-                # Import Camoufox with patched asyncio
-                from camoufox.sync_api import Camoufox
+            # Import Camoufox (uses Playwright with nest_asyncio support)
+            from camoufox.sync_api import Camoufox
 
-                # Build Camoufox launch options
-                camoufox_kwargs = {
-                    "headless": self.headless,
-                    "humanize": self.humanize,
-                    "i_know_what_im_doing": True,
+            # Build Camoufox launch options
+            camoufox_kwargs = {
+                "headless": self.headless,
+                "humanize": self.humanize,
+                "i_know_what_im_doing": True,
+            }
+
+            # Add geolocation if configured and lat/lon are non-zero
+            if self.geolocation and self.geolocation.get("latitude", 0) != 0:
+                try:
+                    # Only enable geoip if the package is available
+                    import geoip2  # noqa: F401
+                    camoufox_kwargs["geoip"] = True
+                except ImportError:
+                    logger.warning("geoip2 not installed, skipping automatic geoip lookup")
+
+            # Create Camoufox launcher and start the browser
+            self._camoufox = Camoufox(**camoufox_kwargs)
+            self._browser = self._camoufox.start()  # Returns Playwright browser
+
+            # Create context with proxy, timezone, geolocation, and storage state
+            context_kwargs = {}
+            if self.proxy:
+                context_kwargs["proxy"] = self.proxy
+            if self.timezone:
+                # Playwright uses timezone_id for timezone override
+                context_kwargs["timezone_id"] = self.timezone
+                context_kwargs["locale"] = "en-US"
+            if self.geolocation and (self.geolocation.get("latitude", 0) != 0 or
+                                     self.geolocation.get("longitude", 0) != 0):
+                context_kwargs["geolocation"] = {
+                    "latitude": self.geolocation.get("latitude", 0),
+                    "longitude": self.geolocation.get("longitude", 0),
+                    "accuracy": self.geolocation.get("accuracy", 100),
                 }
+                context_kwargs["permissions"] = ["geolocation"]
 
-                # Add geolocation if configured and lat/lon are non-zero
-                if self.geolocation and self.geolocation.get("latitude", 0) != 0:
-                    try:
-                        # Only enable geoip if the package is available
-                        import geoip2  # noqa: F401
-                        camoufox_kwargs["geoip"] = True
-                    except ImportError:
-                        logger.warning("geoip2 not installed, skipping automatic geoip lookup")
+            # Load persisted storage state (cookies, localStorage) if it exists
+            storage_state_path = self._get_storage_state_path()
+            if os.path.exists(storage_state_path):
+                try:
+                    context_kwargs["storage_state"] = storage_state_path
+                    logger.info(f"Loading persisted Google session from {storage_state_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to load storage state: {e}")
 
-                # Create Camoufox launcher and start the browser
-                self._camoufox = Camoufox(**camoufox_kwargs)
-                self._browser = self._camoufox.start()  # Returns Playwright browser
+            if context_kwargs:
+                self._context = self._browser.new_context(**context_kwargs)
+                self._page = self._context.new_page()
+            else:
+                self._page = self._browser.new_page()
 
-                # Create context with proxy, timezone, geolocation, and storage state
-                context_kwargs = {}
-                if self.proxy:
-                    context_kwargs["proxy"] = self.proxy
-                if self.timezone:
-                    # Playwright uses timezone_id for timezone override
-                    context_kwargs["timezone_id"] = self.timezone
-                    context_kwargs["locale"] = "en-US"
-                if self.geolocation and (self.geolocation.get("latitude", 0) != 0 or
-                                         self.geolocation.get("longitude", 0) != 0):
-                    context_kwargs["geolocation"] = {
-                        "latitude": self.geolocation.get("latitude", 0),
-                        "longitude": self.geolocation.get("longitude", 0),
-                        "accuracy": self.geolocation.get("accuracy", 100),
-                    }
-                    context_kwargs["permissions"] = ["geolocation"]
-
-                # Load persisted storage state (cookies, localStorage) if it exists
-                storage_state_path = self._get_storage_state_path()
-                if os.path.exists(storage_state_path):
-                    try:
-                        context_kwargs["storage_state"] = storage_state_path
-                        logger.info(f"Loading persisted Google session from {storage_state_path}")
-                    except Exception as e:
-                        logger.warning(f"Failed to load storage state: {e}")
-
-                if context_kwargs:
-                    self._context = self._browser.new_context(**context_kwargs)
-                    self._page = self._context.new_page()
-                else:
-                    self._page = self._browser.new_page()
-
-                self._page.set_default_timeout(self.page_timeout)
-                self._creator_thread_id = threading.get_ident()  # Track creator thread
-                self._is_closed = False
-                logger.info("Camoufox browser started")
-
-            finally:
-                # Restore original asyncio.get_running_loop
-                asyncio.get_running_loop = original_get_running_loop
-                logger.debug("Restored asyncio.get_running_loop")
+            self._page.set_default_timeout(self.page_timeout)
+            self._creator_thread_id = threading.get_ident()  # Track creator thread
+            self._is_closed = False
+            logger.info("Camoufox browser started")
 
     def _simulate_human_delay(self, min_sec: float = 0.5, max_sec: float = 2.0):
         """Add human-like delay between actions."""

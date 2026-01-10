@@ -21,7 +21,7 @@ from urllib.parse import urlparse, quote_plus
 from bs4 import BeautifulSoup
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, bindparam
 from sqlalchemy.orm import Session
 
 from seo_intelligence.services import get_task_logger
@@ -138,52 +138,74 @@ class ReviewDetailScraper:
         limit: int = None
     ) -> List[Dict]:
         """
-        Get citations to scrape for review details.
+        Get business sources to scrape for review details.
+
+        Uses business_sources table which links to companies, falling back to
+        citations table if no company filter is specified.
 
         Args:
             session: Database session
             company_id: Filter by specific company (None = all companies)
-            limit: Maximum citations to return
+            limit: Maximum records to return
 
         Returns:
-            List of citation dictionaries
+            List of source dictionaries with listing URLs
         """
         limit = limit or self.max_listings_per_run
 
-        # Build query
-        query_text = """
-            SELECT
-                citation_id,
-                company_id,
-                directory_name,
-                listing_url,
-                rating_value,
-                rating_count,
-                metadata
-            FROM citations
-            WHERE
-                directory_name IN :platforms
-                AND listing_url IS NOT NULL
-                AND listing_url != ''
-        """
-
-        params = {"platforms": tuple(self.SUPPORTED_PLATFORMS), "limit": limit}
-
         if company_id:
-            query_text += " AND company_id = :company_id"
-            params["company_id"] = company_id
-
-        # Prioritize listings not scraped recently
-        query_text += """
-            ORDER BY
-                COALESCE(
-                    (metadata->>'last_review_scrape_at')::timestamp,
-                    '2000-01-01'::timestamp
-                ) ASC
-            LIMIT :limit
-        """
-
-        result = session.execute(text(query_text), params)
+            # Query business_sources for company-specific listings
+            # source_type maps to platforms (google, yelp, yp, etc.)
+            query_text = """
+                SELECT
+                    source_id,
+                    company_id,
+                    source_type as directory_name,
+                    profile_url as listing_url,
+                    rating_value,
+                    rating_count,
+                    metadata
+                FROM business_sources
+                WHERE
+                    company_id = :company_id
+                    AND profile_url IS NOT NULL
+                    AND profile_url != ''
+                ORDER BY
+                    COALESCE(
+                        (metadata->>'last_review_scrape_at')::timestamp,
+                        '2000-01-01'::timestamp
+                    ) ASC
+                LIMIT :limit
+            """
+            params = {"company_id": company_id, "limit": limit}
+            result = session.execute(text(query_text), params)
+        else:
+            # Query citations table for non-company-specific lookups
+            # Use bindparam with expanding=True for IN clause (psycopg3 compatibility)
+            query_text = """
+                SELECT
+                    citation_id,
+                    NULL as company_id,
+                    directory_name,
+                    listing_url,
+                    rating as rating_value,
+                    review_count as rating_count,
+                    metadata
+                FROM citations
+                WHERE
+                    directory_name IN :platforms
+                    AND listing_url IS NOT NULL
+                    AND listing_url != ''
+                ORDER BY
+                    COALESCE(
+                        (metadata->>'last_review_scrape_at')::timestamp,
+                        '2000-01-01'::timestamp
+                    ) ASC
+                LIMIT :limit
+            """
+            params = {"platforms": list(self.SUPPORTED_PLATFORMS), "limit": limit}
+            stmt = text(query_text).bindparams(bindparam("platforms", expanding=True))
+            result = session.execute(stmt, params)
 
         citations = []
         for row in result:
@@ -197,7 +219,7 @@ class ReviewDetailScraper:
                 'metadata': row[6] or {}
             })
 
-        logger.info(f"Found {len(citations)} citations to scrape")
+        logger.info(f"Found {len(citations)} sources to scrape for reviews")
         return citations
 
     def _fetch_page_content(self, url: str) -> Optional[str]:

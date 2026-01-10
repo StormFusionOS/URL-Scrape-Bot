@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from nicegui import ui
 from ..backend_facade import backend
 from ..widgets.kpi import create_kpi_card
+from ..widgets.gpu_monitor import gpu_monitor_card
 from ..theme import COLORS
 from .verification import verification_state, get_verification_stats
 from ..utils.system_temps import get_system_temps, format_temp, get_temp_color
@@ -372,11 +373,8 @@ def build_discovery_status_cards(status_container):
                         ui.icon('error', size='md', color='negative')
                         ui.label('Error').classes('text-lg font-semibold text-red-300')
 
-            # Total Processed
-            with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):
-                ui.label('Total Companies').classes('text-sm text-gray-200 mb-2')
-                kpis = backend.kpis()
-                ui.label(str(kpis['total_companies'])).classes('text-2xl font-bold text-white')
+            # GPU Monitor
+            gpu_monitor_card(refresh_interval=2.0)
 
             # System Temperatures
             with ui.card().classes('flex-1 p-4').style('background: rgba(255, 255, 255, 0.15); backdrop-filter: blur(10px);'):

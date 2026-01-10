@@ -45,6 +45,8 @@ from seo_intelligence.services import (
     KeywordGap,
     GapCategory,
 )
+from seo_intelligence.services.keyword_gap_analyzer import KeywordRanking
+from seo_intelligence.services.content_gap_analyzer import ContentPage
 
 
 @dataclass
@@ -144,25 +146,35 @@ class CompetitiveAnalysisSelenium(BaseSeleniumScraper):
     def __init__(
         self,
         tier: str = "D",  # Conservative for scraping
+        headless: bool = False,  # Headed mode works better against Google detection
+        use_proxy: bool = True,  # Use residential proxies by default
     ):
         """
         Initialize competitive analysis with SeleniumBase scrapers.
 
         Args:
             tier: Rate limit tier
+            headless: Run browser in headless mode
+            use_proxy: Use proxy pool
         """
         super().__init__(
             name="competitive_analysis_selenium",
             tier=tier,
-            headless=True,
-            use_proxy=False,
+            headless=headless,
+            use_proxy=use_proxy,
             max_retries=3,
             page_timeout=30000,
         )
 
         self.logger = get_logger("competitive_analysis_selenium")
 
+        # Configure GoogleCoordinator with our headless/proxy settings BEFORE creating scrapers
+        # This ensures the shared browser session uses our settings
+        from seo_intelligence.services import get_google_coordinator
+        get_google_coordinator(headless=headless, use_proxy=use_proxy)
+
         # Initialize components (SeleniumBase versions)
+        # These will use the GoogleCoordinator's shared browser with our settings
         self.serp_scraper = get_serp_scraper_selenium()
         self.topic_clusterer = get_topic_clusterer()
         self.content_gap_analyzer = get_content_gap_analyzer()
@@ -323,10 +335,22 @@ class CompetitiveAnalysisSelenium(BaseSeleniumScraper):
 
         # 3. Analyze keyword gaps
         self.logger.info("Analyzing keyword gaps...")
+        # Convert Dict[str, int] to Dict[str, KeywordRanking] format
+        your_keyword_rankings = {
+            kw: KeywordRanking(keyword=kw, position=pos)
+            for kw, pos in your_keywords.items()
+        }
+        competitor_keyword_rankings = {
+            domain: {
+                kw: KeywordRanking(keyword=kw, position=pos)
+                for kw, pos in keywords.items()
+            }
+            for domain, keywords in all_competitor_keywords.items()
+        }
         keyword_gaps = self.keyword_gap_analyzer.analyze_keyword_gaps(
-            your_keywords=your_keywords,
-            competitor_keywords=all_competitor_keywords,
-            min_coverage=1,
+            your_keywords=your_keyword_rankings,
+            competitor_keywords=competitor_keyword_rankings,
+            min_competitor_coverage=1,
         )
         self.ca_stats["keyword_gaps_found"] = len(keyword_gaps)
 
@@ -343,21 +367,33 @@ class CompetitiveAnalysisSelenium(BaseSeleniumScraper):
 
         # 5. Analyze content gaps
         self.logger.info("Analyzing content gaps...")
-        # Build content data from keyword rankings
+        # Build content data from keyword rankings as ContentPage objects
         your_content = [
-            {"url": your_domain, "topics": list(your_keywords.keys())}
+            ContentPage(
+                url=your_domain,
+                title=your_domain,
+                content="",
+                word_count=0,
+                topics=list(your_keywords.keys()),
+            )
         ]
-        competitor_content = []
+        # competitor_content must be Dict[str, List[ContentPage]]
+        competitor_content = {}
         for domain, keywords in all_competitor_keywords.items():
-            competitor_content.append({
-                "url": domain,
-                "topics": list(keywords.keys()),
-            })
+            competitor_content[domain] = [
+                ContentPage(
+                    url=domain,
+                    title=domain,
+                    content="",
+                    word_count=0,
+                    topics=list(keywords.keys()),
+                )
+            ]
 
         content_gaps = self.content_gap_analyzer.analyze_content_gaps(
             your_content=your_content,
             competitor_content=competitor_content,
-            min_coverage=1,
+            min_competitor_coverage=1,
         )
         self.ca_stats["content_gaps_found"] = len(content_gaps)
 
@@ -374,7 +410,7 @@ class CompetitiveAnalysisSelenium(BaseSeleniumScraper):
                 backlink_opportunities = self.backlink_gap_analyzer.analyze_backlink_gaps(
                     your_backlinks=your_backlinks,
                     competitor_backlinks=competitor_backlinks,
-                    min_coverage=1,
+                    min_competitor_coverage=1,
                 )
                 self.ca_stats["backlink_opportunities_found"] = len(backlink_opportunities)
 

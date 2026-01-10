@@ -51,6 +51,11 @@ from threading import Lock, Thread
 from concurrent.futures import ThreadPoolExecutor
 import queue
 
+# Fix for Camoufox sync API in asyncio contexts
+# nest_asyncio allows nested event loops, fixing Playwright sync API conflicts
+import nest_asyncio
+nest_asyncio.apply()
+
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
@@ -365,66 +370,65 @@ class GoogleSession:
         """Create a new Camoufox browser with persistent profile."""
         try:
             import asyncio
+            from urllib.parse import urlparse
 
-            # Patch asyncio.get_running_loop BEFORE importing/using Camoufox
-            # This prevents "Playwright Sync API inside asyncio loop" errors
-            # when nest_asyncio is applied globally
-            original_get_running_loop = asyncio.get_running_loop
+            # nest_asyncio is applied at module load to allow nested event loops.
+            # This lets Playwright's sync API work even when there's already an event loop.
+            # We do NOT patch asyncio.get_running_loop - Playwright needs it to work normally.
 
-            def patched_get_running_loop():
-                raise RuntimeError("no running event loop")
-
-            asyncio.get_running_loop = patched_get_running_loop
-
+            # Create a fresh event loop for this thread if needed
             try:
-                from camoufox.sync_api import Camoufox
+                asyncio.get_running_loop()
+                logger.debug("Using existing event loop for thread")
+            except RuntimeError:
+                # No event loop exists for this thread - create one
+                asyncio.set_event_loop(asyncio.new_event_loop())
+                logger.debug("Created new event loop for thread")
 
-                # Build Camoufox launcher options
-                launcher_options = {
-                    "headless": False,  # Headed for better evasion
-                    "humanize": True,
-                    "i_know_what_im_doing": True,
+            # Import Camoufox (uses Playwright with nest_asyncio support)
+            from camoufox.sync_api import Camoufox
+
+            # Build Camoufox launcher options
+            launcher_options = {
+                "headless": False,  # Headed for better evasion
+                "humanize": True,
+                "i_know_what_im_doing": True,
+            }
+
+            # Create launcher and start browser
+            self._launcher = Camoufox(**launcher_options)
+            self._browser = self._launcher.start()  # Returns Playwright browser
+
+            # Build context options
+            context_options = {}
+
+            if self.proxy:
+                # Parse proxy URL and build Playwright proxy config
+                # Playwright expects {"server": "http://host:port", "username": "...", "password": "..."}
+                parsed = urlparse(self.proxy)
+                proxy_config = {
+                    "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
                 }
+                if parsed.username:
+                    proxy_config["username"] = parsed.username
+                if parsed.password:
+                    proxy_config["password"] = parsed.password
+                context_options["proxy"] = proxy_config
+                logger.debug(f"Session {self.session_id}: Proxy config: server={proxy_config['server']}")
 
-                # Create launcher and start browser (must be within patched asyncio)
-                self._launcher = Camoufox(**launcher_options)
-                self._browser = self._launcher.start()  # Returns Playwright browser
+            # Load storage state if it exists (for persistent sessions)
+            storage_file = Path(self.profile_dir) / "storage_state.json"
+            if storage_file.exists():
+                try:
+                    context_options["storage_state"] = str(storage_file)
+                    logger.debug(f"Session {self.session_id}: Loading storage state from {storage_file}")
+                except Exception as e:
+                    logger.warning(f"Session {self.session_id}: Could not load storage state: {e}")
 
-                # Build context options
-                context_options = {}
-
-                if self.proxy:
-                    # Parse proxy URL and build Playwright proxy config
-                    # Playwright expects {"server": "http://host:port", "username": "...", "password": "..."}
-                    from urllib.parse import urlparse
-                    parsed = urlparse(self.proxy)
-                    proxy_config = {
-                        "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
-                    }
-                    if parsed.username:
-                        proxy_config["username"] = parsed.username
-                    if parsed.password:
-                        proxy_config["password"] = parsed.password
-                    context_options["proxy"] = proxy_config
-                    logger.debug(f"Session {self.session_id}: Proxy config: server={proxy_config['server']}")
-
-                # Load storage state if it exists (for persistent sessions)
-                storage_file = Path(self.profile_dir) / "storage_state.json"
-                if storage_file.exists():
-                    try:
-                        context_options["storage_state"] = str(storage_file)
-                        logger.debug(f"Session {self.session_id}: Loading storage state from {storage_file}")
-                    except Exception as e:
-                        logger.warning(f"Session {self.session_id}: Could not load storage state: {e}")
-
-                # Create context and page
-                self._context = self._browser.new_context(**context_options)
-                self._page = self._context.new_page()
-                self._page.set_default_timeout(30000)
-
-            finally:
-                # Restore original asyncio function
-                asyncio.get_running_loop = original_get_running_loop
+            # Create context and page
+            self._context = self._browser.new_context(**context_options)
+            self._page = self._context.new_page()
+            self._page.set_default_timeout(30000)
 
             self.stats.current_proxy = self.proxy
             logger.info(f"Session {self.session_id}: Browser created with proxy {self.proxy}")

@@ -17,6 +17,9 @@ from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
+
 from seo_intelligence.scrapers.base_selenium_scraper import BaseSeleniumScraper
 from seo_intelligence.services.cwv_metrics import get_cwv_metrics_service, CWVRating
 from runner.logging_setup import get_logger
@@ -550,6 +553,7 @@ class CoreWebVitalsSelenium(BaseSeleniumScraper):
         tier: str = "C",
         cwv_wait_time: float = 5.0,
         mobile_mode: bool = False,
+        database_url: Optional[str] = None,
     ):
         super().__init__(
             name="core_web_vitals_selenium",
@@ -565,6 +569,13 @@ class CoreWebVitalsSelenium(BaseSeleniumScraper):
         self.cwv_wait_time = cwv_wait_time
         self.cwv_service = get_cwv_metrics_service()
         self._mobile_mode = mobile_mode
+
+        # Database connection
+        database_url = database_url or os.getenv("DATABASE_URL")
+        if database_url:
+            self.engine = create_engine(database_url, echo=False)
+        else:
+            self.engine = None
 
         mode_str = "mobile" if mobile_mode else "desktop"
         logger.info(f"CoreWebVitalsSelenium initialized (tier={tier}, {mode_str}, UC mode)")
@@ -1391,6 +1402,104 @@ class CoreWebVitalsSelenium(BaseSeleniumScraper):
             results["measurements"].append(measurement.to_dict())
 
         return results
+
+    def save_to_db(
+        self,
+        result: CWVResult,
+        company_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """Save CWV result to database.
+
+        Args:
+            result: The CWVResult from measure_url()
+            company_id: Optional company ID to associate with the measurement
+
+        Returns:
+            The record ID if saved successfully, None otherwise
+        """
+        if not self.engine:
+            logger.warning("No database engine configured, skipping DB save")
+            return None
+
+        try:
+            import json
+            with Session(self.engine) as session:
+                insert_result = session.execute(
+                    text("""
+                        INSERT INTO core_web_vitals (
+                            company_id, url, device_type,
+                            lcp_ms, cls_value, inp_ms, fid_ms, fcp_ms, ttfb_ms, tbt_ms, tti_ms,
+                            lcp_rating, cls_rating, inp_rating, fid_rating, tbt_rating,
+                            cwv_score, cwv_assessment, grade,
+                            dns_lookup_ms, tcp_connect_ms, ssl_handshake_ms,
+                            request_time_ms, response_time_ms,
+                            dom_interactive_ms, dom_content_loaded_ms, dom_complete_ms, load_event_ms,
+                            page_transfer_size_bytes, total_resources, total_resources_size_bytes,
+                            third_party_domain_count, render_blocking_count,
+                            long_task_count, long_task_total_ms,
+                            metrics_json
+                        ) VALUES (
+                            :company_id, :url, :device_type,
+                            :lcp_ms, :cls_value, :inp_ms, :fid_ms, :fcp_ms, :ttfb_ms, :tbt_ms, :tti_ms,
+                            :lcp_rating, :cls_rating, :inp_rating, :fid_rating, :tbt_rating,
+                            :cwv_score, :cwv_assessment, :grade,
+                            :dns_lookup_ms, :tcp_connect_ms, :ssl_handshake_ms,
+                            :request_time_ms, :response_time_ms,
+                            :dom_interactive_ms, :dom_content_loaded_ms, :dom_complete_ms, :load_event_ms,
+                            :page_transfer_size_bytes, :total_resources, :total_resources_size_bytes,
+                            :third_party_domain_count, :render_blocking_count,
+                            :long_task_count, :long_task_total_ms,
+                            :metrics_json
+                        )
+                        RETURNING id
+                    """),
+                    {
+                        "company_id": company_id,
+                        "url": result.url,
+                        "device_type": result.device_type,
+                        "lcp_ms": result.lcp_ms,
+                        "cls_value": result.cls_value,
+                        "inp_ms": result.inp_ms,
+                        "fid_ms": result.fid_ms,
+                        "fcp_ms": result.fcp_ms,
+                        "ttfb_ms": result.ttfb_ms,
+                        "tbt_ms": result.tbt_ms,
+                        "tti_ms": result.tti_ms,
+                        "lcp_rating": result.lcp_rating,
+                        "cls_rating": result.cls_rating,
+                        "inp_rating": result.inp_rating,
+                        "fid_rating": result.fid_rating,
+                        "tbt_rating": result.tbt_rating,
+                        "cwv_score": result.cwv_score,
+                        "cwv_assessment": result.cwv_assessment,
+                        "grade": result.grade,
+                        "dns_lookup_ms": result.dns_lookup_ms,
+                        "tcp_connect_ms": result.tcp_connect_ms,
+                        "ssl_handshake_ms": result.ssl_handshake_ms,
+                        "request_time_ms": result.request_time_ms,
+                        "response_time_ms": result.response_time_ms,
+                        "dom_interactive_ms": result.dom_interactive_ms,
+                        "dom_content_loaded_ms": result.dom_content_loaded_ms,
+                        "dom_complete_ms": result.dom_complete_ms,
+                        "load_event_ms": result.load_event_ms,
+                        "page_transfer_size_bytes": result.page_transfer_size_bytes,
+                        "total_resources": result.total_resources,
+                        "total_resources_size_bytes": result.total_resources_size_bytes,
+                        "third_party_domain_count": result.third_party_domain_count,
+                        "render_blocking_count": result.render_blocking_count,
+                        "long_task_count": result.long_task_count,
+                        "long_task_total_ms": result.long_task_total_ms,
+                        "metrics_json": json.dumps(result.to_dict()),
+                    }
+                )
+                record_id = insert_result.fetchone()[0]
+                session.commit()
+                logger.info(f"Saved CWV result {record_id} for {result.url} (grade={result.grade})")
+                return record_id
+
+        except Exception as e:
+            logger.error(f"Failed to save CWV to DB: {e}")
+            return None
 
 
 # Module singleton

@@ -92,7 +92,7 @@ except ImportError as e:
 
 # Configuration
 OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://localhost:11434/api/generate')
-MODEL_NAME = os.getenv('OLLAMA_MODEL', 'unified-washdb')
+MODEL_NAME = os.getenv('OLLAMA_MODEL', 'unified-washdb-v2')
 BATCH_SIZE = 50  # Smaller batches since browser scraping is slower
 POLL_INTERVAL = 60  # seconds to wait when no work
 HEARTBEAT_INTERVAL = 30
@@ -104,13 +104,18 @@ HEADLESS = os.getenv('BROWSER_HEADLESS', 'false').lower() == 'true'
 DISPLAY = os.getenv('DISPLAY', ':99')
 PAGE_TIMEOUT = 20  # seconds
 
-# Rate limiting settings (optimized for better throughput)
-MIN_DELAY_BETWEEN_REQUESTS = 5.0   # Minimum seconds between requests
-MAX_DELAY_BETWEEN_REQUESTS = 10.0  # Maximum seconds between requests
-BLOCK_COOLDOWN_THRESHOLD = 10      # INCREASED: Number of blocks before cooldown (was 5)
-BLOCK_COOLDOWN_SECONDS = 180       # REDUCED: 3 minute cooldown (was 5 min)
-BROWSER_RESTART_THRESHOLD = 30     # INCREASED: Restart browser after this many blocks (was 20)
-BLOCK_WINDOW_SECONDS = 600         # INCREASED: Window to track blocks (10 minutes)
+# Rate limiting settings (optimized for maximum throughput)
+MIN_DELAY_BETWEEN_REQUESTS = 2.0   # REDUCED: Minimum seconds between requests (was 5.0)
+MAX_DELAY_BETWEEN_REQUESTS = 4.0   # REDUCED: Maximum seconds between requests (was 10.0)
+BLOCK_COOLDOWN_THRESHOLD = 10      # Number of blocks before cooldown
+BLOCK_COOLDOWN_SECONDS = 120       # REDUCED: 2 minute cooldown (was 3 min)
+BROWSER_RESTART_THRESHOLD = 30     # Restart browser after this many blocks
+BLOCK_WINDOW_SECONDS = 600         # Window to track blocks (10 minutes)
+
+# Fast path settings - skip browser for these cases
+ENABLE_FAST_PATH = True            # Use regex-only for dead/blocked domains
+FAST_PATH_FOR_DEAD_DOMAINS = True  # Skip browser for domains marked as dead
+FAST_PATH_FOR_BLOCKED = True       # Skip browser for domains with high block_count
 
 # Retry queue settings - blocked sites go to Ultimate Playwright scraper
 RETRY_BACKOFF_BASE_HOURS = 1       # 1 hour = 60 minutes for first retry (Ultimate scraper)

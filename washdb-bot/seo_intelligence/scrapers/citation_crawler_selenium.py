@@ -14,6 +14,7 @@ Features:
 
 Per SCRAPING_NOTES.md:
 - Use Tier B rate limits for directories (respectable sites)
+- Use YP-style stealth tactics (human delays, scrolling, jitter)
 - Verify NAP consistency across listings
 - Track last verified date for freshness
 """
@@ -23,6 +24,14 @@ import re
 import json
 import time
 import random
+
+# Import YP stealth features for human-like behavior
+from scrape_yp.yp_stealth import (
+    human_delay,
+    get_human_reading_delay,
+    get_scroll_delays,
+    get_random_viewport,
+)
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 from urllib.parse import urlparse, quote_plus
@@ -150,6 +159,262 @@ CITATION_DIRECTORIES = {
 # Directories to skip
 SKIP_DIRECTORIES = {"facebook"}
 
+# =============================================================================
+# Directory-Specific Stealth Configurations
+# =============================================================================
+# These configs optimize stealth behavior for each directory's detection system.
+# Yellow Pages and Google Business are the most aggressive at bot detection.
+
+DIRECTORY_STEALTH_CONFIGS = {
+    "yellowpages": {
+        "initial_delay": (3.0, 6.0),       # Wait longer before interacting
+        "scroll_intensity": "thorough",     # Full F-pattern + extra scrolls
+        "min_page_time": 15,                # Spend at least 15s on each page
+        "max_page_time": 30,                # But no more than 30s
+        "click_random_element": True,       # Click non-critical elements
+        "reading_pattern": "f_pattern",     # Use F-pattern reading simulation
+        "inter_action_delay": (1.0, 3.0),   # Delay between actions
+        "scroll_back_chance": 0.4,          # 40% chance to scroll back up
+        "mouse_movement": True,             # Use natural mouse movement
+        "typing_simulation": True,          # Natural typing with typos
+    },
+    "google_business": {
+        "initial_delay": (2.0, 4.0),
+        "scroll_intensity": "normal",
+        "min_page_time": 10,
+        "max_page_time": 25,
+        "click_random_element": False,      # Google tracks clicks carefully
+        "reading_pattern": "f_pattern",
+        "inter_action_delay": (0.8, 2.0),
+        "scroll_back_chance": 0.3,
+        "mouse_movement": True,
+        "typing_simulation": True,
+        "accept_cookies_first": True,       # Handle Google consent dialog
+        "avoid_rapid_searches": True,       # Max 1 search per 30s
+        "search_cooldown": 30,              # Seconds between searches
+    },
+    "yelp": {
+        "initial_delay": (2.5, 5.0),
+        "scroll_intensity": "normal",
+        "min_page_time": 12,
+        "max_page_time": 25,
+        "click_random_element": True,
+        "reading_pattern": "f_pattern",
+        "inter_action_delay": (1.0, 2.5),
+        "scroll_back_chance": 0.35,
+        "mouse_movement": True,
+        "typing_simulation": True,
+    },
+    "bbb": {
+        "initial_delay": (1.5, 3.5),
+        "scroll_intensity": "light",
+        "min_page_time": 8,
+        "max_page_time": 20,
+        "click_random_element": False,
+        "reading_pattern": "z_pattern",     # BBB has simpler layouts
+        "inter_action_delay": (0.5, 1.5),
+        "scroll_back_chance": 0.2,
+        "mouse_movement": True,
+        "typing_simulation": False,
+    },
+    "default": {
+        "initial_delay": (2.0, 4.0),
+        "scroll_intensity": "normal",
+        "min_page_time": 10,
+        "max_page_time": 20,
+        "click_random_element": False,
+        "reading_pattern": "basic",
+        "inter_action_delay": (0.8, 2.0),
+        "scroll_back_chance": 0.25,
+        "mouse_movement": True,
+        "typing_simulation": False,
+    },
+}
+
+
+def get_directory_config(directory: str) -> Dict[str, Any]:
+    """Get stealth configuration for a specific directory."""
+    return DIRECTORY_STEALTH_CONFIGS.get(directory, DIRECTORY_STEALTH_CONFIGS["default"])
+
+
+# =============================================================================
+# Directory Metrics Tracking (Phase 7)
+# =============================================================================
+
+@dataclass
+class DirectoryMetrics:
+    """
+    Track success/failure metrics per directory for adaptive behavior.
+
+    Monitors detection rates and adjusts delays automatically when
+    a directory starts blocking requests.
+    """
+    directory: str
+    success_count: int = 0
+    captcha_count: int = 0
+    block_count: int = 0
+    timeout_count: int = 0
+    last_success: Optional[datetime] = None
+    last_failure: Optional[datetime] = None
+    consecutive_failures: int = 0
+
+    @property
+    def total_requests(self) -> int:
+        return self.success_count + self.captcha_count + self.block_count + self.timeout_count
+
+    @property
+    def success_rate(self) -> float:
+        """Calculate success rate (0-1)."""
+        total = self.total_requests
+        return self.success_count / total if total > 0 else 1.0
+
+    @property
+    def detection_rate(self) -> float:
+        """Calculate detection rate (CAPTCHAs + blocks)."""
+        total = self.total_requests
+        detected = self.captcha_count + self.block_count
+        return detected / total if total > 0 else 0.0
+
+    def record_success(self):
+        """Record a successful request."""
+        self.success_count += 1
+        self.last_success = datetime.now()
+        self.consecutive_failures = 0
+
+    def record_captcha(self):
+        """Record a CAPTCHA encounter."""
+        self.captcha_count += 1
+        self.last_failure = datetime.now()
+        self.consecutive_failures += 1
+
+    def record_block(self):
+        """Record a block/access denied."""
+        self.block_count += 1
+        self.last_failure = datetime.now()
+        self.consecutive_failures += 1
+
+    def record_timeout(self):
+        """Record a timeout."""
+        self.timeout_count += 1
+        self.last_failure = datetime.now()
+        self.consecutive_failures += 1
+
+    def should_back_off(self) -> bool:
+        """Check if we should slow down requests to this directory."""
+        # Back off if:
+        # - More than 3 consecutive failures
+        # - Detection rate > 30%
+        # - Success rate < 50%
+        if self.consecutive_failures >= 3:
+            return True
+        if self.total_requests >= 5:
+            if self.detection_rate > 0.3:
+                return True
+            if self.success_rate < 0.5:
+                return True
+        return False
+
+    def get_recommended_delay_multiplier(self) -> float:
+        """Get delay multiplier based on detection rate."""
+        if self.consecutive_failures >= 5:
+            return 3.0  # Triple delays after 5 failures
+        if self.consecutive_failures >= 3:
+            return 2.0  # Double delays after 3 failures
+        if self.total_requests >= 10:
+            if self.detection_rate > 0.4:
+                return 2.5
+            if self.detection_rate > 0.2:
+                return 1.5
+        return 1.0  # Normal speed
+
+
+class DirectoryMetricsTracker:
+    """
+    Singleton tracker for directory metrics across all crawler instances.
+
+    Persists metrics in memory for adaptive behavior across requests.
+    """
+    _instance = None
+    _metrics: Dict[str, DirectoryMetrics] = {}
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._metrics = {}
+        return cls._instance
+
+    def get_metrics(self, directory: str) -> DirectoryMetrics:
+        """Get or create metrics for a directory."""
+        if directory not in self._metrics:
+            self._metrics[directory] = DirectoryMetrics(directory=directory)
+        return self._metrics[directory]
+
+    def get_adaptive_delay(self, directory: str) -> Tuple[float, float]:
+        """
+        Get adaptive delay range based on directory metrics.
+
+        Returns:
+            (min_delay, max_delay) tuple adjusted for detection rate
+        """
+        metrics = self.get_metrics(directory)
+        config = get_directory_config(directory)
+
+        # Base delay from config
+        base_delay = config.get("inter_action_delay", (1.0, 3.0))
+        multiplier = metrics.get_recommended_delay_multiplier()
+
+        adjusted_min = base_delay[0] * multiplier
+        adjusted_max = base_delay[1] * multiplier
+
+        # Log if backing off
+        if multiplier > 1.0:
+            logger.debug(
+                f"Adaptive delay for {directory}: {multiplier:.1f}x "
+                f"(success={metrics.success_rate:.0%}, detected={metrics.detection_rate:.0%})"
+            )
+
+        return (adjusted_min, adjusted_max)
+
+    def should_skip_directory(self, directory: str) -> bool:
+        """Check if we should skip a directory due to high detection."""
+        metrics = self.get_metrics(directory)
+
+        # Skip if 5+ consecutive failures
+        if metrics.consecutive_failures >= 5:
+            logger.warning(f"Skipping {directory} due to {metrics.consecutive_failures} consecutive failures")
+            return True
+
+        # Skip if detection rate > 70% with 10+ requests
+        if metrics.total_requests >= 10 and metrics.detection_rate > 0.7:
+            logger.warning(f"Skipping {directory} due to {metrics.detection_rate:.0%} detection rate")
+            return True
+
+        return False
+
+    def get_summary(self) -> Dict[str, Dict[str, Any]]:
+        """Get summary of all directory metrics."""
+        return {
+            dir_name: {
+                "success_rate": m.success_rate,
+                "detection_rate": m.detection_rate,
+                "total_requests": m.total_requests,
+                "consecutive_failures": m.consecutive_failures,
+            }
+            for dir_name, m in self._metrics.items()
+        }
+
+
+# Global metrics tracker instance
+_metrics_tracker: Optional[DirectoryMetricsTracker] = None
+
+
+def get_metrics_tracker() -> DirectoryMetricsTracker:
+    """Get the global directory metrics tracker."""
+    global _metrics_tracker
+    if _metrics_tracker is None:
+        _metrics_tracker = DirectoryMetricsTracker()
+    return _metrics_tracker
+
 
 class CitationCrawlerSelenium(BaseSeleniumScraper):
     """
@@ -192,13 +457,163 @@ class CitationCrawlerSelenium(BaseSeleniumScraper):
         # Per-directory CAPTCHA tracking
         self.directory_captcha_counts = {}
 
-        # Directory success/failure tracking
+        # Directory success/failure/blocked tracking
+        # - success: Found listing for business
+        # - fail: No listing found (legitimate negative)
+        # - skip: Directory skipped (login required, etc.)
+        # - blocked: CAPTCHA or access denied (not a true negative)
         self.directory_stats = {
-            d: {"success": 0, "fail": 0, "skip": 0}
+            d: {"success": 0, "fail": 0, "skip": 0, "blocked": 0}
             for d in CITATION_DIRECTORIES.keys()
         }
 
-        logger.info("CitationCrawlerSelenium initialized (tier=B, SeleniumBase UC mode)")
+        # Request counter for session break simulation
+        self._request_count = 0
+
+        logger.info("CitationCrawlerSelenium initialized (tier=B, using enterprise browser pool)")
+
+    def _simulate_human_behavior(self, driver, intensity: str = "normal", directory: str = None):
+        """
+        Simulate human browsing behavior with directory-specific tactics.
+
+        Uses F-pattern or Z-pattern reading simulation based on directory config.
+
+        Args:
+            driver: Selenium driver
+            intensity: "light", "normal", or "thorough"
+            directory: Directory name for specific config (e.g., "yellowpages")
+        """
+        try:
+            # Import F-pattern simulation
+            from seo_intelligence.drivers.human_behavior import (
+                simulate_f_pattern_selenium,
+                simulate_z_pattern_selenium,
+                click_safe_element_selenium,
+                move_mouse_naturally_selenium,
+            )
+
+            # Get directory-specific config
+            config = get_directory_config(directory) if directory else get_directory_config("default")
+
+            # Override intensity from config if available
+            if config.get("scroll_intensity"):
+                intensity = config["scroll_intensity"]
+
+            # Get YP-style scroll delays (3-7 variable delays)
+            scroll_delays = get_scroll_delays()
+
+            # Initial delay from config
+            initial_delay = config.get("initial_delay", (2.0, 4.0))
+            human_delay(min_seconds=initial_delay[0], max_seconds=initial_delay[1], jitter=0.5)
+
+            # Get page dimensions
+            try:
+                viewport_height = driver.execute_script("return window.innerHeight")
+                total_height = driver.execute_script("return document.body.scrollHeight")
+            except Exception:
+                viewport_height = 800
+                total_height = 2000
+
+            # Use reading pattern from config
+            reading_pattern = config.get("reading_pattern", "basic")
+
+            if reading_pattern == "f_pattern":
+                # Use sophisticated F-pattern reading simulation
+                simulate_f_pattern_selenium(driver, thorough=(intensity == "thorough"))
+
+            elif reading_pattern == "z_pattern":
+                # Use Z-pattern for simpler layouts
+                simulate_z_pattern_selenium(driver)
+
+            else:
+                # Basic scrolling behavior (original logic)
+                if intensity == "light":
+                    scroll_amount = random.randint(100, 300)
+                    driver.execute_script(f"window.scrollBy({{top: {scroll_amount}, behavior: 'smooth'}});")
+                    human_delay(min_seconds=0.5, max_seconds=1.5, jitter=0.2)
+
+                elif intensity == "normal":
+                    for i, delay in enumerate(scroll_delays[:3]):
+                        scroll_amount = random.randint(150, 400)
+                        driver.execute_script(f"window.scrollBy({{top: {scroll_amount}, behavior: 'smooth'}});")
+                        time.sleep(delay)
+
+                        scroll_back_chance = config.get("scroll_back_chance", 0.3)
+                        if random.random() < scroll_back_chance:
+                            back_scroll = random.randint(50, 150)
+                            driver.execute_script(f"window.scrollBy({{top: -{back_scroll}, behavior: 'smooth'}});")
+                            time.sleep(random.uniform(0.3, 0.8))
+
+                elif intensity == "thorough":
+                    current_position = 0
+                    for i, delay in enumerate(scroll_delays):
+                        scroll_amount = random.randint(200, 500)
+                        current_position += scroll_amount
+                        driver.execute_script(f"window.scrollTo({{top: {current_position}, behavior: 'smooth'}});")
+                        time.sleep(delay)
+
+                        try:
+                            new_height = driver.execute_script("return document.body.scrollHeight")
+                            if new_height > total_height:
+                                total_height = new_height
+                        except Exception:
+                            pass
+
+                        scroll_back_chance = config.get("scroll_back_chance", 0.25)
+                        if random.random() < scroll_back_chance:
+                            back_scroll = random.randint(100, 250)
+                            driver.execute_script(f"window.scrollBy({{top: -{back_scroll}, behavior: 'smooth'}});")
+                            human_delay(min_seconds=0.5, max_seconds=1.0, jitter=0.2)
+
+                        if current_position >= total_height:
+                            break
+
+                    human_delay(min_seconds=0.5, max_seconds=1.5, jitter=0.3)
+                    scroll_target = random.randint(0, 300)
+                    driver.execute_script(f"window.scrollTo({{top: {scroll_target}, behavior: 'smooth'}});")
+                    human_delay(min_seconds=1.0, max_seconds=2.0, jitter=0.5)
+
+            # Click random safe element if config allows
+            if config.get("click_random_element") and random.random() < 0.3:
+                try:
+                    click_safe_element_selenium(driver)
+                except Exception:
+                    pass
+
+            # Natural mouse movement if enabled
+            if config.get("mouse_movement") and random.random() < 0.5:
+                try:
+                    viewport_width = driver.execute_script("return window.innerWidth")
+                    # Move mouse to a random position
+                    move_mouse_naturally_selenium(
+                        driver,
+                        random.randint(100, viewport_width - 100),
+                        random.randint(100, viewport_height - 100)
+                    )
+                except Exception:
+                    pass
+
+            # Ensure minimum page time is met
+            min_page_time = config.get("min_page_time", 10)
+            max_page_time = config.get("max_page_time", 20)
+            additional_wait = random.uniform(min_page_time * 0.3, max_page_time * 0.3)
+            time.sleep(additional_wait)
+
+            # Final reading pause
+            reading_delay = get_human_reading_delay(200)
+            time.sleep(min(reading_delay, 3.0))
+
+        except Exception as e:
+            logger.debug(f"Human behavior simulation skipped: {e}")
+
+    def _maybe_take_session_break(self):
+        """Simulate human taking breaks between requests."""
+        self._request_count += 1
+        if self._request_count >= random.randint(8, 15):
+            break_duration = random.uniform(30, 90)
+            logger.info(f"Taking {break_duration:.0f}s session break (human simulation)")
+            time.sleep(break_duration)
+            self._request_count = 0
 
     def _normalize_phone(self, phone: str) -> str:
         """Normalize phone number to digits only."""
@@ -519,6 +934,19 @@ class CitationCrawlerSelenium(BaseSeleniumScraper):
 
         dir_info = CITATION_DIRECTORIES[directory]
 
+        # Get metrics tracker for adaptive behavior
+        metrics_tracker = get_metrics_tracker()
+
+        # Check if directory should be skipped due to high detection rate
+        if metrics_tracker.should_skip_directory(directory):
+            self.directory_stats[directory]["skip"] += 1
+            return CitationResult(
+                directory=directory,
+                directory_url=dir_info["name"],
+                is_listed=False,
+                metadata={"skipped": True, "skip_reason": "high_detection_rate"}
+            )
+
         # Check if directory should be skipped
         if dir_info.get("skip", False) or directory in SKIP_DIRECTORIES:
             logger.info(f"Skipping {directory}: login required")
@@ -571,21 +999,29 @@ class CitationCrawlerSelenium(BaseSeleniumScraper):
             search_url = search_url.replace("{zip}", quote_plus(zip_code))
 
         driver_type = dir_info.get("driver_type", "generic")
-        logger.info(f"Checking {dir_info['name']} for '{business.name}' [SeleniumBase UC]")
+        logger.info(f"Checking {dir_info['name']} for '{business.name}' [Enterprise Pool + UC]")
+
+        # Check for session break (human simulation)
+        self._maybe_take_session_break()
 
         try:
-            with self.browser_session(driver_type) as driver:
-                # Human delay before navigation
-                time.sleep(random.uniform(1.5, 3.0))
+            # Use browser pool (already has residential proxies, warmup, stealth)
+            # Pass directory as site to get proper target group mapping
+            with self.browser_session(directory) as driver:
+                # Adaptive delay before navigation (increases if detection rate is high)
+                adaptive_delay = metrics_tracker.get_adaptive_delay(directory)
+                human_delay(min_seconds=adaptive_delay[0], max_seconds=adaptive_delay[1], jitter=0.5)
 
                 # Navigate to search URL
                 driver.get(search_url)
 
-                # Wait for page to load
-                time.sleep(random.uniform(2, 4))
+                # Wait for page to load with human-like timing
+                config = get_directory_config(directory)
+                initial_delay = config.get("initial_delay", (3.0, 6.0))
+                human_delay(min_seconds=initial_delay[0], max_seconds=initial_delay[1], jitter=1.0)
 
-                # Simulate human behavior
-                self._simulate_human_behavior(driver, intensity="normal")
+                # Simulate human behavior with directory-specific scrolling
+                self._simulate_human_behavior(driver, intensity="thorough", directory=directory)
 
                 # Get page source
                 html = driver.page_source
@@ -593,6 +1029,7 @@ class CitationCrawlerSelenium(BaseSeleniumScraper):
                 if not html or len(html) < 1000:
                     logger.warning(f"Failed to fetch {dir_info['name']}")
                     self.directory_stats[directory]["fail"] += 1
+                    metrics_tracker.get_metrics(directory).record_timeout()
                     return None
 
                 # Check for CAPTCHA
@@ -615,16 +1052,20 @@ class CitationCrawlerSelenium(BaseSeleniumScraper):
                         duration_minutes=quarantine_minutes
                     )
 
+                    # Log CAPTCHA detection (browser pool handles proxy rotation internally)
                     logger.warning(
-                        f"CAPTCHA detected on {directory} - quarantining for {quarantine_minutes} minutes"
+                        f"CAPTCHA detected on {directory} - quarantining domain for {quarantine_minutes} minutes"
                     )
-                    self.directory_stats[directory]["fail"] += 1
+
+                    # Track as blocked, not fail - CAPTCHA is not a true negative
+                    self.directory_stats[directory]["blocked"] += 1
+                    metrics_tracker.get_metrics(directory).record_captcha()
 
                     return CitationResult(
                         directory=directory,
                         directory_url=dir_info["name"],
                         is_listed=False,
-                        metadata={"error": "CAPTCHA_DETECTED", "quarantine_minutes": quarantine_minutes}
+                        metadata={"error": "CAPTCHA_BLOCKED", "quarantine_minutes": quarantine_minutes}
                     )
 
                 # Extract listing info
@@ -637,15 +1078,19 @@ class CitationCrawlerSelenium(BaseSeleniumScraper):
                 # Track stats
                 if result and result.is_listed:
                     self.directory_stats[directory]["success"] += 1
+                    metrics_tracker.get_metrics(directory).record_success()
                     logger.info(f"SUCCESS: Found listing on {directory} for '{business.name}'")
                 else:
                     self.directory_stats[directory]["fail"] += 1
+                    # Not a detection failure, just no listing found
+                    metrics_tracker.get_metrics(directory).record_success()
 
                 return result
 
         except Exception as e:
             logger.error(f"Error checking {directory}: {e}")
             self.directory_stats[directory]["fail"] += 1
+            metrics_tracker.get_metrics(directory).record_block()
             return None
 
     def check_all_directories(

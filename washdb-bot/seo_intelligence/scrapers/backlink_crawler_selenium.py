@@ -373,11 +373,29 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
 
         Returns:
             List of backlink dictionaries with placement detection
+
+        Note:
+            Internal links (where source_domain == target_domain) are filtered out.
         """
         from bs4 import BeautifulSoup
 
         soup = BeautifulSoup(html, 'html.parser')
         backlinks = []
+
+        # Get source domain for internal link filtering
+        source_parsed = urlparse(source_url)
+        source_domain = source_parsed.netloc.lower()
+        if source_domain.startswith('www.'):
+            source_domain = source_domain[4:]
+
+        # Check if source page is on a target domain (internal link scenario)
+        source_is_target = False
+        for target in target_domains:
+            target_clean = target.lower().replace('www.', '')
+            if source_domain == target_clean or source_domain.endswith('.' + target_clean):
+                source_is_target = True
+                logger.debug(f"Source {source_url} is on target domain {target} - will skip internal links")
+                break
 
         for link in soup.find_all('a', href=True):
             href = link.get('href', '')
@@ -402,6 +420,10 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
                     target_clean = target_clean[4:]
 
                 if link_domain == target_clean or link_domain.endswith('.' + target_clean):
+                    # Skip internal links (source page is on the same domain as target)
+                    if source_is_target and (source_domain == link_domain or source_domain.endswith('.' + link_domain)):
+                        logger.debug(f"Skipping internal link: {source_url} -> {full_url}")
+                        continue
                     # Extract anchor text
                     anchor_text = link.get_text(strip=True)
 
@@ -456,7 +478,7 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
         inbound links from other sites.
 
         For reliable backlink discovery, use:
-        - search_bing_backlinks() for free discovery (mentions + links)
+        - search_duckduckgo_backlinks() for free discovery (mentions + links)
         - Paid APIs (Ahrefs, Majestic, Moz) for comprehensive backlink data
 
         This method is kept for backwards compatibility but results should
@@ -473,7 +495,7 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
         import warnings
         warnings.warn(
             "search_common_crawl() returns pages ON the domain, not pages LINKING TO it. "
-            "This method is deprecated for backlink discovery. Use search_bing_backlinks() instead.",
+            "This method is deprecated for backlink discovery. Use search_duckduckgo_backlinks() instead.",
             DeprecationWarning,
             stacklevel=2
         )
@@ -602,17 +624,174 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
 
         return backlink_sources
 
+    def _check_for_captcha_or_block(self, html: str) -> Tuple[bool, str]:
+        """
+        Check if the page contains a CAPTCHA or block indicator.
+
+        Args:
+            html: Page HTML source
+
+        Returns:
+            Tuple of (is_blocked, reason)
+        """
+        if not html:
+            return True, "EMPTY_RESPONSE"
+
+        html_lower = html.lower()
+
+        # CAPTCHA indicators
+        captcha_indicators = [
+            'captcha', 'recaptcha', 'g-recaptcha', 'hcaptcha',
+            'one last step', 'verify you are human', 'security check',
+            'unusual traffic', 'verify?partner=', 'challenge/verify',
+        ]
+
+        for indicator in captcha_indicators:
+            if indicator in html_lower:
+                return True, f"CAPTCHA_DETECTED:{indicator}"
+
+        # Block indicators
+        block_indicators = [
+            'access denied', 'blocked', '403 forbidden',
+            'your request has been blocked',
+        ]
+
+        for indicator in block_indicators:
+            if indicator in html_lower:
+                return True, f"BLOCKED:{indicator}"
+
+        return False, "OK"
+
+    def _search_bing_with_driver(
+        self,
+        driver,
+        query: str,
+        domain: str,
+        max_results: int,
+    ) -> Tuple[List[Dict[str, Any]], bool, str]:
+        """
+        Execute Bing search with given driver and return results.
+
+        Args:
+            driver: Selenium driver (already warmed up)
+            query: Search query
+            domain: Target domain
+            max_results: Max results to scrape
+
+        Returns:
+            Tuple of (results, is_blocked, reason)
+        """
+        from bs4 import BeautifulSoup
+
+        backlink_sources = []
+        seen_domains: Set[str] = set()
+
+        search_url = f"https://www.bing.com/search?q={quote(query)}"
+        logger.info(f"Fetching Bing results from: {search_url}")
+
+        # Apply long human delay before search to avoid CAPTCHA (30-60s)
+        delay_before = random.uniform(30.0, 60.0)
+        logger.info(f"Waiting {delay_before:.1f}s before Bing search...")
+        human_delay(min_seconds=30.0, max_seconds=60.0, jitter=5.0)
+
+        driver.get(search_url)
+
+        # Wait for results with human-like behavior (15-25s)
+        time.sleep(random.uniform(15.0, 25.0))
+
+        # Simulate reading the page
+        self._simulate_human_behavior(driver, intensity="normal")
+
+        # Get page source
+        html = driver.page_source
+
+        # Check for CAPTCHA/block
+        is_blocked, reason = self._check_for_captcha_or_block(html)
+        if is_blocked:
+            logger.warning(f"Bing search blocked: {reason}")
+            return [], True, reason
+
+        # Parse search results
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # Bing search results are in <li class="b_algo"> elements
+        results = soup.find_all('li', class_='b_algo')
+
+        logger.info(f"Found {len(results)} Bing search results")
+
+        # If no results found, might still be blocked
+        if len(results) == 0:
+            # Check for "No results" message vs actual block
+            if 'no results' in html.lower() or 'did not match any' in html.lower():
+                return [], False, "NO_RESULTS"
+            else:
+                # Likely blocked - results container exists but is empty
+                return [], True, "RESULTS_EMPTY_POSSIBLE_BLOCK"
+
+        for result in results[:max_results]:
+            try:
+                # Extract link
+                link_elem = result.find('h2')
+                if not link_elem:
+                    continue
+
+                a_tag = link_elem.find('a', href=True)
+                if not a_tag:
+                    continue
+
+                url = a_tag['href']
+
+                # Parse URL
+                parsed = urlparse(url)
+                source_domain = parsed.netloc.lower()
+                if source_domain.startswith('www.'):
+                    source_domain = source_domain[4:]
+
+                # Skip if same domain
+                if source_domain == domain:
+                    continue
+
+                # Skip if already seen
+                if source_domain in seen_domains:
+                    continue
+
+                seen_domains.add(source_domain)
+
+                # Extract snippet/context
+                snippet_elem = result.find('p') or result.find('div', class_='b_caption')
+                snippet = snippet_elem.get_text(strip=True) if snippet_elem else ""
+
+                backlink_sources.append({
+                    'source_url': url,
+                    'source_domain': source_domain,
+                    'target_domain': domain,
+                    'discovered_via': 'bing_search',
+                    'context': snippet[:200],
+                    'verified': False,
+                    'contains_link': None,
+                })
+
+            except Exception as e:
+                logger.debug(f"Failed to parse Bing result: {e}")
+                continue
+
+        return backlink_sources, False, "OK"
+
     def search_bing_backlinks(
         self,
         domain: str,
         max_results: int = 50,
         verify_links: bool = True,
+        max_escalation_attempts: int = 3,
     ) -> List[Dict[str, Any]]:
         """
         Use Bing search to find pages mentioning/linking to our domain.
 
-        Uses SeleniumBase UC mode to scrape Bing search results.
-        Optionally verifies that found pages actually contain backlinks.
+        Uses SeleniumBase UC mode with:
+        - Browser warming before search
+        - CAPTCHA/block detection
+        - Automatic browser escalation on block
+        - Proxy rotation
 
         Note: Bing deprecated the "link:" operator in 2017. This method
         searches for domain mentions which may include both links and
@@ -622,6 +801,7 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
             domain: Domain to find backlinks for (e.g., "example.com")
             max_results: Maximum number of results to scrape (default 50)
             verify_links: If True, verify each result contains an actual link
+            max_escalation_attempts: Max times to try with different browser tiers
 
         Returns:
             List of backlink sources found via Bing
@@ -633,101 +813,67 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
         if domain.startswith('www.'):
             domain = domain[4:]
 
+        # Randomize search query pattern to look more natural
+        # Avoid obvious bot patterns like "-site:" operator
+        # We filter out self-links in the parsing code anyway
+        query_templates = [
+            f'"{domain}"',                          # Simple quoted domain
+            f'"www.{domain}"',                      # With www
+            f'{domain} website',                    # Natural search
+            f'{domain} company',                    # Business search
+            f'"{domain}" reviews',                  # Review search
+            f'link:{domain}',                       # Bing link operator (natural)
+        ]
+        query = random.choice(query_templates)
+        logger.info(f"Using search pattern: {query}")
+
         backlink_sources = []
-        seen_domains: Set[str] = set()
 
-        # Search for domain mentions (excludes the domain itself with -site:)
-        # This finds pages that mention the domain, which may include links
-        alternative_query = f'"{domain}" -site:{domain}'
+        for attempt in range(max_escalation_attempts):
+            try:
+                logger.info(f"Attempt {attempt + 1}/{max_escalation_attempts}")
 
-        try:
-            # Use SeleniumBase browser session
-            with self.browser_session(site="generic") as driver:
-                # Search Bing
-                search_url = f"https://www.bing.com/search?q={quote(alternative_query)}"
-
-                logger.info(f"Fetching Bing results from: {search_url}")
-
-                # Apply human delay before search
-                human_delay(min_seconds=1.0, max_seconds=3.0, jitter=0.5)
-
-                driver.get(search_url)
-
-                # Wait for results
-                time.sleep(random.uniform(2.0, 4.0))
-
-                # Get page source
-                html = driver.page_source
-
-                if not html:
-                    logger.warning("Failed to fetch Bing search results")
-                    return []
-
-                # Parse search results
-                from bs4 import BeautifulSoup
-                soup = BeautifulSoup(html, 'html.parser')
-
-                # Bing search results are in <li class="b_algo"> elements
-                results = soup.find_all('li', class_='b_algo')
-
-                logger.info(f"Found {len(results)} Bing search results")
-
-                for result in results[:max_results]:
-                    try:
-                        # Extract link
-                        link_elem = result.find('h2')
-                        if not link_elem:
-                            continue
-
-                        a_tag = link_elem.find('a', href=True)
-                        if not a_tag:
-                            continue
-
-                        url = a_tag['href']
-
-                        # Parse URL
-                        parsed = urlparse(url)
-                        source_domain = parsed.netloc.lower()
-                        if source_domain.startswith('www.'):
-                            source_domain = source_domain[4:]
-
-                        # Skip if same domain
-                        if source_domain == domain:
-                            continue
-
-                        # Skip if already seen
-                        if source_domain in seen_domains:
-                            continue
-
-                        seen_domains.add(source_domain)
-
-                        # Extract snippet/context
-                        snippet_elem = result.find('p') or result.find('div', class_='b_caption')
-                        snippet = snippet_elem.get_text(strip=True) if snippet_elem else ""
-
-                        backlink_sources.append({
-                            'source_url': url,
-                            'source_domain': source_domain,
-                            'target_domain': domain,
-                            'discovered_via': 'bing_search',
-                            'context': snippet[:200],
-                            'verified': False,  # Will be set by verify step
-                            'contains_link': None,  # Unknown until verified
-                        })
-
-                    except Exception as e:
-                        logger.debug(f"Failed to parse Bing result: {e}")
+                # Use browser pool via browser_session (pool handles warmup and escalation)
+                with self.browser_session("bing") as driver:
+                    if driver is None:
+                        logger.error("Failed to get driver from pool")
                         continue
 
-                logger.info(f"Found {len(backlink_sources)} unique backlink sources from Bing")
+                    # Execute search
+                    backlink_sources, is_blocked, reason = self._search_bing_with_driver(
+                        driver, query, domain, max_results
+                    )
 
-        except Exception as e:
-            logger.error(f"Bing search failed: {e}")
+                    if is_blocked:
+                        logger.warning(f"Search blocked: {reason}")
+                        # Wait before retry with long exponential backoff (60-120s per attempt)
+                        wait_time = (attempt + 1) * 60 + random.randint(0, 60)
+                        logger.info(f"Waiting {wait_time}s before retry...")
+                        time.sleep(wait_time)
+                        # Raise to trigger pool's block reporting via exception handling
+                        raise RuntimeError(f"Bing blocked: {reason}")
+
+                    # Success!
+                    logger.info(f"Found {len(backlink_sources)} unique backlink sources from Bing")
+                    break
+
+            except RuntimeError as e:
+                if "blocked" in str(e).lower():
+                    logger.warning(f"Bing search attempt {attempt + 1} blocked, will retry")
+                    continue
+                raise
+
+            except Exception as e:
+                logger.error(f"Bing search attempt {attempt + 1} failed: {e}")
+                # Wait before retry (30-60s)
+                wait_time = 30 + random.randint(0, 30)
+                logger.info(f"Waiting {wait_time}s before retry...")
+                time.sleep(wait_time)
 
         # Optionally verify results contain actual backlinks
         if verify_links and backlink_sources:
             verified_sources = []
-            for source in backlink_sources[:min(10, len(backlink_sources))]:  # Verify top 10
+            for source in backlink_sources[:min(10, len(backlink_sources))]:
                 backlinks = self.check_page_for_backlinks(
                     source['source_url'],
                     [domain]
@@ -740,7 +886,266 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
                 else:
                     source['verified'] = True
                     source['contains_link'] = False
-                    # Still include but mark as mention-only
+                    source['is_mention_only'] = True
+                    verified_sources.append(source)
+
+            logger.info(f"Verified {len([s for s in verified_sources if s.get('contains_link')])} "
+                       f"actual backlinks out of {len(verified_sources)} checked")
+
+            return verified_sources
+
+        return backlink_sources
+
+    def _search_duckduckgo_with_driver(
+        self,
+        driver,
+        query: str,
+        domain: str,
+        max_results: int,
+    ) -> Tuple[List[Dict[str, Any]], bool, str]:
+        """
+        Execute DuckDuckGo search with given driver and return results.
+
+        Args:
+            driver: Selenium driver (already warmed up)
+            query: Search query
+            domain: Target domain
+            max_results: Max results to scrape
+
+        Returns:
+            Tuple of (results, is_blocked, reason)
+        """
+        from bs4 import BeautifulSoup
+
+        backlink_sources = []
+        seen_domains: Set[str] = set()
+
+        # DuckDuckGo search URL
+        search_url = f"https://duckduckgo.com/?q={quote(query)}&ia=web"
+        logger.info(f"Fetching DuckDuckGo results from: {search_url}")
+
+        # Apply moderate human delay before search (5-15s - DDG is less aggressive)
+        delay_before = random.uniform(5.0, 15.0)
+        logger.info(f"Waiting {delay_before:.1f}s before DuckDuckGo search...")
+        human_delay(min_seconds=5.0, max_seconds=15.0, jitter=2.0)
+
+        driver.get(search_url)
+
+        # Wait for JavaScript to render results (DDG is JS-heavy)
+        time.sleep(random.uniform(5.0, 10.0))
+
+        # Scroll down to trigger lazy loading
+        try:
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 2);")
+            time.sleep(random.uniform(1.0, 2.0))
+        except Exception:
+            pass
+
+        # Simulate reading the page
+        self._simulate_human_behavior(driver, intensity="light")
+
+        # Get page source
+        html = driver.page_source
+
+        # Check for CAPTCHA/block (DDG rarely blocks, but check anyway)
+        is_blocked, reason = self._check_for_captcha_or_block(html)
+        if is_blocked:
+            logger.warning(f"DuckDuckGo search blocked: {reason}")
+            return [], True, reason
+
+        # Parse search results
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # DuckDuckGo results are in article tags with data-testid="result"
+        # or in older format: div elements with result classes
+        results = soup.find_all('article', attrs={'data-testid': 'result'})
+
+        # Fallback: try other selectors if no results found
+        if not results:
+            results = soup.find_all('div', class_='result')
+        if not results:
+            results = soup.find_all('div', class_='links_main')
+        if not results:
+            # Try finding all result links
+            results = soup.select('[data-testid="result-title-a"]')
+
+        logger.info(f"Found {len(results)} DuckDuckGo search results")
+
+        # If no results found, check if actually blocked
+        if len(results) == 0:
+            # Check for "No results" message
+            no_results_indicators = ['no results', 'did not match', 'nothing found']
+            if any(ind in html.lower() for ind in no_results_indicators):
+                return [], False, "NO_RESULTS"
+            # Check if page loaded at all
+            if 'duckduckgo' not in html.lower():
+                return [], True, "PAGE_NOT_LOADED"
+            # May just be empty for this query
+            return [], False, "EMPTY_RESULTS"
+
+        for result in results[:max_results]:
+            try:
+                # Extract link - try multiple selectors
+                a_tag = None
+
+                # Try data-testid selector first (modern DDG)
+                a_tag = result.find('a', attrs={'data-testid': 'result-title-a'})
+
+                # Fallback to first link in result
+                if not a_tag:
+                    a_tag = result.find('a', href=True)
+
+                if not a_tag or not a_tag.get('href'):
+                    continue
+
+                url = a_tag['href']
+
+                # Skip DDG internal links
+                if 'duckduckgo.com' in url:
+                    continue
+
+                # Parse URL
+                parsed = urlparse(url)
+                source_domain = parsed.netloc.lower()
+                if source_domain.startswith('www.'):
+                    source_domain = source_domain[4:]
+
+                # Skip if same domain (internal links)
+                if source_domain == domain or domain in source_domain:
+                    continue
+
+                # Skip if already seen
+                if source_domain in seen_domains:
+                    continue
+
+                seen_domains.add(source_domain)
+
+                # Extract snippet/context
+                snippet_elem = result.find('span', attrs={'data-testid': 'result-snippet'})
+                if not snippet_elem:
+                    snippet_elem = result.find('p') or result.find('div', class_='snippet')
+                snippet = snippet_elem.get_text(strip=True) if snippet_elem else ""
+
+                backlink_sources.append({
+                    'source_url': url,
+                    'source_domain': source_domain,
+                    'target_domain': domain,
+                    'discovered_via': 'duckduckgo_search',
+                    'context': snippet[:200],
+                    'verified': False,
+                    'contains_link': None,
+                })
+
+            except Exception as e:
+                logger.debug(f"Failed to parse DuckDuckGo result: {e}")
+                continue
+
+        return backlink_sources, False, "OK"
+
+    def search_duckduckgo_backlinks(
+        self,
+        domain: str,
+        max_results: int = 50,
+        verify_links: bool = True,
+        max_escalation_attempts: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """
+        Use DuckDuckGo search to find pages mentioning/linking to our domain.
+
+        DuckDuckGo is generally less aggressive with bot detection than Bing,
+        making it more reliable for automated backlink discovery.
+
+        Uses SeleniumBase UC mode with:
+        - Browser warming before search
+        - CAPTCHA/block detection
+        - Automatic browser escalation on block
+        - Proxy rotation
+
+        Args:
+            domain: Domain to find backlinks for (e.g., "example.com")
+            max_results: Maximum number of results to scrape (default 50)
+            verify_links: If True, verify each result contains an actual link
+            max_escalation_attempts: Max times to try with different browser tiers
+
+        Returns:
+            List of backlink sources found via DuckDuckGo
+        """
+        logger.info(f"Searching DuckDuckGo for backlinks to {domain} (max {max_results} results, verify={verify_links})")
+
+        # Clean domain
+        domain = domain.lower().strip()
+        if domain.startswith('www.'):
+            domain = domain[4:]
+
+        # Randomize search query pattern to look natural
+        query_templates = [
+            f'"{domain}"',                          # Simple quoted domain
+            f'"www.{domain}"',                      # With www
+            f'{domain} site',                       # Natural search
+            f'{domain} website',                    # Website search
+            f'"{domain}" link',                     # Link search
+        ]
+        query = random.choice(query_templates)
+        logger.info(f"Using search pattern: {query}")
+
+        backlink_sources = []
+
+        for attempt in range(max_escalation_attempts):
+            try:
+                logger.info(f"Attempt {attempt + 1}/{max_escalation_attempts}")
+
+                # Use browser pool via browser_session
+                with self.browser_session("duckduckgo") as driver:
+                    if driver is None:
+                        logger.error("Failed to get driver from pool")
+                        continue
+
+                    # Execute search
+                    backlink_sources, is_blocked, reason = self._search_duckduckgo_with_driver(
+                        driver, query, domain, max_results
+                    )
+
+                    if is_blocked:
+                        logger.warning(f"Search blocked: {reason}")
+                        # Wait before retry (shorter than Bing since DDG is less aggressive)
+                        wait_time = (attempt + 1) * 20 + random.randint(0, 20)
+                        logger.info(f"Waiting {wait_time}s before retry...")
+                        time.sleep(wait_time)
+                        raise RuntimeError(f"DuckDuckGo blocked: {reason}")
+
+                    # Success!
+                    logger.info(f"Found {len(backlink_sources)} unique backlink sources from DuckDuckGo")
+                    break
+
+            except RuntimeError as e:
+                if "blocked" in str(e).lower():
+                    logger.warning(f"DuckDuckGo search attempt {attempt + 1} blocked, will retry")
+                    continue
+                raise
+
+            except Exception as e:
+                logger.error(f"DuckDuckGo search attempt {attempt + 1} failed: {e}")
+                # Wait before retry (15-30s)
+                wait_time = 15 + random.randint(0, 15)
+                logger.info(f"Waiting {wait_time}s before retry...")
+                time.sleep(wait_time)
+
+        # Optionally verify results contain actual backlinks
+        if verify_links and backlink_sources:
+            verified_sources = []
+            for source in backlink_sources[:min(10, len(backlink_sources))]:
+                backlinks = self.check_page_for_backlinks(
+                    source['source_url'],
+                    [domain]
+                )
+                if backlinks:
+                    source['verified'] = True
+                    source['contains_link'] = True
+                    source['found_backlinks'] = backlinks
+                    verified_sources.append(source)
+                else:
+                    source['verified'] = True
+                    source['contains_link'] = False
                     source['is_mention_only'] = True
                     verified_sources.append(source)
 
@@ -956,20 +1361,20 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
         all_sources = []
         seen_urls = set()
 
-        # Method 1: Bing search (primary free method)
-        bing_results = self.search_bing_backlinks(
+        # Method 1: DuckDuckGo search (primary free method - more reliable than Bing)
+        ddg_results = self.search_duckduckgo_backlinks(
             domain,
             max_results=max_results,
             verify_links=verify
         )
-        for result in bing_results:
+        for result in ddg_results:
             if result['source_url'] not in seen_urls:
                 seen_urls.add(result['source_url'])
                 all_sources.append(result)
 
         # Method 2: Wayback Machine for historical links (optional)
         if include_historical:
-            # Search for top referring domains from Bing results
+            # Search for top referring domains from DuckDuckGo results
             referring_domains = set()
             for source in all_sources[:10]:
                 rd = source.get('source_domain')
@@ -1032,18 +1437,18 @@ class BacklinkCrawlerSelenium(BaseSeleniumScraper):
 
         logger.info(f"Starting backlink discovery with artifact capture for {domain}")
 
-        # First, discover potential backlink sources via Bing
+        # First, discover potential backlink sources via DuckDuckGo
         all_sources = []
         seen_urls = set()
 
-        # Method 1: Bing search (primary free method)
-        bing_results = self.search_bing_backlinks(
+        # Method 1: DuckDuckGo search (primary free method - more reliable than Bing)
+        ddg_results = self.search_duckduckgo_backlinks(
             domain,
             max_results=max_results,
             verify_links=False  # We'll verify manually with artifact capture
         )
 
-        for result in bing_results:
+        for result in ddg_results:
             if result['source_url'] not in seen_urls:
                 seen_urls.add(result['source_url'])
                 all_sources.append(result)

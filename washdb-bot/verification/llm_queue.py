@@ -27,7 +27,7 @@ from typing import Optional, Dict, Any
 
 # Configuration
 SOCKET_PATH = os.getenv("LLM_SERVICE_SOCKET", "/tmp/llm_service.sock")
-MODEL_NAME = os.getenv("OLLAMA_MODEL", "mistral:7b")
+MODEL_NAME = os.getenv("OLLAMA_MODEL", "unified-washdb")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 
 logger = logging.getLogger(__name__)
@@ -179,10 +179,11 @@ class DirectLLMClient:
             "model": self.model_name,
             "prompt": prompt,
             "stream": False,
+            "raw": True,  # CRITICAL: bypass Ollama template to use ChatML format
             "options": {
-                "temperature": 0.0,
+                "temperature": 0.1,
                 "num_predict": max_tokens,
-                "top_p": 0.9,
+                "top_p": 0.85,
                 "top_k": 40
             }
         }
@@ -247,6 +248,32 @@ def llm_generate(prompt: str, max_tokens: int = 5, timeout: float = 30.0) -> str
     # Fall back to direct call
     direct_client = _get_direct_client()
     return direct_client.generate(prompt, max_tokens, timeout)
+
+
+def llm_generate_raw(
+    prompt: str,
+    model: str = None,
+    max_tokens: int = 400,
+    timeout: float = 30.0
+) -> str:
+    """
+    Generate text using a specific model directly via Ollama.
+
+    This function bypasses the shared LLM service and calls Ollama directly,
+    allowing specification of a custom model.
+
+    Args:
+        prompt: The prompt to process
+        model: The model name to use (defaults to OLLAMA_MODEL env var)
+        max_tokens: Maximum tokens to generate
+        timeout: Maximum time to wait
+
+    Returns:
+        Generated response text
+    """
+    model_name = model or MODEL_NAME
+    client = DirectLLMClient(model_name=model_name)
+    return client.generate(prompt, max_tokens, timeout)
 
 
 # Legacy compatibility - these functions existed in the old version

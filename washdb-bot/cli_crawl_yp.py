@@ -43,6 +43,7 @@ def ensure_targets_exist(session, state_ids: list[str]) -> int:
     """
     Ensure targets exist for the specified states.
     Auto-generates from city_registry if no targets found.
+    Also checks if category configuration has changed and regenerates if needed.
 
     Args:
         session: SQLAlchemy session
@@ -52,6 +53,21 @@ def ensure_targets_exist(session, state_ids: list[str]) -> int:
         Number of planned targets available
     """
     from db.models import YPTarget
+    from scrape_yp.generate_city_targets import check_and_regenerate_if_needed
+
+    # Check if category configuration has changed
+    # This will regenerate targets if yp_category_slugs.csv or other config files changed
+    regenerated = check_and_regenerate_if_needed(state_ids)
+    if regenerated:
+        # Targets were regenerated, return the new count
+        return (
+            session.query(YPTarget)
+            .filter(
+                YPTarget.state_id.in_(state_ids),
+                YPTarget.status == "planned"
+            )
+            .count()
+        )
 
     # Check if targets exist for these states
     existing_count = (

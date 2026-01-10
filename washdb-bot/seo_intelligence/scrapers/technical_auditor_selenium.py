@@ -406,21 +406,56 @@ class TechnicalAuditorSelenium(BaseSeleniumScraper):
         return issues, metrics
 
     def _check_schema(self, soup) -> Tuple[List[AuditIssue], Dict[str, Any]]:
-        """Check schema.org structured data."""
+        """Check schema.org structured data.
+
+        Uses get_text() instead of string property to handle multi-node scripts.
+        Supports @graph arrays commonly used in modern schema markup.
+        """
         issues = []
         metrics = {}
 
         schemas = []
         schema_types = set()
 
+        def extract_types(data):
+            """Recursively extract @type values from schema data."""
+            if isinstance(data, dict):
+                if '@type' in data:
+                    t = data['@type']
+                    if isinstance(t, list):
+                        schema_types.update(t)
+                    else:
+                        schema_types.add(t)
+                # Check nested objects
+                for v in data.values():
+                    extract_types(v)
+            elif isinstance(data, list):
+                for item in data:
+                    extract_types(item)
+
         for script in soup.find_all('script', type='application/ld+json'):
             try:
-                content = script.string
+                # Use get_text() instead of .string - handles multi-node scripts
+                content = script.get_text(strip=True)
                 if content:
                     data = json.loads(content)
-                    schemas.append(data)
-                    if isinstance(data, dict) and '@type' in data:
-                        schema_types.add(data['@type'])
+                    # Handle @graph arrays (common in Google-style schema)
+                    if isinstance(data, dict) and '@graph' in data:
+                        graph_items = data['@graph']
+                        if isinstance(graph_items, list):
+                            schemas.extend(graph_items)
+                            for item in graph_items:
+                                extract_types(item)
+                        else:
+                            schemas.append(graph_items)
+                            extract_types(graph_items)
+                    elif isinstance(data, list):
+                        schemas.extend(data)
+                        for item in data:
+                            extract_types(item)
+                    else:
+                        schemas.append(data)
+                        extract_types(data)
             except json.JSONDecodeError:
                 issues.append(AuditIssue(
                     category=IssueCategory.TECHNICAL.value,
@@ -1278,6 +1313,100 @@ class TechnicalAuditorSelenium(BaseSeleniumScraper):
             results["average_score"] = sum(scores) / len(scores)
 
         return results
+
+    def save_audit_to_db(
+        self,
+        result: AuditResult,
+        company_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """Save audit result to database.
+
+        Args:
+            result: The AuditResult from audit_page()
+            company_id: Optional company ID to associate with the audit
+
+        Returns:
+            The audit_id if saved successfully, None otherwise
+        """
+        if not self.engine:
+            logger.warning("No database engine configured, skipping DB save")
+            return None
+
+        try:
+            with Session(self.engine) as session:
+                # Insert main audit record
+                insert_result = session.execute(
+                    text("""
+                        INSERT INTO technical_audits (
+                            url, company_id, overall_score, audit_type,
+                            lcp_ms, fid_ms, cls_value, fcp_ms, ttfb_ms, tti_ms,
+                            cwv_score, lcp_rating, cls_rating, fid_rating,
+                            page_load_time_ms, page_size_kb, total_requests,
+                            metadata, audited_at
+                        ) VALUES (
+                            :url, :company_id, :overall_score, :audit_type,
+                            :lcp_ms, :fid_ms, :cls_value, :fcp_ms, :ttfb_ms, :tti_ms,
+                            :cwv_score, :lcp_rating, :cls_rating, :fid_rating,
+                            :page_load_time_ms, :page_size_kb, :total_requests,
+                            :metadata, :audited_at
+                        ) RETURNING audit_id
+                    """),
+                    {
+                        "url": result.url,
+                        "company_id": company_id,
+                        "overall_score": int(result.overall_score),
+                        "audit_type": "technical",
+                        "lcp_ms": result.metrics.get("lcp_ms"),
+                        "fid_ms": result.metrics.get("fid_ms"),
+                        "cls_value": result.metrics.get("cls_value"),
+                        "fcp_ms": result.metrics.get("fcp_ms"),
+                        "ttfb_ms": result.metrics.get("ttfb_ms"),
+                        "tti_ms": result.metrics.get("tti_ms"),
+                        "cwv_score": result.metrics.get("cwv_score"),
+                        "lcp_rating": result.metrics.get("lcp_rating"),
+                        "cls_rating": result.metrics.get("cls_rating"),
+                        "fid_rating": result.metrics.get("fid_rating"),
+                        "page_load_time_ms": result.metrics.get("page_load_time_ms"),
+                        "page_size_kb": result.metrics.get("page_size_kb"),
+                        "total_requests": result.metrics.get("total_requests"),
+                        "metadata": json.dumps(result.metrics),
+                        "audited_at": result.audit_date,
+                    }
+                )
+
+                audit_id = insert_result.fetchone()[0]
+
+                # Insert individual issues
+                for issue in result.issues:
+                    session.execute(
+                        text("""
+                            INSERT INTO technical_audit_issues (
+                                audit_id, category, issue_type, severity,
+                                description, element, recommendation, metadata
+                            ) VALUES (
+                                :audit_id, :category, :issue_type, :severity,
+                                :description, :element, :recommendation, :metadata
+                            )
+                        """),
+                        {
+                            "audit_id": audit_id,
+                            "category": issue.category,
+                            "issue_type": issue.issue_type,
+                            "severity": issue.severity,
+                            "description": issue.description,
+                            "element": issue.affected_element,
+                            "recommendation": issue.recommendation,
+                            "metadata": json.dumps(issue.metadata) if issue.metadata else None,
+                        }
+                    )
+
+                session.commit()
+                logger.info(f"Saved audit {audit_id} for {result.url} with {len(result.issues)} issues")
+                return audit_id
+
+        except Exception as e:
+            logger.error(f"Failed to save audit to DB: {e}")
+            return None
 
 
 # Singleton

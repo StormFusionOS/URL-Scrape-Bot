@@ -1,0 +1,27 @@
+[Unit]
+Description=WashDB LLM Verification Service
+After=network.target postgresql.service ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=rivercityscrape
+Group=rivercityscrape
+WorkingDirectory=/mnt/work/projects/URL-Scrape-Bot/washdb-bot
+Environment=PATH=/mnt/work/projects/URL-Scrape-Bot/washdb-bot/venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/mnt/work/projects/URL-Scrape-Bot/washdb-bot/.env
+ExecStart=/mnt/work/projects/URL-Scrape-Bot/washdb-bot/venv/bin/python scripts/llm_verification_service.py
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=append:/mnt/work/projects/URL-Scrape-Bot/washdb-bot/logs/llm_verification_service.log
+StandardError=append:/mnt/work/projects/URL-Scrape-Bot/washdb-bot/logs/llm_verification_service.log
+
+# Resource limits
+MemoryMax=2G
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

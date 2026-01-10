@@ -67,10 +67,11 @@ JS_RENDER_SCRIPT_THRESHOLD = 5  # Many scripts suggest SPA/JS-heavy site
 # ==============================================================================
 
 # Smart truncation limits for LLM context
-LLM_SERVICES_TEXT_LIMIT = 2000
-LLM_ABOUT_TEXT_LIMIT = 2000
-LLM_HOMEPAGE_TEXT_LIMIT = 1500
-LLM_TOTAL_CONTEXT_LIMIT = 6000
+# Increased for browser-extracted content (unified browser worker)
+LLM_SERVICES_TEXT_LIMIT = int(os.getenv('LLM_SERVICES_TEXT_LIMIT', '4000'))
+LLM_ABOUT_TEXT_LIMIT = int(os.getenv('LLM_ABOUT_TEXT_LIMIT', '4000'))
+LLM_HOMEPAGE_TEXT_LIMIT = int(os.getenv('LLM_HOMEPAGE_TEXT_LIMIT', '8000'))
+LLM_TOTAL_CONTEXT_LIMIT = int(os.getenv('LLM_TOTAL_CONTEXT_LIMIT', '12000'))
 
 # Keywords for smart truncation (prioritize sentences with these)
 LLM_PRIORITY_KEYWORDS = [
@@ -121,7 +122,7 @@ ALERT_PASS_RATE_MIN = 5          # Alert if pass rate drops below this %
 # ==============================================================================
 
 # Claude API Configuration
-CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', 'claude-3-5-sonnet-20241022')
+CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', 'claude-3-5-haiku-20241022')
 CLAUDE_MAX_TOKENS = int(os.getenv('CLAUDE_MAX_TOKENS', '500'))
 CLAUDE_TEMPERATURE = float(os.getenv('CLAUDE_TEMPERATURE', '0.0'))
 
@@ -141,7 +142,7 @@ CLAUDE_REVIEW_SCORE_MAX = float(os.getenv('CLAUDE_REVIEW_SCORE_MAX', '0.55'))
 CLAUDE_CONFIDENCE_THRESHOLD = float(os.getenv('CLAUDE_CONFIDENCE_THRESHOLD', '0.70'))
 
 # Cost Limits (safety thresholds)
-CLAUDE_MAX_COST_PER_DAY = float(os.getenv('CLAUDE_MAX_COST_DAY', '10.0'))
+CLAUDE_MAX_COST_PER_DAY = float(os.getenv('CLAUDE_MAX_COST_DAY', '50.0'))
 CLAUDE_MAX_REVIEWS_PER_DAY = int(os.getenv('CLAUDE_MAX_REVIEWS_DAY', '5000'))
 
 # Rate Limiting

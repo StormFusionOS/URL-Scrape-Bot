@@ -1,0 +1,16 @@
+[Unit]
+Description=Daily System Cleanup Timer
+Documentation=file:///home/rivercityscrape/SERVER_STORAGE_DOCUMENTATION.md
+
+[Timer]
+# Run daily at 3:00 AM
+OnCalendar=*-*-* 03:00:00
+
+# Add random delay up to 5 minutes to avoid exact timing
+RandomizedDelaySec=300
+
+# Run immediately if a scheduled run was missed (e.g., system was off)
+Persistent=true
+
+[Install]
+WantedBy=timers.target

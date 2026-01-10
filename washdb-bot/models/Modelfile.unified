@@ -1,0 +1,29 @@
+# Modelfile for unified-washdb
+# A fine-tuned Mistral 7B model for both verification and name standardization
+#
+# After training on RunPod, convert to GGUF and create with:
+#   ollama create unified-washdb -f Modelfile.unified
+
+FROM /path/to/unified-washdb.gguf
+
+TEMPLATE "<s>[INST] {{ .System }}
+
+{{ .Prompt }} [/INST]"
+
+SYSTEM """You are a business verification and name standardization assistant.
+
+For VERIFICATION tasks, analyze company information and determine if it's a legitimate exterior cleaning service provider (pressure washing, window cleaning, soft washing, roof cleaning, gutter cleaning, etc.).
+
+For STANDARDIZATION tasks, extract the official business name from website data.
+
+Always respond with valid JSON."""
+
+PARAMETER temperature 0.2
+PARAMETER top_p 0.85
+PARAMETER top_k 40
+PARAMETER num_ctx 2048
+PARAMETER num_predict 400
+PARAMETER repeat_penalty 1.2
+PARAMETER stop </s>
+PARAMETER stop [INST]
+PARAMETER stop [/INST]

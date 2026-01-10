@@ -150,7 +150,7 @@ class SerpScraperSelenium(BaseSeleniumScraper):
 
     def __init__(
         self,
-        headless: bool = True,
+        headless: bool = False,  # Headed mode works better against Google detection
         use_proxy: bool = True,  # Enabled by default with UC mode
         store_raw_html: bool = True,
         enable_embeddings: bool = True,
@@ -436,6 +436,103 @@ class SerpScraperSelenium(BaseSeleniumScraper):
 
         session.commit()
         logger.info(f"Saved {len(snapshot.people_also_ask)} PAA questions for snapshot {snapshot_id}")
+
+    def _parse_review_count(self, value) -> int | None:
+        """Parse review count from string like '(902)' or '902' to integer."""
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            # Strip parentheses, commas, and whitespace
+            cleaned = value.strip().strip('()').replace(',', '').strip()
+            if cleaned.isdigit():
+                return int(cleaned)
+            # Try to extract first number from string
+            import re
+            match = re.search(r'\d+', cleaned)
+            if match:
+                return int(match.group())
+        return None
+
+    def _parse_rating(self, value) -> float | None:
+        """Parse rating from string like '4.5' to float."""
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                return None
+        return None
+
+    def _save_local_pack(
+        self,
+        session: Session,
+        snapshot_id: int,
+        query_id: int,
+        snapshot: SerpSnapshot,
+    ):
+        """Save local pack (Google Maps) results to serp_local_pack table."""
+        if not snapshot.local_pack:
+            return
+
+        for item in snapshot.local_pack:
+            # Handle both dict and object access
+            if isinstance(item, dict):
+                get = item.get
+            else:
+                get = lambda k, d=None: getattr(item, k, d)
+
+            # Parse review_count and rating to proper types
+            review_count = self._parse_review_count(get('review_count'))
+            rating = self._parse_rating(get('rating'))
+
+            session.execute(
+                text("""
+                    INSERT INTO serp_local_pack (
+                        snapshot_id, query_id, business_name, position,
+                        phone, website, street, city, state, zip_code,
+                        rating, rating_text, review_count, category,
+                        price_level, hours, is_open, distance,
+                        directions_url, services, metadata
+                    ) VALUES (
+                        :snapshot_id, :query_id, :business_name, :position,
+                        :phone, :website, :street, :city, :state, :zip_code,
+                        :rating, :rating_text, :review_count, :category,
+                        :price_level, :hours, :is_open, :distance,
+                        :directions_url, :services, :metadata
+                    )
+                """),
+                {
+                    "snapshot_id": snapshot_id,
+                    "query_id": query_id,
+                    "business_name": get('name') or get('business_name') or 'Unknown',
+                    "position": get('position', 0) or 0,
+                    "phone": get('phone'),
+                    "website": get('website'),
+                    "street": get('street'),
+                    "city": get('city'),
+                    "state": get('state'),
+                    "zip_code": get('zip_code') or get('zip'),
+                    "rating": rating,
+                    "rating_text": get('rating_text'),
+                    "review_count": review_count,
+                    "category": get('category'),
+                    "price_level": get('price_level'),
+                    "hours": get('hours'),
+                    "is_open": get('is_open'),
+                    "distance": get('distance'),
+                    "directions_url": get('directions_url'),
+                    "services": get('services'),
+                    "metadata": json.dumps(item if isinstance(item, dict) else None),
+                }
+            )
+
+        session.commit()
+        logger.info(f"Saved {len(snapshot.local_pack)} local pack results for snapshot {snapshot_id}")
 
     def _save_results(
         self,
@@ -1045,6 +1142,9 @@ class SerpScraperSelenium(BaseSeleniumScraper):
                         self._save_paa_questions(
                             session, snapshot_id, query_id, snapshot
                         )
+                        self._save_local_pack(
+                            session, snapshot_id, query_id, snapshot
+                        )
 
                         logger.info(
                             f"Saved SERP snapshot {snapshot_id} with "
@@ -1063,7 +1163,7 @@ class SerpScraperSelenium(BaseSeleniumScraper):
         country: str = "us",
         language: str = "en",
         num_results: int = 100,
-        use_coordinator: bool = True,
+        use_coordinator: bool = False,  # Changed: Browser pool works better than Camoufox
     ) -> Optional[Dict[str, Any]]:
         """
         Backwards-compatible method that returns a dict instead of SerpSnapshot.
@@ -1077,8 +1177,8 @@ class SerpScraperSelenium(BaseSeleniumScraper):
             language: Language code (hl parameter)
             num_results: Number of results to request
             use_coordinator: If True, use GoogleCoordinator for rate limiting
-                            and browser session sharing (recommended).
-                            If False, use direct scraping (standalone mode).
+                            and browser session sharing (uses Camoufox).
+                            If False, use browser pool with SeleniumBase UC (recommended).
 
         Returns:
             Dict with organic_results, people_also_ask, local_pack, etc.
@@ -1087,7 +1187,10 @@ class SerpScraperSelenium(BaseSeleniumScraper):
         # If using coordinator, route through it with SHARED browser
         if use_coordinator:
             try:
-                coordinator = get_google_coordinator()
+                coordinator = get_google_coordinator(
+                    headless=self.headless,
+                    use_proxy=self.use_proxy
+                )
                 # Use execute() which provides the shared browser
                 return coordinator.execute(
                     "serp",
@@ -1475,11 +1578,15 @@ class SerpScraperSelenium(BaseSeleniumScraper):
                         self._save_paa_questions(
                             session, snapshot_id, query_id, final_snapshot
                         )
+                        self._save_local_pack(
+                            session, snapshot_id, query_id, final_snapshot
+                        )
 
                         logger.info(
                             f"Saved interactive SERP snapshot {snapshot_id} with "
                             f"{len(final_snapshot.results)} results, "
-                            f"{len(final_snapshot.people_also_ask)} PAA questions"
+                            f"{len(final_snapshot.people_also_ask)} PAA questions, "
+                            f"{len(final_snapshot.local_pack)} local pack results"
                         )
 
                 return final_snapshot

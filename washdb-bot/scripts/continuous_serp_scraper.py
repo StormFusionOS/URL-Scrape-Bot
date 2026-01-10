@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from sqlalchemy import text
 from db.database_manager import DatabaseManager
-from seo_intelligence.scrapers.serp_scraper import SerpScraper
+from seo_intelligence.scrapers import SerpScraper
 from runner.logging_setup import get_logger
 
 logger = get_logger("continuous_serp_scraper")

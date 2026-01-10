@@ -1,0 +1,23 @@
+[Unit]
+Description=WashDB Claude API Verification Service
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=rivercityscrape
+Group=rivercityscrape
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+Environment="PATH=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python -m verification.claude_service
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/claude_service.log
+StandardError=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/claude_service_error.log
+
+# Safety limits
+MemoryMax=2G
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

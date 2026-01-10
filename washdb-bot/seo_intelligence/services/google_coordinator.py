@@ -317,45 +317,58 @@ class GoogleCoordinator:
         if not self._camoufox:
             return
 
-        try:
-            logger.info("Warming up browser with neutral search...")
-            self._camoufox._ensure_browser()
-            page = self._camoufox._page
-
-            # Do a neutral warm-up search
-            page.goto("https://www.google.com/search?q=whats+happening+today", wait_until="domcontentloaded", timeout=30000)
-            time.sleep(3)
-
-            # Handle consent popup if present
+        max_retries = 2
+        for attempt in range(max_retries):
             try:
-                consent_btn = page.query_selector('button[id="L2AGLb"]')
-                if consent_btn and consent_btn.is_visible():
-                    consent_btn.click()
-                    logger.debug("Clicked consent button during warm-up")
+                logger.debug(f"Warming up browser (attempt {attempt + 1}/{max_retries})...")
+                self._camoufox._ensure_browser()
+                page = self._camoufox._page
+
+                # First try simple homepage (faster, less likely to fail)
+                try:
+                    page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=20000)
+                    time.sleep(2)
+                except Exception:
+                    # Fallback: try with longer timeout
+                    page.goto("https://www.google.com", wait_until="load", timeout=45000)
+                    time.sleep(2)
+
+                # Handle consent popup if present
+                try:
+                    consent_btn = page.query_selector('button[id="L2AGLb"]')
+                    if consent_btn and consent_btn.is_visible():
+                        consent_btn.click()
+                        logger.debug("Clicked consent button during warm-up")
+                        time.sleep(1)
+                except Exception:
+                    pass
+
+                # Check for CAPTCHA
+                url = page.url
+                if "/sorry/" in url:
+                    logger.warning("Got CAPTCHA during warm-up - session may be flagged")
+                    self._record_captcha()
+                else:
+                    logger.debug("Browser warm-up successful")
                     time.sleep(1)
-            except Exception:
-                pass
+                    return  # Success
 
-            # Check for CAPTCHA in warm-up
-            url = page.url
-            if "/sorry/" in url:
-                logger.warning("Got CAPTCHA during warm-up - session may be flagged")
-                self._record_captcha()
-            else:
-                logger.info("Browser warm-up successful")
-                time.sleep(2)  # Extra wait before actual use
-
-        except Exception as e:
-            logger.warning(f"Browser warm-up failed: {e}")
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.debug(f"Browser warm-up attempt {attempt + 1} failed, retrying: {str(e)[:50]}")
+                    time.sleep(2)
+                else:
+                    # Only log as debug on final failure - warm-up is optional
+                    logger.debug(f"Browser warm-up failed after {max_retries} attempts (non-critical)")
 
     def _run_in_isolated_thread(self, func, *args, timeout: int = 120, **kwargs):
         """
         Run a function in an isolated thread to avoid asyncio loop contamination.
 
-        Playwright's sync API explicitly checks for running asyncio loops and refuses
-        to run inside one. When Camoufox starts, it creates an asyncio loop that
-        persists even after the browser closes. This wrapper ensures all Playwright
-        operations run in a clean thread without an event loop.
+        Playwright's sync API creates an event loop that persists even after the
+        browser closes. This wrapper ensures Camoufox operations run in a clean
+        thread. nest_asyncio (applied in camoufox_drivers.py) allows nested event
+        loops, so Playwright works correctly.
 
         Args:
             func: Function to run in isolated thread
@@ -369,36 +382,22 @@ class GoogleCoordinator:
         import asyncio
 
         def wrapped_func(*args, **kwargs):
-            # Aggressively ensure no running event loop is detected
-            # This is needed because nest_asyncio patches asyncio globally
-            # and Playwright's sync API checks for running loops
+            # Ensure nest_asyncio is applied (camoufox_drivers import does this)
+            import nest_asyncio
+            nest_asyncio.apply()
 
-            # First, close any existing loop in this thread
-            try:
-                loop = asyncio.get_event_loop()
-                if not loop.is_running():
-                    loop.close()
-            except RuntimeError:
-                pass
-
-            # Create a fresh event loop
+            # Create a fresh event loop for this thread
             new_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(new_loop)
-
-            # Temporarily patch get_running_loop to return None
-            # This bypasses Playwright's sync API check
-            original_get_running_loop = asyncio.get_running_loop
-
-            def patched_get_running_loop():
-                raise RuntimeError("no running event loop")
-
-            asyncio.get_running_loop = patched_get_running_loop
 
             try:
                 return func(*args, **kwargs)
             finally:
-                # Restore original function
-                asyncio.get_running_loop = original_get_running_loop
+                # Clean up the event loop
+                try:
+                    new_loop.close()
+                except Exception:
+                    pass
 
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="isolated_browser") as executor:
             future = executor.submit(wrapped_func, *args, **kwargs)

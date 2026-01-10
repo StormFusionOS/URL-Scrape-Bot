@@ -158,7 +158,7 @@ def test_module(name: str, test_func, inputs: list, module_num: int) -> dict:
 
 def test_1_technical_auditor(limit: int = 10):
     """Test TechnicalAuditor module."""
-    from seo_intelligence.scrapers.technical_auditor import TechnicalAuditor
+    from seo_intelligence.scrapers import TechnicalAuditor
 
     auditor = TechnicalAuditor(headless=True)
 
@@ -170,7 +170,7 @@ def test_1_technical_auditor(limit: int = 10):
 
 def test_2_core_web_vitals(limit: int = 10):
     """Test CoreWebVitalsCollector module."""
-    from seo_intelligence.scrapers.core_web_vitals import CoreWebVitalsCollector
+    from seo_intelligence.scrapers import CoreWebVitalsCollector
 
     collector = CoreWebVitalsCollector(headless=True)
 
@@ -206,7 +206,7 @@ def test_4_autocomplete_scraper(limit: int = 10):
 
 def test_5_citation_crawler(limit: int = 3):
     """Test CitationCrawler module."""
-    from seo_intelligence.scrapers.citation_crawler import CitationCrawler, BusinessInfo
+    from seo_intelligence.scrapers import CitationCrawler, BusinessInfo
 
     crawler = CitationCrawler(headless=True)
 
@@ -230,7 +230,7 @@ def test_5_citation_crawler(limit: int = 3):
 
 def test_6_backlink_crawler(limit: int = 5):
     """Test BacklinkCrawler module."""
-    from seo_intelligence.scrapers.backlink_crawler import BacklinkCrawler
+    from seo_intelligence.scrapers import BacklinkCrawler
 
     crawler = BacklinkCrawler(headless=True)
 
@@ -242,7 +242,7 @@ def test_6_backlink_crawler(limit: int = 5):
 
 def test_7_competitor_crawler(limit: int = 3):
     """Test CompetitorCrawler module."""
-    from seo_intelligence.scrapers.competitor_crawler import CompetitorCrawler
+    from seo_intelligence.scrapers import CompetitorCrawler
 
     crawler = CompetitorCrawler(headless=True, max_pages_per_site=3)
 

@@ -1,0 +1,30 @@
+# Unified WashDB LLM - Combined Verification and Standardization
+# Usage: ollama create unified-washdb -f Modelfile.unified
+
+FROM /workspace/output/unified-washdb-q4km.gguf
+
+TEMPLATE "<s>[INST] {{ .System }}
+
+{{ .Prompt }} [/INST]"
+
+SYSTEM """You are a business intelligence assistant for WashDB that performs two tasks:
+
+TASK 1 - VERIFICATION: Determine if a company is a legitimate exterior cleaning service provider.
+Target services: Pressure washing, Window cleaning, Soft washing, Roof cleaning, Gutter cleaning, Solar panel cleaning, Fleet washing, Wood restoration.
+
+TASK 2 - STANDARDIZATION: Extract and standardize the official business name from website information.
+
+For verification requests, respond with JSON:
+{"legitimate": true/false, "confidence": 0.0-1.0, "services": {...}, "reasoning": "..."}
+
+For standardization requests, respond with just the standardized business name."""
+
+PARAMETER temperature 0.1
+PARAMETER top_p 0.9
+PARAMETER top_k 40
+PARAMETER num_ctx 2048
+PARAMETER num_predict 512
+PARAMETER repeat_penalty 1.1
+PARAMETER stop </s>
+PARAMETER stop [INST]
+PARAMETER stop [/INST]

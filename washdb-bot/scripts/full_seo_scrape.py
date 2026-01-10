@@ -127,7 +127,7 @@ def extract_domain(url: str) -> str:
 def run_module_1_technical_audit(url: str, result: SEOResult) -> None:
     """Run TechnicalAuditor module."""
     try:
-        from seo_intelligence.scrapers.technical_auditor import TechnicalAuditor
+        from seo_intelligence.scrapers import TechnicalAuditor
 
         auditor = TechnicalAuditor(headless=USE_HEADLESS)
         audit = auditor.audit_page(url)
@@ -162,7 +162,7 @@ def run_module_1_technical_audit(url: str, result: SEOResult) -> None:
 def run_module_2_core_web_vitals(url: str, result: SEOResult) -> None:
     """Run CoreWebVitalsCollector module."""
     try:
-        from seo_intelligence.scrapers.core_web_vitals import CoreWebVitalsCollector
+        from seo_intelligence.scrapers import CoreWebVitalsCollector
 
         collector = CoreWebVitalsCollector(headless=USE_HEADLESS)
         cwv = collector.measure_url(url)
@@ -247,7 +247,7 @@ def run_module_4_autocomplete(domain: str, result: SEOResult) -> None:
 def run_module_5_citations(business_name: str, result: SEOResult) -> None:
     """Run CitationCrawler module."""
     try:
-        from seo_intelligence.scrapers.citation_crawler import CitationCrawler, BusinessInfo
+        from seo_intelligence.scrapers import CitationCrawler, BusinessInfo
 
         crawler = CitationCrawler(headless=USE_HEADLESS)
 
@@ -297,7 +297,7 @@ def run_module_5_citations(business_name: str, result: SEOResult) -> None:
 def run_module_6_backlinks(url: str, result: SEOResult, target_domains: List[str] = None) -> None:
     """Run BacklinkCrawler module."""
     try:
-        from seo_intelligence.scrapers.backlink_crawler import BacklinkCrawler
+        from seo_intelligence.scrapers import BacklinkCrawler
 
         crawler = BacklinkCrawler(headless=USE_HEADLESS)
 
@@ -328,7 +328,7 @@ def run_module_6_backlinks(url: str, result: SEOResult, target_domains: List[str
 def run_module_7_competitor(domain: str, result: SEOResult) -> None:
     """Run CompetitorCrawler module."""
     try:
-        from seo_intelligence.scrapers.competitor_crawler import CompetitorCrawler
+        from seo_intelligence.scrapers import CompetitorCrawler
 
         crawler = CompetitorCrawler(headless=USE_HEADLESS, max_pages_per_site=5)
         competitor = crawler.crawl_competitor(domain)

@@ -1,0 +1,18 @@
+[Unit]
+Description=WashDB SEO Health Check
+After=network.target
+
+[Service]
+Type=oneshot
+User=rivercityscrape
+Group=rivercityscrape
+EnvironmentFile=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/.env
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python scripts/seo_health_check.py --restart --quiet
+
+# Logging
+StandardOutput=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/seo_health_check.log
+StandardError=append:/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs/seo_health_check.log
+
+[Install]
+WantedBy=multi-user.target

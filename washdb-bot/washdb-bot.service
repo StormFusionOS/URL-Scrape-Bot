@@ -7,10 +7,15 @@ Wants=postgresql.service
 Type=simple
 User=rivercityscrape
 Group=rivercityscrape
-WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
-Environment="PATH=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-EnvironmentFile=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/.env
-ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/.venv/bin/python -m niceui.main
+
+# Load environment variables from config
+EnvironmentFile=/etc/washdb-bot/washdb-bot.env
+EnvironmentFile=${WASHDB_HOME}/.env
+
+WorkingDirectory=${WASHDB_HOME}
+Environment="PATH=${WASHDB_VENV}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=${WASHDB_VENV}/bin/python -m niceui.main
+
 Restart=always
 RestartSec=10
 StandardOutput=journal

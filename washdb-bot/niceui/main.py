@@ -53,13 +53,13 @@ def register_pages():
     router.register('seo_database', pages.seo_database_page)
     router.register('seo_review_queue', pages.seo_review_queue_page)
     router.register('local_competitors', pages.local_competitors_page)
-    router.register('dev_tools', pages.dev_tools_page)
     router.register('testing', pages.testing_page)
     router.register('scraper_review', pages.scraper_review_page)
     router.register('yp_discover', pages.yp_discover_page)
     router.register('verification', pages.verification_page)
     router.register('seo_dashboard', pages.seo_dashboard_page)
     router.register('standardization', pages.standardization_page)
+    router.register('system_monitor', pages.system_monitor_page)
 
 
 def create_app():

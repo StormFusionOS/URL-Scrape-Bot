@@ -60,7 +60,7 @@ def test_technical_auditor(urls: list) -> dict:
     results = {'passed': 0, 'failed': 0, 'blocked': 0, 'errors': []}
 
     try:
-        from seo_intelligence.scrapers.technical_auditor import TechnicalAuditor
+        from seo_intelligence.scrapers import TechnicalAuditor
         auditor = TechnicalAuditor(headless=True)
 
         for i, (url, name) in enumerate(urls, 1):
@@ -121,7 +121,7 @@ def test_core_web_vitals(urls: list) -> dict:
     results = {'passed': 0, 'failed': 0, 'blocked': 0, 'errors': []}
 
     try:
-        from seo_intelligence.scrapers.core_web_vitals import CoreWebVitalsCollector
+        from seo_intelligence.scrapers import CoreWebVitalsCollector
         collector = CoreWebVitalsCollector(headless=True)
 
         for i, (url, name) in enumerate(urls, 1):
@@ -164,7 +164,7 @@ def test_backlink_crawler(urls: list) -> dict:
     results = {'passed': 0, 'failed': 0, 'blocked': 0, 'errors': []}
 
     try:
-        from seo_intelligence.scrapers.backlink_crawler import BacklinkCrawler
+        from seo_intelligence.scrapers import BacklinkCrawler
         crawler = BacklinkCrawler(headless=True)
 
         # Use first few URLs as target domains to check for
@@ -217,7 +217,7 @@ def test_competitor_crawler(urls: list) -> dict:
     results = {'passed': 0, 'failed': 0, 'blocked': 0, 'errors': []}
 
     try:
-        from seo_intelligence.scrapers.competitor_crawler import CompetitorCrawler
+        from seo_intelligence.scrapers import CompetitorCrawler
         crawler = CompetitorCrawler(headless=True, max_pages=3)
 
         # Extract domains from URLs
