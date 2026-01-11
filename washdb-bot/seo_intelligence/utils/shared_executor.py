@@ -32,7 +32,8 @@ logger = get_logger("shared_executor")
 T = TypeVar('T')
 
 # Configuration
-MAX_WORKERS = 20  # Bounded pool size
+# Server has 32 cores and 125GB RAM - can handle much more parallelism
+MAX_WORKERS = 80  # Increased from 20 to handle concurrent browser operations
 THREAD_WARNING_THRESHOLD = 2000  # Warn when approaching limit
 THREAD_CRITICAL_THRESHOLD = 3000  # Force GC and reject new work
 EXECUTOR_IDLE_TIMEOUT = 300  # Shutdown idle workers after 5 minutes

@@ -678,6 +678,43 @@ class CompetitorCrawlerSelenium(BaseSeleniumScraper):
             )
             session.commit()
             logger.debug(f"Content unchanged for {metrics.url}, skipped insert (page_id={existing[0]})")
+
+            # Still save to competitor_crawl_pages if not already there (for modules needing HTML)
+            try:
+                existing_cache = session.execute(
+                    text("""
+                        SELECT id FROM competitor_crawl_pages
+                        WHERE competitor_id = :cid AND url = :url
+                        LIMIT 1
+                    """),
+                    {"cid": competitor_id, "url": metrics.url}
+                ).fetchone()
+
+                if not existing_cache:
+                    session.execute(
+                        text("""
+                            INSERT INTO competitor_crawl_pages (
+                                competitor_id, url, page_type, html_content,
+                                content_hash, status_code, crawled_at
+                            ) VALUES (
+                                :competitor_id, :url, :page_type, :html_content,
+                                :content_hash, :status_code, NOW()
+                            )
+                        """),
+                        {
+                            "competitor_id": competitor_id,
+                            "url": metrics.url,
+                            "page_type": metrics.page_type,
+                            "html_content": html[:500000] if html else None,
+                            "content_hash": content_hash,
+                            "status_code": status_code,
+                        }
+                    )
+                    session.commit()
+                    logger.info(f"Backfilled HTML cache for {metrics.url}")
+            except Exception as e:
+                logger.debug(f"Could not backfill competitor_crawl_pages: {e}")
+
             return existing[0]
 
         # Prepare data
@@ -796,6 +833,37 @@ class CompetitorCrawlerSelenium(BaseSeleniumScraper):
             except Exception as e:
                 logger.error(f"Failed to generate embeddings for page {page_id}: {e}")
                 # Continue without embeddings - don't fail the entire save operation
+
+        # Also save to competitor_crawl_pages for modules that need full HTML
+        try:
+            session.execute(
+                text("""
+                    INSERT INTO competitor_crawl_pages (
+                        competitor_id, url, page_type, html_content, text_content,
+                        content_hash, status_code, crawled_at
+                    ) VALUES (
+                        :competitor_id, :url, :page_type, :html_content, :text_content,
+                        :content_hash, :status_code, NOW()
+                    )
+                    ON CONFLICT DO NOTHING
+                """),
+                {
+                    "competitor_id": competitor_id,
+                    "url": metrics.url,
+                    "page_type": metrics.page_type,
+                    "html_content": html[:500000] if html else None,  # Cap at 500KB
+                    "text_content": (
+                        main_text[:100000] if ('main_text' in locals() and main_text) else None
+                    ),
+                    "content_hash": content_hash,
+                    "status_code": status_code,
+                }
+            )
+            session.commit()
+            logger.debug(f"Saved HTML cache for page {page_id}")
+        except Exception as e:
+            logger.debug(f"Could not save to competitor_crawl_pages: {e}")
+            # Non-critical - continue
 
         return page_id
 

@@ -1,0 +1,56 @@
+[Unit]
+Description=WashDB Competitor Intelligence Worker - Local Competitor Tracking
+Documentation=https://github.com/StormFusionOS/URL-Scrape-Bot
+After=network.target postgresql.service xvfb.service
+Wants=xvfb.service
+
+[Service]
+Type=simple
+User=rivercityscrape
+Group=rivercityscrape
+WorkingDirectory=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot
+
+# Environment
+Environment=DISPLAY=:99
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/washdb-bot/washdb-bot.env
+
+# Main process
+ExecStart=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/venv/bin/python \
+    -m competitor_intel.jobs.competitor_job_orchestrator \
+    --worker-name competitor_worker_1
+
+# Restart policy
+Restart=always
+RestartSec=30
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# Resource limits (lighter than SEO worker since fewer competitors)
+MemoryHigh=4G
+MemoryMax=6G
+CPUQuota=80%
+
+# Systemd watchdog (requires sd_notify support in code)
+WatchdogSec=120
+NotifyAccess=main
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=competitor-intel
+
+# Security hardening (relaxed for Chrome snap compatibility)
+# NoNewPrivileges=true  # Disabled - Chrome snap requires new privileges
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/logs
+ReadWritePaths=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/data
+ReadWritePaths=/home/rivercityscrape/URL-Scrape-Bot/washdb-bot/downloaded_files
+ReadWritePaths=/home/rivercityscrape/.cache
+ReadWritePaths=/tmp
+ReadWritePaths=/run/user/1000
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target

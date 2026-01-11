@@ -67,133 +67,87 @@ class TargetGroupConfig:
 
 
 # =============================================================================
-# COMPREHENSIVE WARMUP URL POOLS
+# TIERED WARMUP URL SYSTEM (Enterprise-Grade)
 # =============================================================================
-# These are curated lists of safe, high-traffic sites that:
-# 1. Never block legitimate traffic
-# 2. Handle JS properly (for verification)
-# 3. Are not honeypots
-# 4. Build realistic browsing fingerprints
-# 5. Set cookies that make browsers look "lived in"
+# URLs are organized by bot detection risk level:
+# - Tier S: Ultra-safe infrastructure sites (first in sequence)
+# - Tier A: Editorial/news sites (moderate, good for reading behavior)
+# - Tier B: Consumer/retail sites (heavier JS, manageable)
+# - Tier C: High-signal bot-aware sites (use sparingly, <35% of sessions)
+# - Tier D: Never use (auth, finance, identity)
 #
-# Format: (url, min_wait_seconds, max_wait_seconds, category)
+# The tiered system ensures warmup starts with safe sites before
+# progressing to more detection-heavy sites.
 # =============================================================================
 
-# High-traffic commercial sites - safe, never rate-limit, build realistic patterns
-# NOTE: Replaced .gov sites which were causing proxy provider issues (rate limiting)
-WARMUP_HIGH_TRAFFIC_SITES = [
-    ("https://www.linkedin.com/", 2, 4, "social"),
-    ("https://www.pinterest.com/", 2, 4, "social"),
-    ("https://medium.com/", 2, 3, "content"),
-    ("https://www.quora.com/", 2, 4, "content"),
-    ("https://www.indeed.com/", 2, 3, "jobs"),
-    ("https://www.glassdoor.com/", 2, 3, "jobs"),
-    ("https://www.zillow.com/", 3, 5, "real_estate"),
-    ("https://www.realtor.com/", 2, 4, "real_estate"),
-    ("https://www.allrecipes.com/", 2, 3, "lifestyle"),
-    ("https://www.foodnetwork.com/", 2, 3, "lifestyle"),
-]
-
-# Educational/Reference sites - very safe, high traffic, good JS
-WARMUP_EDU_REFERENCE = [
-    ("https://www.wikipedia.org/", 2, 4, "reference"),
-    ("https://en.wikipedia.org/wiki/Main_Page", 3, 5, "reference"),
-    ("https://www.britannica.com/", 2, 4, "reference"),
-    ("https://www.khanacademy.org/", 3, 5, "education"),
-    ("https://www.coursera.org/", 2, 4, "education"),
-    ("https://www.archive.org/", 2, 4, "reference"),
-    ("https://www.wolframalpha.com/", 2, 3, "reference"),
-]
-
-# Major news sites - high traffic, expect automation, good for cookies
-WARMUP_NEWS_SITES = [
-    ("https://www.reuters.com/", 3, 5, "news"),
-    ("https://apnews.com/", 3, 5, "news"),
-    ("https://www.npr.org/", 2, 4, "news"),
-    ("https://www.bbc.com/", 3, 5, "news"),
-    ("https://www.pbs.org/", 2, 4, "news"),
-    ("https://www.c-span.org/", 2, 3, "news"),
-]
-
-# Major tech/services - high traffic, sophisticated but not blocking
-WARMUP_TECH_SITES = [
-    ("https://www.google.com/", 2, 4, "search"),
-    ("https://www.bing.com/", 2, 3, "search"),
-    ("https://duckduckgo.com/", 2, 3, "search"),
-    ("https://www.microsoft.com/", 2, 4, "tech"),
-    ("https://www.apple.com/", 2, 4, "tech"),
-    ("https://github.com/", 2, 4, "tech"),
-    ("https://stackoverflow.com/", 3, 5, "tech"),
-]
-
-# Weather/utility sites - public service, never block
-WARMUP_UTILITY_SITES = [
-    ("https://www.accuweather.com/", 2, 4, "weather"),
-    ("https://www.wunderground.com/", 2, 3, "weather"),
-    ("https://www.timeanddate.com/", 2, 3, "utility"),
-    ("https://www.speedtest.net/", 3, 5, "utility"),
-]
-
-# Shopping/Commerce - high traffic, builds realistic patterns
-WARMUP_COMMERCE_SITES = [
-    ("https://www.amazon.com/", 3, 5, "shopping"),
-    ("https://www.ebay.com/", 2, 4, "shopping"),
-    ("https://www.etsy.com/", 2, 4, "shopping"),
-    ("https://www.target.com/", 2, 4, "shopping"),
-    ("https://www.homedepot.com/", 2, 4, "shopping"),
-    ("https://www.lowes.com/", 2, 4, "shopping"),
-]
-
-# Directory/Local search context - builds context for directory scraping
-WARMUP_LOCAL_CONTEXT = [
-    ("https://www.google.com/search?q=plumber+near+me", 3, 5, "local_search"),
-    ("https://www.google.com/search?q=local+contractors", 3, 5, "local_search"),
-    ("https://www.google.com/search?q=home+services", 3, 5, "local_search"),
-    ("https://www.google.com/maps", 3, 5, "maps"),
-    ("https://www.mapquest.com/", 2, 4, "maps"),
-]
-
-# JS-heavy sites for rendering verification
-WARMUP_JS_VERIFICATION = [
-    ("https://www.google.com/maps", 3, 5, "js_heavy"),
-    ("https://www.youtube.com/", 3, 5, "js_heavy"),
-    ("https://twitter.com/", 2, 4, "js_heavy"),
-    ("https://www.reddit.com/", 3, 5, "js_heavy"),
-]
-
-# Combine all warmup pools
-ALL_WARMUP_URLS = (
-    WARMUP_HIGH_TRAFFIC_SITES +
-    WARMUP_EDU_REFERENCE +
-    WARMUP_NEWS_SITES +
-    WARMUP_TECH_SITES +
-    WARMUP_UTILITY_SITES +
-    WARMUP_COMMERCE_SITES +
-    WARMUP_LOCAL_CONTEXT +
-    WARMUP_JS_VERIFICATION
+from seo_intelligence.drivers.tiered_warmup_adapter import (
+    get_tier_s_urls_legacy,
+    get_tier_a_urls_legacy,
+    get_tier_b_urls_legacy,
+    get_safe_warmup_urls,
+    get_tiered_warmup_urls_legacy,
+    generate_target_group_warmup_urls,
+    TieredWarmupAdapter,
 )
 
-# Warmup configuration
-WARMUP_CONFIG = {
-    # How many sites to visit during warmup (quality over speed)
-    # Reduced from 10-15 to 5-8 to lower browser crash risk
-    "min_sites_to_visit": 5,
-    "max_sites_to_visit": 8,
+# Tier S - Ultra-safe infrastructure sites (foundations, standards bodies, tech docs)
+# These sites have minimal bot detection and build baseline legitimacy
+WARMUP_TIER_S = get_tier_s_urls_legacy()
 
-    # Human behavior simulation
-    "scroll_probability": 0.7,      # 70% chance to scroll on each page
-    "click_probability": 0.2,       # 20% chance to click a safe link (reduced for stability)
-    "read_time_min": 2,             # Minimum seconds to "read" page
-    "read_time_max": 5,             # Maximum seconds to "read" page
+# Tier A - Editorial/news sites (news, blogs, magazines)
+# These sites simulate reading behavior with moderate detection
+WARMUP_TIER_A = get_tier_a_urls_legacy()
+
+# Tier B - Consumer sites (retail, travel, weather)
+# Commercial sites with heavier JS but manageable after warmup
+WARMUP_TIER_B = get_tier_b_urls_legacy()
+
+# Combined safe-first URL list (Tier S → A → B, no Tier C)
+# Use this as the default warmup pool
+ALL_WARMUP_URLS = get_safe_warmup_urls()
+
+# Legacy compatibility aliases
+WARMUP_HIGH_TRAFFIC_SITES = WARMUP_TIER_S[:5] + WARMUP_TIER_A[:5]
+WARMUP_EDU_REFERENCE = WARMUP_TIER_S
+WARMUP_NEWS_SITES = [u for u in WARMUP_TIER_A if 'news' in u[3] or 'magazine' in u[3]]
+WARMUP_TECH_SITES = [u for u in WARMUP_TIER_S if 'tech' in u[3] or 'infra' in u[3]]
+WARMUP_UTILITY_SITES = [u for u in WARMUP_TIER_B if 'utility' in u[3] or 'weather' in u[3]]
+WARMUP_COMMERCE_SITES = [u for u in WARMUP_TIER_B if 'retail' in u[3] or 'travel' in u[3]]
+WARMUP_LOCAL_CONTEXT = []  # Removed - causes detection on search engines
+WARMUP_JS_VERIFICATION = WARMUP_TIER_A[:3]  # News sites have good JS
+
+# Warmup configuration - Tiered approach
+WARMUP_CONFIG = {
+    # How many sites to visit during warmup
+    # Tiered system selects from blueprints (S→A→B pattern)
+    "min_sites_to_visit": 5,
+    "max_sites_to_visit": 10,
+
+    # Use tiered warmup (safer-first approach)
+    "use_tiered_warmup": True,
+
+    # Tier C probability (high-signal bot-aware sites)
+    # Keep low to avoid detection; only 35% of sessions include Tier C
+    "tier_c_probability": 0.35,
+
+    # Human behavior simulation (overridden by tier-specific configs)
+    "scroll_probability": 0.5,      # Default - tier configs override
+    "click_probability": 0.10,      # Reduced for safety
+    "read_time_min": 6,             # Increased for realism
+    "read_time_max": 15,            # Increased for realism
 
     # Honeypot detection
-    "check_invisible_links": True,   # Detect invisible honeypot links
-    "check_redirect_traps": True,    # Detect redirect honeypots
-    "max_redirects": 3,              # Max redirects before aborting
+    "check_invisible_links": True,
+    "check_redirect_traps": True,
+    "max_redirects": 3,
 
     # JS verification
-    "verify_js_execution": True,     # Run JS verification checks
-    "js_test_timeout": 5,            # Seconds to wait for JS tests
+    "verify_js_execution": True,
+    "js_test_timeout": 5,
+
+    # Tiered warmup specific
+    "rewarm_uses_short_blueprint": True,  # Re-warm uses A→B only
+    "enforce_no_domain_reuse": True,      # Prevent same domain in session
 }
 
 
@@ -202,24 +156,26 @@ WARMUP_CONFIG = {
 # =============================================================================
 # Each target group has its own warmup strategy optimized for its scraping targets
 
+# Use tiered warmup adapter for generating target-specific URLs
+_warmup_adapter = TieredWarmupAdapter()
+
 TARGET_GROUP_CONFIGS: Dict[str, TargetGroupConfig] = {
     "search_engines": TargetGroupConfig(
         name="search_engines",
         domains=["google.com", "bing.com", "duckduckgo.com"],
-        min_sessions=4,
-        max_sessions=8,
-        # Search engines need extensive warmup with diverse browsing
+        min_sessions=2,
+        max_sessions=3,
+        # Search engines need extensive warmup with safe-first approach
+        # Avoid Tier C (search engines themselves) to prevent detection
         warmup_urls=(
-            WARMUP_HIGH_TRAFFIC_SITES[:5] +
-            WARMUP_NEWS_SITES[:4] +
-            WARMUP_TECH_SITES +
-            WARMUP_COMMERCE_SITES[:3] +
-            WARMUP_JS_VERIFICATION[:2]
+            WARMUP_TIER_S[:8] +   # Foundation first
+            WARMUP_TIER_A[:6] +   # Editorial/news
+            WARMUP_TIER_B[:4]     # Consumer (no search engines)
         ),
         warmup_actions=["deep_scroll", "read_content", "random_click", "js_verify"],
         warmup_frequency_seconds=1800,  # 30 minutes
-        session_ttl_minutes=120,        # 2 hours
-        idle_ttl_minutes=20,
+        session_ttl_minutes=60,
+        idle_ttl_minutes=15,
         navigation_cap=100,
         tier="A",
         min_delay_seconds=15.0,
@@ -233,21 +189,20 @@ TARGET_GROUP_CONFIGS: Dict[str, TargetGroupConfig] = {
             "mapquest.com", "foursquare.com", "angi.com", "thumbtack.com",
             "homeadvisor.com",
         ],
-        min_sessions=6,
-        max_sessions=12,
-        # Directory scraping needs local search context
+        min_sessions=2,
+        max_sessions=3,
+        # Directory scraping - use consumer/utility context
+        # Tiered approach: S → A → B, minimal Tier C
         warmup_urls=(
-            WARMUP_HIGH_TRAFFIC_SITES[:3] +
-            WARMUP_LOCAL_CONTEXT +
-            WARMUP_COMMERCE_SITES[:4] +
-            WARMUP_UTILITY_SITES[:2] +
-            WARMUP_EDU_REFERENCE[:2]
+            WARMUP_TIER_S[:4] +   # Foundation
+            WARMUP_TIER_A[:4] +   # Editorial
+            WARMUP_TIER_B[:6]     # Consumer/utility
         ),
-        warmup_actions=["deep_scroll", "read_content", "random_click", "local_search_behavior"],
-        warmup_frequency_seconds=2400,  # 40 minutes
-        session_ttl_minutes=60,         # 1 hour
+        warmup_actions=["deep_scroll", "read_content", "random_click"],
+        warmup_frequency_seconds=1800,  # 30 minutes
+        session_ttl_minutes=60,
         idle_ttl_minutes=15,
-        navigation_cap=200,
+        navigation_cap=150,
         tier="C",
         min_delay_seconds=8.0,
         max_delay_seconds=15.0,
@@ -256,21 +211,19 @@ TARGET_GROUP_CONFIGS: Dict[str, TargetGroupConfig] = {
     "general": TargetGroupConfig(
         name="general",
         domains=["*"],  # Catch-all
-        min_sessions=5,
-        max_sessions=10,
-        # General purpose needs balanced warmup
+        min_sessions=2,
+        max_sessions=4,
+        # General purpose - balanced tiered warmup
         warmup_urls=(
-            WARMUP_HIGH_TRAFFIC_SITES[:4] +
-            WARMUP_EDU_REFERENCE[:3] +
-            WARMUP_NEWS_SITES[:3] +
-            WARMUP_UTILITY_SITES +
-            WARMUP_TECH_SITES[:3]
+            WARMUP_TIER_S[:6] +   # Foundation
+            WARMUP_TIER_A[:4] +   # Editorial
+            WARMUP_TIER_B[:4]     # Consumer
         ),
         warmup_actions=["deep_scroll", "read_content", "js_verify"],
-        warmup_frequency_seconds=3600,  # 1 hour
-        session_ttl_minutes=30,
-        idle_ttl_minutes=10,
-        navigation_cap=300,
+        warmup_frequency_seconds=1800,  # 30 minutes
+        session_ttl_minutes=45,
+        idle_ttl_minutes=12,
+        navigation_cap=200,
         tier="D",
         min_delay_seconds=5.0,
         max_delay_seconds=10.0,

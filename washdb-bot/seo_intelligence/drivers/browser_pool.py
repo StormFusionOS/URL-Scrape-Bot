@@ -57,22 +57,25 @@ logger = get_logger("browser_pool")
 
 # Environment configuration
 POOL_ENABLED = os.getenv("BROWSER_POOL_ENABLED", "true").lower() == "true"
-POOL_MIN_SESSIONS = int(os.getenv("BROWSER_POOL_MIN_SESSIONS", "15"))
-POOL_MAX_SESSIONS = int(os.getenv("BROWSER_POOL_MAX_SESSIONS", "25"))
-SESSION_TTL_MINUTES = int(os.getenv("BROWSER_POOL_SESSION_TTL", "120"))
-IDLE_TTL_MINUTES = int(os.getenv("BROWSER_POOL_IDLE_TTL", "20"))
-NAVIGATION_CAP = int(os.getenv("BROWSER_POOL_NAVIGATION_CAP", "200"))
+POOL_MIN_SESSIONS = int(os.getenv("BROWSER_POOL_MIN_SESSIONS", "6"))
+POOL_MAX_SESSIONS = int(os.getenv("BROWSER_POOL_MAX_SESSIONS", "10"))
+SESSION_TTL_MINUTES = int(os.getenv("BROWSER_POOL_SESSION_TTL", "60"))
+IDLE_TTL_MINUTES = int(os.getenv("BROWSER_POOL_IDLE_TTL", "15"))
+NAVIGATION_CAP = int(os.getenv("BROWSER_POOL_NAVIGATION_CAP", "150"))
 LEASE_TIMEOUT_SECONDS = int(os.getenv("BROWSER_POOL_LEASE_TIMEOUT", "300"))
 HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("BROWSER_POOL_HEARTBEAT_INTERVAL", "30"))
 WARMUP_FREQUENCY_SECONDS = int(os.getenv("BROWSER_POOL_WARMUP_FREQUENCY", "1800"))
 
 # Maximum time to wait for a session
-MAX_ACQUIRE_WAIT_SECONDS = 360  # 6 minutes - allow full pool warmup
+MAX_ACQUIRE_WAIT_SECONDS = 300  # 5 minutes - allow pool warmup time
 
-# Chrome process limits (lowered for better stability)
-MAX_CHROME_PROCESSES = 60  # Warn and clean orphans
-CRITICAL_CHROME_PROCESSES = 100  # Force full cleanup (raised - no nuclear option now)
-CHROME_CLEANUP_INTERVAL = 60  # Check every minute for faster response
+# Chrome process limits
+# Each browser session spawns ~20 Chrome processes (main + renderer + GPU + utility)
+# With POOL_MAX=10, expect up to 200 Chrome processes normally
+MAX_CHROME_PROCESSES = 150  # Warn and clean orphans
+CRITICAL_CHROME_PROCESSES = 250  # Force aggressive cleanup
+EMERGENCY_CHROME_PROCESSES = 350  # Hard cap - emergency cleanup
+CHROME_CLEANUP_INTERVAL = 60  # Check every minute
 
 # Self-healing thresholds
 QUARANTINE_RECOVERY_THRESHOLD = 0.30  # Auto-recovery if >30% sessions quarantined
@@ -902,11 +905,12 @@ class EnterpriseBrowserPool:
         """
         Execute comprehensive warm plan for a session.
 
-        This is a quality-focused warmup that:
-        - Visits 10-15 diverse sites (not just 3)
+        This is an enterprise-grade tiered warmup that:
+        - Uses safe-first URL selection (Tier S → A → B)
+        - Visits 5-10 diverse sites with tier-appropriate behavior
         - Simulates realistic human browsing behavior
         - Verifies JS execution works correctly
-        - Checks for and avoids honeypots
+        - Avoids bot-aware sites early in warmup
         - Builds authentic cookies and browsing history
 
         Args:
@@ -916,6 +920,7 @@ class EnterpriseBrowserPool:
             True if warming succeeded
         """
         from .pool_models import WARMUP_CONFIG
+        from .tiered_warmup_adapter import TieredWarmupAdapter, get_tiered_warmup_urls_legacy
 
         if session.driver is None:
             return False
@@ -930,20 +935,39 @@ class EnterpriseBrowserPool:
             successful_warmups = 0
             js_verified = False
 
-            # Get warmup URLs - prioritized by reputation tracker
+            # Use tiered warmup system for safer-first URL selection
             reputation_tracker = get_warmup_reputation_tracker()
-            all_urls = list(config.warmup_urls)
-            num_sites = random.randint(
-                WARMUP_CONFIG["min_sites_to_visit"],
-                min(WARMUP_CONFIG["max_sites_to_visit"], len(all_urls))
-            )
 
-            # Use reputation tracker to prioritize URLs (high-success first)
-            warmup_urls = reputation_tracker.get_prioritized_warmup_urls(
-                base_urls=all_urls,
-                count=num_sites,
-                include_new=True
-            )
+            if WARMUP_CONFIG.get("use_tiered_warmup", True):
+                # Generate tiered warmup URLs (S → A → B pattern)
+                num_sites = random.randint(
+                    WARMUP_CONFIG["min_sites_to_visit"],
+                    WARMUP_CONFIG["max_sites_to_visit"]
+                )
+
+                # Create tiered adapter with target-group-specific settings
+                adapter = TieredWarmupAdapter(
+                    tier_c_probability=WARMUP_CONFIG.get("tier_c_probability", 0.35),
+                    enforce_no_domain_reuse=WARMUP_CONFIG.get("enforce_no_domain_reuse", True),
+                )
+
+                warmup_urls = adapter.get_warmup_urls(
+                    count=num_sites,
+                    is_rewarm=False,
+                )
+            else:
+                # Fallback to legacy URL selection
+                all_urls = list(config.warmup_urls)
+                num_sites = random.randint(
+                    WARMUP_CONFIG["min_sites_to_visit"],
+                    min(WARMUP_CONFIG["max_sites_to_visit"], len(all_urls))
+                )
+
+                warmup_urls = reputation_tracker.get_prioritized_warmup_urls(
+                    base_urls=all_urls,
+                    count=num_sites,
+                    include_new=True
+                )
 
             logger.info(f"Session {session.session_id[:8]} starting comprehensive warmup ({len(warmup_urls)} sites)")
 
@@ -2215,11 +2239,9 @@ class EnterpriseBrowserPool:
         Check Chrome process count and clean up if needed.
 
         Escalation levels:
-        1. MAX_CHROME_PROCESSES (60): Kill orphans only
-        2. CRITICAL_CHROME_PROCESSES (100): Aggressive + targeted cleanup
-
-        NO nuclear option - we never kill all Chrome processes.
-        This prevents destabilizing the pool.
+        1. MAX_CHROME_PROCESSES (40): Kill orphans only
+        2. CRITICAL_CHROME_PROCESSES (60): Aggressive + targeted cleanup
+        3. EMERGENCY_CHROME_PROCESSES (80): Hard cap - kill ALL orphans aggressively
 
         Returns:
             Tuple of (process_count, killed_count)
@@ -2227,7 +2249,25 @@ class EnterpriseBrowserPool:
         chrome_count = self._get_chrome_process_count()
         killed = 0
 
-        if chrome_count >= CRITICAL_CHROME_PROCESSES:
+        if chrome_count >= EMERGENCY_CHROME_PROCESSES:
+            # EMERGENCY: Hard cap exceeded - aggressive measures
+            logger.error(f"EMERGENCY: {chrome_count} Chrome processes - forcing hard cleanup!")
+
+            # Kill ALL orphan processes immediately
+            killed = self._cleanup_orphan_chrome_processes()
+            killed += self._aggressive_chrome_cleanup()
+            killed += self._targeted_chrome_cleanup()
+
+            remaining = self._get_chrome_process_count()
+            if remaining >= EMERGENCY_CHROME_PROCESSES:
+                # Last resort: kill oldest Chrome processes
+                logger.error(f"Still {remaining} - killing oldest Chrome processes")
+                killed += self._emergency_chrome_cleanup()
+
+            remaining = self._get_chrome_process_count()
+            logger.warning(f"Emergency cleanup complete: {remaining} processes remain (killed {killed})")
+
+        elif chrome_count >= CRITICAL_CHROME_PROCESSES:
             logger.warning(f"CRITICAL: {chrome_count} Chrome processes - starting cleanup")
 
             # Level 1: Try orphan cleanup first
@@ -2241,12 +2281,9 @@ class EnterpriseBrowserPool:
                 remaining = self._get_chrome_process_count()
 
                 if remaining >= CRITICAL_CHROME_PROCESSES:
-                    # Level 3: Targeted cleanup via ChromeProcessManager (NOT nuclear!)
+                    # Level 3: Targeted cleanup via ChromeProcessManager
                     logger.warning(f"Still {remaining} after aggressive - using targeted cleanup")
                     killed += self._targeted_chrome_cleanup()
-
-                    # Note: We do NOT invalidate all sessions anymore
-                    # Targeted cleanup only kills orphans, not active sessions
 
             remaining = self._get_chrome_process_count()
             if remaining >= MAX_CHROME_PROCESSES:
@@ -2269,6 +2306,52 @@ class EnterpriseBrowserPool:
 
         self._last_chrome_cleanup = datetime.now()
         return chrome_count, killed
+
+    def _emergency_chrome_cleanup(self) -> int:
+        """
+        Emergency cleanup: Kill oldest Chrome processes to get under limit.
+
+        This is the last resort when other cleanup methods fail.
+        """
+        try:
+            import subprocess
+
+            # Get Chrome processes sorted by start time (oldest first)
+            result = subprocess.run(
+                ["ps", "-eo", "pid,etimes,comm", "--sort=-etimes"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            killed = 0
+            target_count = EMERGENCY_CHROME_PROCESSES - 20  # Kill down to 60
+            current_count = self._get_chrome_process_count()
+
+            for line in result.stdout.strip().split('\n')[1:]:  # Skip header
+                if current_count <= target_count:
+                    break
+
+                parts = line.split()
+                if len(parts) >= 3:
+                    pid = parts[0]
+                    comm = parts[2]
+
+                    if 'chrome' in comm.lower() or 'chromium' in comm.lower():
+                        try:
+                            os.kill(int(pid), signal.SIGKILL)
+                            killed += 1
+                            current_count -= 1
+                            logger.debug(f"Emergency killed Chrome PID {pid}")
+                        except (ProcessLookupError, PermissionError):
+                            pass
+
+            logger.warning(f"Emergency cleanup: killed {killed} oldest Chrome processes")
+            return killed
+
+        except Exception as e:
+            logger.error(f"Emergency Chrome cleanup error: {e}")
+            return 0
 
     # ========== Drain Mode Methods ==========
 
